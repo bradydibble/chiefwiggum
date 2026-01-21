@@ -1,0 +1,16 @@
+# Include shell scripts for ralph_loop
+recursive-include chiefwiggum/scripts *.sh
+
+# Include Python files
+recursive-include chiefwiggum *.py
+
+# Include test files
+recursive-include tests *.py
+
+# Include documentation
+include README.md
+include LICENSE
+
+# Exclude compiled Python
+global-exclude __pycache__
+global-exclude *.py[cod]

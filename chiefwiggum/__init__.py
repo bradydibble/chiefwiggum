@@ -25,6 +25,7 @@ from chiefwiggum.coordination import (
     sync_tasks_from_fix_plan,
     verify_claim_before_commit,
     safe_git_commit,
+    check_ralph_completions,
     # Instance operations
     register_ralph_instance,
     register_ralph_instance_with_config,
@@ -104,6 +105,7 @@ __all__ = [
     "sync_tasks_from_fix_plan",
     "verify_claim_before_commit",
     "safe_git_commit",
+    "check_ralph_completions",
     # Instance operations
     "register_ralph_instance",
     "register_ralph_instance_with_config",

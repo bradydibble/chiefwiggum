@@ -6,6 +6,7 @@ Spawn and manage Ralph (Claude Code) instances as background daemons.
 import asyncio
 import logging
 import os
+import shutil
 import signal
 import socket
 import subprocess
@@ -15,27 +16,194 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from chiefwiggum.config import get_ralph_loop_settings
 from chiefwiggum.database import get_setting, set_setting
-from chiefwiggum.models import ClaudeModel, RalphConfig, TargetingConfig, TaskCategory, TaskPriority
+from chiefwiggum.models import ClaudeModel, RalphConfig, TargetingConfig, TaskCategory, TaskPriority, TaskClaim
+from chiefwiggum.paths import get_paths
+from chiefwiggum.scripts import get_ralph_loop_path
 
 logger = logging.getLogger(__name__)
 
-# Directory for Ralph session files and logs
-RALPH_DATA_DIR = Path.home() / ".chiefwiggum" / "ralphs"
+
+def _get_ralph_data_dir() -> Path:
+    """Get the Ralph data directory (for session files and logs)."""
+    return get_paths().ralphs_dir
+
+
+def _get_task_prompts_dir() -> Path:
+    """Get the task prompts directory."""
+    return get_paths().task_prompts_dir
+
+
+def _get_status_dir() -> Path:
+    """Get the status directory."""
+    return get_paths().status_dir
+
+
+def _validate_spawn_requirements() -> tuple[bool, str]:
+    """Synchronous validation of spawn requirements.
+
+    Checks:
+    1. ANTHROPIC_API_KEY is set
+    2. Claude CLI is available
+
+    Note: This does NOT check concurrent Ralph limits (requires async).
+    Use can_spawn_ralph() for complete validation including limits.
+
+    Returns:
+        Tuple of (can_spawn, reason)
+    """
+    # Check 1: API key
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        return (False, "ANTHROPIC_API_KEY not set. Export the key or check your environment.")
+
+    # Check 2: Claude CLI available
+    if shutil.which("claude") is None:
+        return (False, "Claude CLI not found. Install: npm install -g @anthropic-ai/claude-code")
+
+    return (True, "Requirements validated")
+
+
+def _ensure_project_permissions(project_dir: Path) -> None:
+    """Ensure project has Claude Code permissions for autonomous Ralph operation.
+
+    Updates the project-level .claude/settings.json to add Edit and other
+    necessary permissions while preserving existing settings.
+    This abstracts permission management from the user.
+    """
+    import json
+
+    claude_dir = project_dir / ".claude"
+    settings_file = claude_dir / "settings.json"
+
+    # Required permissions for Ralph - autonomous code modification
+    # Note: Uses colon format Bash(cmd:*) to match Claude CLI expectations
+    required_allow = [
+        # Core tools
+        "Read",
+        "Write",
+        "Edit",  # Essential for modifying existing files
+        "Glob",
+        "Grep",
+        # Bash commands - comprehensive set for autonomous operation
+        "Bash(git:*)",
+        "Bash(npm:*)",
+        "Bash(yarn:*)",
+        "Bash(pip:*)",
+        "Bash(uv:*)",
+        "Bash(pytest:*)",
+        "Bash(python:*)",
+        "Bash(python3:*)",
+        "Bash(node:*)",
+        "Bash(make:*)",
+        "Bash(ruff:*)",
+        "Bash(mypy:*)",
+        "Bash(cargo:*)",
+        "Bash(ls:*)",
+        "Bash(cat:*)",
+        "Bash(head:*)",
+        "Bash(tail:*)",
+        "Bash(mkdir:*)",
+        "Bash(cp:*)",
+        "Bash(mv:*)",
+        "Bash(touch:*)",
+        "Bash(chmod:*)",
+        "Bash(echo:*)",
+        "Bash(grep:*)",
+        "Bash(find:*)",
+        "Bash(sed:*)",
+    ]
+
+    # Create .claude directory if needed
+    claude_dir.mkdir(parents=True, exist_ok=True)
+
+    # Load existing settings or start fresh
+    if settings_file.exists():
+        try:
+            settings = json.loads(settings_file.read_text())
+        except json.JSONDecodeError:
+            settings = {}
+    else:
+        settings = {}
+
+    # Ensure permissions structure exists
+    if "permissions" not in settings:
+        settings["permissions"] = {}
+    if "allow" not in settings["permissions"]:
+        settings["permissions"]["allow"] = []
+
+    # Add required permissions if missing
+    allow_list = settings["permissions"]["allow"]
+    modified = False
+    for perm in required_allow:
+        if perm not in allow_list:
+            allow_list.append(perm)
+            modified = True
+            logger.info(f"Added '{perm}' permission for Ralph")
+
+    # Set defaultMode to bypassPermissions for autonomous operation
+    # This is critical - without it, dontAsk mode blocks even allowed tools
+    if settings["permissions"].get("defaultMode") != "bypassPermissions":
+        settings["permissions"]["defaultMode"] = "bypassPermissions"
+        modified = True
+        logger.info("Set defaultMode to bypassPermissions for autonomous Ralph operation")
+
+    # Write back if modified
+    if modified:
+        settings_file.write_text(json.dumps(settings, indent=2))
+        logger.info(f"Updated Claude permissions at {settings_file}")
+
+
+def _get_ralphs_by_working_dir() -> dict[Path, list[str]]:
+    """Get a mapping of working directories to Ralph IDs.
+
+    This helps detect if multiple Ralphs are running on the same project,
+    which can cause session file conflicts.
+
+    Returns:
+        Dict mapping working_dir -> list of ralph_ids
+    """
+    result: dict[Path, list[str]] = {}
+    data_dir = _ensure_data_dir()
+
+    for pid_file in data_dir.glob("*.pid"):
+        ralph_id = pid_file.stem
+        running, _ = is_ralph_running(ralph_id)
+        if running:
+            # Try to get working dir from the log file
+            log_path = get_ralph_log_path(ralph_id)
+            if log_path.exists():
+                try:
+                    content = log_path.read_text()
+                    # Look for "Fix Plan:" line which contains the path
+                    for line in content.split("\n"):
+                        if line.startswith("Fix Plan:"):
+                            fix_plan_path = Path(line.split(":", 1)[1].strip())
+                            working_dir = fix_plan_path.parent.resolve()
+                            if working_dir not in result:
+                                result[working_dir] = []
+                            result[working_dir].append(ralph_id)
+                            break
+                except Exception:
+                    pass
+
+    return result
 
 
 def _ensure_data_dir() -> Path:
     """Ensure the Ralph data directory exists."""
-    RALPH_DATA_DIR.mkdir(parents=True, exist_ok=True)
-    return RALPH_DATA_DIR
+    data_dir = _get_ralph_data_dir()
+    data_dir.mkdir(parents=True, exist_ok=True)
+    return data_dir
 
 
 def generate_ralph_id(name: str | None = None) -> str:
     """Generate a unique Ralph ID."""
     hostname = socket.gethostname().split(".")[0]
+    unique = uuid.uuid4().hex[:4]
     if name:
-        return f"{hostname}-{name}"
-    return f"{hostname}-{uuid.uuid4().hex[:6]}"
+        return f"{hostname}-{name}-{unique}"
+    return f"{hostname}-{unique}"
 
 
 def get_ralph_log_path(ralph_id: str) -> Path:
@@ -51,6 +219,174 @@ def get_ralph_pid_path(ralph_id: str) -> Path:
 def get_ralph_session_path(ralph_id: str) -> Path:
     """Get the session file path for a Ralph instance."""
     return _ensure_data_dir() / f"{ralph_id}.session"
+
+
+def get_ralph_status_path(ralph_id: str) -> Path:
+    """Get the status file path for a Ralph instance."""
+    status_dir = _get_status_dir()
+    status_dir.mkdir(parents=True, exist_ok=True)
+    return status_dir / f"{ralph_id}.json"
+
+
+def get_task_prompt_path(ralph_id: str, task_id: str) -> Path:
+    """Get the task-specific prompt file path."""
+    prompts_dir = _get_task_prompts_dir()
+    prompts_dir.mkdir(parents=True, exist_ok=True)
+    return prompts_dir / f"{ralph_id}_{task_id}.md"
+
+
+def generate_task_prompt(task: TaskClaim, fix_plan_path: Path) -> str:
+    """Generate a focused prompt for a specific task.
+
+    Instead of giving Ralph the entire @fix_plan.md, we extract just the
+    relevant task and provide clear instructions.
+
+    Args:
+        task: The task claim with task details
+        fix_plan_path: Path to the original @fix_plan.md
+
+    Returns:
+        A focused task prompt string
+    """
+    # Read the original fix_plan to extract task context
+    fix_plan_content = ""
+    if fix_plan_path.exists():
+        fix_plan_content = fix_plan_path.read_text(encoding="utf-8", errors="replace")
+
+    # Extract the task section from fix_plan if possible
+    task_section_content = ""
+    if task.task_section and fix_plan_content:
+        # Try to find the section in the fix_plan
+        import re
+        # Look for the section header (### or #### followed by the section name)
+        pattern = rf"(#{2,4}\s*{re.escape(task.task_section)}.*?)(?=\n#{2,4}\s|\Z)"
+        match = re.search(pattern, fix_plan_content, re.DOTALL | re.IGNORECASE)
+        if match:
+            task_section_content = match.group(1).strip()
+
+    # Build the focused prompt
+    prompt = f"""# Task Assignment: {task.task_title}
+
+## Task Details
+- **Task ID**: {task.task_id}
+- **Priority**: {task.task_priority.value}
+- **Project**: {task.project or "Unknown"}
+{f"- **Category**: {task.category.value}" if task.category else ""}
+{f"- **Section**: {task.task_section}" if task.task_section else ""}
+
+## Instructions
+
+You are working on a SINGLE task. Focus ONLY on this task.
+
+**Your task**: {task.task_title}
+
+{f'''## Task Context from @fix_plan.md
+
+{task_section_content}
+''' if task_section_content else ""}
+
+## Completion Criteria
+
+When you have completed this task:
+1. Ensure all changes are saved
+2. Run any relevant tests
+3. Output the following marker on its own line:
+
+```
+TASK_COMPLETE: {task.task_id}
+```
+
+If you cannot complete the task due to an error:
+```
+TASK_FAILED: {task.task_id}
+REASON: <brief description of what went wrong>
+```
+
+## Important Notes
+
+- Focus ONLY on this specific task
+- Do not work on other tasks from the fix_plan
+- If the task is unclear, make reasonable assumptions and proceed
+- Commit your changes with a descriptive message when done
+"""
+    return prompt
+
+
+def write_ralph_status(ralph_id: str, task_id: str | None, status: str, loop_count: int = 0, message: str = "") -> None:
+    """Write Ralph status to a JSON file for chiefwiggum to read.
+
+    Args:
+        ralph_id: The Ralph instance ID
+        task_id: Current task being worked on (or None)
+        status: Status string (working, idle, complete, failed)
+        loop_count: Current loop iteration
+        message: Optional status message
+    """
+    import json
+
+    status_path = get_ralph_status_path(ralph_id)
+    status_data = {
+        "ralph_id": ralph_id,
+        "task_id": task_id,
+        "status": status,
+        "loop_count": loop_count,
+        "message": message,
+        "updated_at": datetime.now().isoformat(),
+    }
+    status_path.write_text(json.dumps(status_data, indent=2))
+
+
+def read_ralph_status(ralph_id: str) -> dict | None:
+    """Read Ralph status from file.
+
+    Returns:
+        Status dict or None if not found
+    """
+    import json
+
+    status_path = get_ralph_status_path(ralph_id)
+    if not status_path.exists():
+        return None
+    try:
+        return json.loads(status_path.read_text())
+    except (json.JSONDecodeError, IOError):
+        return None
+
+
+def check_task_completion(ralph_id: str) -> tuple[str | None, str | None]:
+    """Check if Ralph has signaled task completion.
+
+    Scans Ralph's log for TASK_COMPLETE or TASK_FAILED markers.
+
+    Returns:
+        Tuple of (completed_task_id, failure_reason) - both None if no completion
+    """
+    log_path = get_ralph_log_path(ralph_id)
+    if not log_path.exists():
+        return (None, None)
+
+    try:
+        # Read last 50KB of log to check for completion markers
+        with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+            f.seek(0, 2)  # Go to end
+            size = f.tell()
+            f.seek(max(0, size - 50000))  # Read last 50KB
+            content = f.read()
+
+        # Check for completion marker
+        import re
+        complete_match = re.search(r"TASK_COMPLETE:\s*(\S+)", content)
+        if complete_match:
+            return (complete_match.group(1), None)
+
+        # Check for failure marker
+        fail_match = re.search(r"TASK_FAILED:\s*(\S+)\s*\nREASON:\s*(.+)", content)
+        if fail_match:
+            return (fail_match.group(1), fail_match.group(2))
+
+        return (None, None)
+    except IOError:
+        return (None, None)
 
 
 def is_ralph_running(ralph_id: str) -> tuple[bool, int | None]:
@@ -77,6 +413,550 @@ def is_ralph_running(ralph_id: str) -> tuple[bool, int | None]:
         return (False, None)
 
 
+def get_process_health(ralph_id: str) -> dict:
+    """Get detailed health information about a Ralph process.
+
+    Returns a dict with:
+        - running: bool - whether process exists
+        - pid: int | None - process ID
+        - state: str - process state (running, sleeping, zombie, stopped, dead, unknown)
+        - state_code: str | None - raw state code from ps
+        - elapsed: str | None - how long process has been running
+        - healthy: bool - True if running and not a zombie
+        - message: str - human-readable status message
+    """
+    result = {
+        "running": False,
+        "pid": None,
+        "state": "dead",
+        "state_code": None,
+        "elapsed": None,
+        "healthy": False,
+        "message": "Process not found",
+    }
+
+    pid_path = get_ralph_pid_path(ralph_id)
+    if not pid_path.exists():
+        result["message"] = "No PID file"
+        return result
+
+    try:
+        pid = int(pid_path.read_text().strip())
+        result["pid"] = pid
+    except (ValueError, IOError) as e:
+        result["message"] = f"Invalid PID file: {e}"
+        return result
+
+    # Use ps to get detailed process state
+    try:
+        import subprocess
+        ps_result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "state=,etime="],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+
+        if ps_result.returncode != 0:
+            # Process doesn't exist
+            result["message"] = "Process not found (PID file stale)"
+            # Clean up stale PID file
+            try:
+                pid_path.unlink()
+                logger.info(f"Cleaned up stale PID file for {ralph_id}")
+            except FileNotFoundError:
+                pass
+            return result
+
+        output = ps_result.stdout.strip()
+        if output:
+            parts = output.split(None, 1)
+            state_code = parts[0] if parts else ""
+            elapsed = parts[1].strip() if len(parts) > 1 else ""
+
+            result["running"] = True
+            result["state_code"] = state_code
+            result["elapsed"] = elapsed
+
+            # Interpret state code
+            # Common states: R=running, S=sleeping, D=disk sleep, Z=zombie, T=stopped
+            if state_code.startswith("Z"):
+                result["state"] = "zombie"
+                result["healthy"] = False
+                result["message"] = f"ZOMBIE process (defunct) - elapsed: {elapsed}"
+                logger.warning(f"Ralph {ralph_id} is a zombie process (PID {pid})")
+            elif state_code.startswith("T"):
+                result["state"] = "stopped"
+                result["healthy"] = False
+                result["message"] = f"Process stopped/suspended - elapsed: {elapsed}"
+            elif state_code.startswith("D"):
+                result["state"] = "disk_sleep"
+                result["healthy"] = True  # Usually temporary
+                result["message"] = f"Process in disk sleep - elapsed: {elapsed}"
+            elif state_code.startswith(("R", "S")):
+                result["state"] = "running" if state_code.startswith("R") else "sleeping"
+                result["healthy"] = True
+                result["message"] = f"Process healthy ({result['state']}) - elapsed: {elapsed}"
+            else:
+                result["state"] = "unknown"
+                result["healthy"] = True  # Assume healthy if not zombie
+                result["message"] = f"Process state '{state_code}' - elapsed: {elapsed}"
+
+    except subprocess.TimeoutExpired:
+        result["message"] = "Timeout checking process state"
+        logger.error(f"Timeout checking process state for Ralph {ralph_id}")
+    except Exception as e:
+        result["message"] = f"Error checking process: {e}"
+        logger.error(f"Error checking process health for Ralph {ralph_id}: {e}")
+
+    return result
+
+
+def get_status_staleness(ralph_id: str) -> dict:
+    """Check how stale the status file is.
+
+    Returns a dict with:
+        - exists: bool - whether status file exists
+        - last_updated: datetime | None - when status was last updated
+        - age_seconds: float | None - seconds since last update
+        - stale: bool - True if > 60 seconds old or doesn't exist
+        - message: str - human-readable staleness message
+    """
+    result = {
+        "exists": False,
+        "last_updated": None,
+        "age_seconds": None,
+        "stale": True,
+        "status_data": None,
+        "message": "No status file",
+    }
+
+    status_data = read_ralph_status(ralph_id)
+    if not status_data:
+        return result
+
+    result["exists"] = True
+    result["status_data"] = status_data
+
+    updated_at_str = status_data.get("updated_at")
+    if updated_at_str:
+        try:
+            updated_at = datetime.fromisoformat(updated_at_str)
+            result["last_updated"] = updated_at
+            age = (datetime.now() - updated_at).total_seconds()
+            result["age_seconds"] = age
+
+            if age < 30:
+                result["stale"] = False
+                result["message"] = f"Updated {age:.0f}s ago"
+            elif age < 60:
+                result["stale"] = False
+                result["message"] = f"Updated {age:.0f}s ago (recent)"
+            elif age < 300:
+                result["stale"] = True
+                result["message"] = f"⚠ Updated {age/60:.1f}m ago (possibly stale)"
+            else:
+                result["stale"] = True
+                result["message"] = f"⚠ Updated {age/60:.0f}m ago (STALE)"
+        except (ValueError, TypeError) as e:
+            result["message"] = f"Invalid timestamp: {e}"
+
+    return result
+
+
+def get_ralph_activity(ralph_id: str) -> dict:
+    """Check if Ralph is showing signs of life by monitoring file activity.
+
+    This provides external heartbeat detection by monitoring:
+    - Log file modification time and growth
+    - Status file freshness
+    - Process state
+
+    Returns a dict with:
+        - log_age_seconds: float | None - seconds since log file modified
+        - status_age_seconds: float | None - seconds since status file updated
+        - log_growing: bool - whether log file has grown recently
+        - log_size: int | None - current log file size
+        - process_state: str - process state from get_process_health
+        - is_responsive: bool - True if showing recent activity
+        - last_check: datetime - when this check was performed
+    """
+    import time
+
+    result = {
+        "log_age_seconds": None,
+        "status_age_seconds": None,
+        "log_growing": False,
+        "log_size": None,
+        "process_state": "unknown",
+        "is_responsive": False,
+        "last_check": datetime.now(),
+    }
+
+    # Check log file activity
+    log_path = get_ralph_log_path(ralph_id)
+    if log_path.exists():
+        try:
+            stat = log_path.stat()
+            result["log_age_seconds"] = (datetime.now() - datetime.fromtimestamp(stat.st_mtime)).total_seconds()
+            result["log_size"] = stat.st_size
+
+            # Check if log is growing (compare size over brief interval)
+            initial_size = stat.st_size
+            time.sleep(0.5)  # Brief wait
+            stat2 = log_path.stat()
+            result["log_growing"] = stat2.st_size > initial_size
+        except (OSError, IOError) as e:
+            logger.warning(f"Error checking log file for {ralph_id}: {e}")
+
+    # Check status file staleness
+    staleness = get_status_staleness(ralph_id)
+    if staleness["age_seconds"] is not None:
+        result["status_age_seconds"] = staleness["age_seconds"]
+
+    # Check process health
+    health = get_process_health(ralph_id)
+    result["process_state"] = health["state"]
+
+    # Determine if responsive
+    # Consider responsive if:
+    # - Log updated in last 60 seconds, OR
+    # - Status file updated in last 120 seconds
+    # AND process is healthy
+    log_recent = result["log_age_seconds"] is not None and result["log_age_seconds"] < 60
+    status_recent = result["status_age_seconds"] is not None and result["status_age_seconds"] < 120
+
+    result["is_responsive"] = health["healthy"] and (log_recent or status_recent)
+
+    return result
+
+
+def is_ralph_stuck(ralph_id: str, timeout_minutes: int = 30) -> tuple[bool, str]:
+    """Detect if Ralph is stuck and needs intervention.
+
+    Checks multiple indicators:
+    1. Process is dead/zombie/stopped
+    2. Log hasn't updated in 5+ minutes while supposedly active
+    3. Status file is stale
+    4. Task running longer than 2x timeout
+
+    Args:
+        ralph_id: The Ralph instance ID
+        timeout_minutes: Task timeout in minutes (default 30)
+
+    Returns:
+        Tuple of (is_stuck: bool, reason: str)
+    """
+    # First check if there's even a PID file - if not, Ralph was never started
+    pid_path = get_ralph_pid_path(ralph_id)
+    if not pid_path.exists():
+        return False, "Not running"
+
+    activity = get_ralph_activity(ralph_id)
+
+    # Check 1: Process state issues
+    if activity["process_state"] == "zombie":
+        return True, f"Process is ZOMBIE (defunct)"
+
+    if activity["process_state"] == "stopped":
+        return True, f"Process is STOPPED/suspended"
+
+    if activity["process_state"] == "dead":
+        # Dead process is definitely stuck (PID file exists but process is dead)
+        return True, f"Process is DEAD (not running)"
+
+    # If process state is unknown but we have a PID file, check health
+    if activity["process_state"] == "unknown":
+        health = get_process_health(ralph_id)
+        if not health["running"]:
+            return False, "Not running"
+
+    # Check 2: Log hasn't updated in 5+ minutes
+    if activity["log_age_seconds"] is not None:
+        if activity["log_age_seconds"] > 300:  # 5 minutes
+            return True, f"No log activity for {activity['log_age_seconds']/60:.1f}m"
+
+    # Check 3: Status file extremely stale (8+ minutes)
+    if activity["status_age_seconds"] is not None:
+        if activity["status_age_seconds"] > 480:  # 8 minutes
+            return True, f"Status file stale for {activity['status_age_seconds']/60:.1f}m"
+
+    # Check 4: Check if current task is running too long
+    # This requires reading the status file for task start time
+    status = read_ralph_status(ralph_id)
+    if status and status.get("status") == "working":
+        updated_at_str = status.get("updated_at")
+        if updated_at_str:
+            try:
+                updated_at = datetime.fromisoformat(updated_at_str)
+                elapsed = (datetime.now() - updated_at).total_seconds()
+                # If status says "working" but hasn't updated in a long time
+                # and it's past 2x timeout, it's stuck
+                max_time = timeout_minutes * 60 * 2  # 2x timeout
+                if elapsed > max_time:
+                    return True, f"Task running {elapsed/60:.0f}m (timeout: {timeout_minutes}m)"
+            except (ValueError, TypeError):
+                pass
+
+    return False, "OK"
+
+
+async def handle_stuck_ralph(ralph_id: str, reason: str) -> dict:
+    """Take action on a stuck Ralph instance.
+
+    Actions taken:
+    1. Log the issue
+    2. Release any claimed task so another Ralph can take it
+    3. Update instance status to UNHEALTHY/CRASHED
+    4. Attempt graceful termination, then force if needed
+
+    Args:
+        ralph_id: The Ralph instance ID
+        reason: Why the Ralph is stuck (for logging)
+
+    Returns:
+        Dict with action results:
+        - task_released: bool - whether a task was released
+        - task_id: str | None - the released task ID
+        - status_updated: bool - whether status was updated
+        - terminated: bool - whether process was terminated
+        - message: str - summary message
+    """
+    from chiefwiggum.coordination import release_claim, get_ralph_instance, update_instance_status
+
+    result = {
+        "task_released": False,
+        "task_id": None,
+        "status_updated": False,
+        "terminated": False,
+        "message": "",
+    }
+
+    logger.warning(f"[HEALTH] Ralph {ralph_id} stuck: {reason}")
+
+    # Step 1: Get instance info and release any claimed task
+    try:
+        instance = await get_ralph_instance(ralph_id)
+        if instance and instance.current_task_id:
+            try:
+                await release_claim(ralph_id, instance.current_task_id)
+                result["task_released"] = True
+                result["task_id"] = instance.current_task_id
+                logger.info(f"[HEALTH] Released task {instance.current_task_id} from stuck Ralph {ralph_id}")
+            except Exception as e:
+                logger.warning(f"[HEALTH] Failed to release task from {ralph_id}: {e}")
+    except Exception as e:
+        logger.warning(f"[HEALTH] Failed to get instance {ralph_id}: {e}")
+
+    # Step 2: Update instance status
+    try:
+        # Write status file
+        write_ralph_status(
+            ralph_id,
+            task_id=None,
+            status="crashed",
+            message=f"Marked crashed: {reason}",
+        )
+
+        # Update database if available
+        try:
+            await update_instance_status(ralph_id, "CRASHED", error_message=reason)
+            result["status_updated"] = True
+            logger.info(f"[HEALTH] Updated {ralph_id} status to CRASHED")
+        except Exception:
+            # update_instance_status might not exist, use direct approach
+            pass
+
+    except Exception as e:
+        logger.warning(f"[HEALTH] Failed to update status for {ralph_id}: {e}")
+
+    # Step 3: Attempt to terminate the process
+    health = get_process_health(ralph_id)
+    if health["running"] and health["pid"]:
+        pid = health["pid"]
+        try:
+            # First try graceful termination (SIGTERM)
+            logger.info(f"[HEALTH] Sending SIGTERM to Ralph {ralph_id} (PID {pid})")
+            os.kill(pid, signal.SIGTERM)
+
+            # Wait briefly for graceful shutdown
+            import time
+            time.sleep(2)
+
+            # Check if still running
+            try:
+                os.kill(pid, 0)  # Check if process exists
+                # Still running, force kill
+                logger.info(f"[HEALTH] Sending SIGKILL to Ralph {ralph_id} (PID {pid})")
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass  # Process already terminated
+
+            result["terminated"] = True
+            logger.info(f"[HEALTH] Terminated stuck Ralph {ralph_id}")
+
+            # Clean up PID file
+            pid_path = get_ralph_pid_path(ralph_id)
+            try:
+                pid_path.unlink()
+            except FileNotFoundError:
+                pass
+
+            # Log to Ralph's log file
+            log_path = get_ralph_log_path(ralph_id)
+            try:
+                with open(log_path, "a") as f:
+                    f.write(f"\n{'='*60}\n")
+                    f.write(f"Ralph {ralph_id} TERMINATED (stuck) at {datetime.now().isoformat()}\n")
+                    f.write(f"Reason: {reason}\n")
+                    f.write(f"PID: {pid}\n")
+                    f.write(f"{'='*60}\n")
+            except Exception:
+                pass
+
+        except ProcessLookupError:
+            # Process already dead
+            result["terminated"] = True
+        except PermissionError:
+            logger.error(f"[HEALTH] Permission denied to kill Ralph {ralph_id}")
+        except Exception as e:
+            logger.error(f"[HEALTH] Error terminating Ralph {ralph_id}: {e}")
+
+    # Build summary message
+    actions = []
+    if result["task_released"]:
+        actions.append(f"released task {result['task_id']}")
+    if result["status_updated"]:
+        actions.append("updated status to CRASHED")
+    if result["terminated"]:
+        actions.append("terminated process")
+
+    result["message"] = f"Handled stuck Ralph {ralph_id}: {', '.join(actions) if actions else 'no actions taken'}"
+    logger.info(f"[HEALTH] {result['message']}")
+
+    return result
+
+
+def reap_zombie_ralph(ralph_id: str) -> bool:
+    """Attempt to reap a zombie Ralph process.
+
+    Returns True if the zombie was cleaned up.
+    """
+    health = get_process_health(ralph_id)
+
+    if health["state"] != "zombie":
+        return False
+
+    pid = health["pid"]
+    if not pid:
+        return False
+
+    logger.info(f"Attempting to reap zombie Ralph {ralph_id} (PID {pid})")
+
+    try:
+        # Try to wait on the zombie process
+        # This only works if we're the parent
+        import os
+        result = os.waitpid(pid, os.WNOHANG)
+        if result[0] == pid:
+            logger.info(f"Successfully reaped zombie Ralph {ralph_id}")
+
+            # Clean up PID file
+            pid_path = get_ralph_pid_path(ralph_id)
+            try:
+                pid_path.unlink()
+            except FileNotFoundError:
+                pass
+
+            # Update status file to indicate crash
+            write_ralph_status(
+                ralph_id,
+                task_id=None,
+                status="crashed",
+                message="Process became zombie and was reaped",
+            )
+
+            # Log to Ralph's log file
+            log_path = get_ralph_log_path(ralph_id)
+            try:
+                with open(log_path, "a") as f:
+                    f.write(f"\n{'='*60}\n")
+                    f.write(f"Ralph {ralph_id} CRASHED (zombie reaped) at {datetime.now().isoformat()}\n")
+                    f.write(f"PID: {pid}\n")
+                    f.write(f"{'='*60}\n")
+            except Exception as e:
+                logger.warning(f"Could not write crash to log: {e}")
+
+            return True
+        else:
+            logger.warning(f"waitpid returned {result} for zombie {ralph_id}")
+            return False
+
+    except ChildProcessError:
+        # Not our child - can't reap it
+        logger.warning(f"Cannot reap zombie {ralph_id} - not our child process")
+
+        # Still mark it as crashed in status
+        write_ralph_status(
+            ralph_id,
+            task_id=None,
+            status="crashed",
+            message="Process is zombie (cannot reap - not our child)",
+        )
+        return False
+
+    except Exception as e:
+        logger.error(f"Error reaping zombie {ralph_id}: {e}")
+        return False
+
+
+def cleanup_dead_ralphs() -> list[str]:
+    """Find and clean up dead/zombie Ralph processes.
+
+    Returns list of ralph_ids that were cleaned up.
+    """
+    cleaned = []
+    data_dir = _ensure_data_dir()
+
+    for pid_file in data_dir.glob("*.pid"):
+        ralph_id = pid_file.stem
+        health = get_process_health(ralph_id)
+
+        if health["state"] == "zombie":
+            if reap_zombie_ralph(ralph_id):
+                cleaned.append(ralph_id)
+                logger.info(f"Cleaned up zombie Ralph: {ralph_id}")
+        elif not health["running"] and health["pid"]:
+            # PID file exists but process is dead
+            logger.info(f"Cleaning up dead Ralph: {ralph_id}")
+            try:
+                # PID file may have already been cleaned up by get_process_health
+                if pid_file.exists():
+                    pid_file.unlink()
+                cleaned.append(ralph_id)
+
+                # Update status
+                write_ralph_status(
+                    ralph_id,
+                    task_id=None,
+                    status="crashed",
+                    message="Process died unexpectedly",
+                )
+            except FileNotFoundError:
+                # PID file already cleaned up by get_process_health
+                cleaned.append(ralph_id)
+                write_ralph_status(
+                    ralph_id,
+                    task_id=None,
+                    status="crashed",
+                    message="Process died unexpectedly",
+                )
+            except Exception as e:
+                logger.error(f"Error cleaning up {ralph_id}: {e}")
+
+    return cleaned
+
+
 def spawn_ralph_daemon(
     ralph_id: str,
     project: str,
@@ -92,12 +972,23 @@ def spawn_ralph_daemon(
         project: Project to work on
         fix_plan_path: Path to the @fix_plan.md file
         config: Optional Ralph configuration
-        targeting: Optional task targeting configuration
+        targeting: Optional task targeting configuration (logged but not passed to CLI;
+                   targeting should be embedded in the @fix_plan.md content)
         working_dir: Working directory for Ralph (defaults to fix_plan parent)
 
     Returns:
         Tuple of (success, message)
+
+    Note:
+        This function performs basic validation (API key, CLI availability).
+        For complete validation including concurrent limits, use can_spawn_ralph() first.
     """
+    # Pre-spawn validation (sync checks only)
+    valid, reason = _validate_spawn_requirements()
+    if not valid:
+        logger.error(f"Spawn validation failed: {reason}")
+        return (False, reason)
+
     config = config or RalphConfig()
     targeting = targeting or TargetingConfig()
 
@@ -116,6 +1007,21 @@ def spawn_ralph_daemon(
     else:
         working_dir = fix_plan_path.parent
 
+    # Multiple Ralphs on same project is ALLOWED - that's the whole point of chiefwiggum!
+    # Each Ralph should work on different tasks (coordinated via task claiming).
+    # Log for visibility but don't block.
+    ralphs_by_dir = _get_ralphs_by_working_dir()
+    if working_dir in ralphs_by_dir:
+        existing_ralphs = ralphs_by_dir[working_dir]
+        logger.info(
+            f"Adding Ralph to project with existing Ralph(s): {existing_ralphs}. "
+            f"Ensure task coordination to avoid conflicts."
+        )
+
+    # Ensure project has proper Claude Code permissions for autonomous operation
+    # This creates .claude/settings.json with Edit and other necessary permissions
+    _ensure_project_permissions(working_dir)
+
     # Prepare log and session files
     log_path = get_ralph_log_path(ralph_id)
     session_path = get_ralph_session_path(ralph_id)
@@ -132,38 +1038,235 @@ def spawn_ralph_daemon(
         session_path=str(session_path),
     )
 
+    logger.info(f"[SPAWN] Starting spawn process for Ralph {ralph_id}")
+    logger.info(f"[SPAWN] Project: {project}, Working dir: {working_dir}")
+    logger.info(f"[SPAWN] Fix plan: {fix_plan_path}")
+    logger.info(f"[SPAWN] Config: model={config.model.value}, timeout={config.timeout_minutes}m")
+
     try:
         # Open log file for output
         log_file = open(log_path, "a")
         log_file.write(f"\n{'='*60}\n")
         log_file.write(f"Ralph {ralph_id} starting at {datetime.now().isoformat()}\n")
         log_file.write(f"Project: {project}\n")
+        log_file.write(f"Working Directory: {working_dir}\n")
         log_file.write(f"Fix Plan: {fix_plan_path}\n")
         log_file.write(f"Config: {config.model_dump()}\n")
         log_file.write(f"Targeting: {targeting.model_dump()}\n")
         log_file.write(f"Command: {' '.join(cmd)}\n")
+        log_file.write(f"Parent PID: {os.getpid()}\n")
+        log_file.write(f"ANTHROPIC_API_KEY set: {bool(os.environ.get('ANTHROPIC_API_KEY'))}\n")
         log_file.write(f"{'='*60}\n\n")
         log_file.flush()
 
+        logger.info(f"[SPAWN] Log file ready: {log_path}")
+
         # Spawn the process
+        # CRITICAL: Explicitly pass environment to ensure ANTHROPIC_API_KEY is available
+        # Without explicit env=, daemon processes (start_new_session=True) may not
+        # inherit environment variables reliably on all systems
+        spawn_env = os.environ.copy()
+        logger.info(f"[SPAWN] Executing: {' '.join(cmd[:3])}...")  # First 3 parts of command
+        logger.info(f"[SPAWN] ANTHROPIC_API_KEY in spawn_env: {bool(spawn_env.get('ANTHROPIC_API_KEY'))}")
         process = subprocess.Popen(
             cmd,
             cwd=str(working_dir),
             stdout=log_file,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
+            env=spawn_env,  # Explicitly pass environment
             start_new_session=True,  # Detach from terminal
         )
 
         # Write PID file
         pid_path.write_text(str(process.pid))
+        logger.info(f"[SPAWN] PID file written: {pid_path} -> {process.pid}")
 
-        logger.info(f"Spawned Ralph {ralph_id} with PID {process.pid}")
+        # Verify process started correctly (brief check)
+        import time
+        time.sleep(0.2)  # Brief wait for process to either start or fail immediately
+
+        # Check if process is still running
+        poll_result = process.poll()
+        if poll_result is not None:
+            # Process exited immediately - this is bad
+            logger.error(f"[SPAWN] Ralph {ralph_id} exited immediately with code {poll_result}")
+
+            # Read any error output from log
+            log_file.flush()
+            try:
+                with open(log_path, "r") as f:
+                    recent_log = f.read()[-2000:]  # Last 2KB
+                logger.error(f"[SPAWN] Recent log output:\n{recent_log}")
+            except Exception:
+                pass
+
+            # Clean up PID file
+            try:
+                pid_path.unlink()
+            except FileNotFoundError:
+                pass
+
+            return (False, f"Ralph {ralph_id} exited immediately (code: {poll_result})")
+
+        # Verify it's actually running
+        health = get_process_health(ralph_id)
+        logger.info(f"[SPAWN] Initial health check: {health['message']}")
+
+        if not health["healthy"]:
+            logger.warning(f"[SPAWN] Process started but not healthy: {health}")
+
+        logger.info(f"[SPAWN] Successfully spawned Ralph {ralph_id} with PID {process.pid}")
+
+        # Close log file in parent - child has its own copy of the fd
+        log_file.close()
+
         return (True, f"Spawned Ralph {ralph_id} (PID: {process.pid})")
 
+    except FileNotFoundError as e:
+        logger.error(f"[SPAWN] File not found during spawn of {ralph_id}: {e}")
+        return (False, f"File not found: {e}")
+    except PermissionError as e:
+        logger.error(f"[SPAWN] Permission error during spawn of {ralph_id}: {e}")
+        return (False, f"Permission denied: {e}")
     except Exception as e:
-        logger.error(f"Failed to spawn Ralph {ralph_id}: {e}")
+        logger.error(f"[SPAWN] Failed to spawn Ralph {ralph_id}: {e}", exc_info=True)
         return (False, f"Failed to spawn: {e}")
+
+
+async def spawn_ralph_with_task_claim(
+    ralph_id: str,
+    project: str,
+    fix_plan_path: str | Path,
+    config: RalphConfig | None = None,
+    targeting: TargetingConfig | None = None,
+    working_dir: str | Path | None = None,
+) -> tuple[bool, str, str | None]:
+    """Spawn a Ralph instance that claims and works on a SINGLE task.
+
+    This is the preferred method for spawning Ralphs. It:
+    1. Syncs tasks from @fix_plan.md to the database
+    2. Claims the next available task (respecting targeting)
+    3. Generates a task-specific prompt
+    4. Spawns Ralph with that focused prompt
+    5. Registers the Ralph in the database
+
+    Args:
+        ralph_id: Unique ID for this Ralph instance
+        project: Project to work on
+        fix_plan_path: Path to the @fix_plan.md file
+        config: Optional Ralph configuration
+        targeting: Optional task targeting configuration
+        working_dir: Working directory for Ralph (defaults to fix_plan parent)
+
+    Returns:
+        Tuple of (success, message, task_id) - task_id is None on failure
+    """
+    from chiefwiggum.coordination import (
+        claim_task,
+        sync_tasks_from_fix_plan,
+        register_ralph_instance_with_config,
+        _update_instance_task,
+    )
+
+    # Load ralph loop settings defaults from config
+    loop_settings = get_ralph_loop_settings()
+
+    # Create config with defaults from settings if not provided
+    if config is None:
+        config = RalphConfig(
+            # Invert session_continuity to no_continue
+            # session_continuity=True means no_continue=False (continue sessions)
+            no_continue=not loop_settings.get("session_continuity", True),
+            session_expiry_hours=loop_settings.get("session_expiry_hours", 24),
+            output_format=loop_settings.get("output_format", "json"),
+            max_calls_per_hour=loop_settings.get("max_calls_per_hour", 100),
+        )
+    targeting = targeting or TargetingConfig()
+    fix_plan_path = Path(fix_plan_path).resolve()
+
+    logger.info(f"[SPAWN_WITH_TASK] Starting for {ralph_id} on project {project}")
+    logger.info(f"[SPAWN_WITH_TASK] Fix plan: {fix_plan_path}")
+
+    if not fix_plan_path.exists():
+        logger.error(f"[SPAWN_WITH_TASK] Fix plan not found: {fix_plan_path}")
+        return (False, f"Fix plan not found: {fix_plan_path}", None)
+
+    # Step 1: Sync tasks from fix_plan to database
+    logger.info(f"[SPAWN_WITH_TASK] Step 1: Syncing tasks from fix_plan")
+    try:
+        synced_count = await sync_tasks_from_fix_plan(fix_plan_path, project)
+        logger.info(f"[SPAWN_WITH_TASK] Synced {synced_count} tasks")
+    except Exception as e:
+        logger.warning(f"[SPAWN_WITH_TASK] Failed to sync tasks: {e}")
+        # Continue anyway - tasks might already be synced
+
+    # Step 2: Claim the next available task
+    logger.info(f"[SPAWN_WITH_TASK] Step 2: Claiming next task for {ralph_id}")
+    claimed = await claim_task(ralph_id, project=project)
+    if not claimed:
+        logger.warning(f"[SPAWN_WITH_TASK] No tasks available to claim for {ralph_id}")
+        return (False, "No tasks available to claim", None)
+
+    task_id = claimed["task_id"]
+    task_title = claimed["task_title"]
+    logger.info(f"[SPAWN_WITH_TASK] Claimed task: {task_id} - {task_title}")
+
+    # Create a TaskClaim object for prompt generation
+    from chiefwiggum.models import TaskClaim, TaskClaimStatus
+    task = TaskClaim(
+        task_id=task_id,
+        task_title=task_title,
+        task_priority=claimed.get("task_priority", "MEDIUM"),
+        task_section=claimed.get("task_section"),
+        project=project,
+        status=TaskClaimStatus.IN_PROGRESS,
+    )
+
+    # Step 3: Generate task-specific prompt
+    logger.info(f"[SPAWN_WITH_TASK] Step 3: Generating task-specific prompt")
+    prompt_content = generate_task_prompt(task, fix_plan_path)
+    prompt_path = get_task_prompt_path(ralph_id, task_id)
+    prompt_path.write_text(prompt_content)
+    logger.info(f"[SPAWN_WITH_TASK] Prompt written to: {prompt_path}")
+
+    # Step 4: Register Ralph in database with config and task info
+    logger.info(f"[SPAWN_WITH_TASK] Step 4: Registering Ralph in database")
+    try:
+        await register_ralph_instance_with_config(
+            ralph_id=ralph_id,
+            project=project,
+            config=config,
+            targeting=targeting,
+        )
+        await _update_instance_task(ralph_id, task_id)
+        logger.info(f"[SPAWN_WITH_TASK] Ralph registered successfully")
+    except Exception as e:
+        logger.warning(f"[SPAWN_WITH_TASK] Failed to register Ralph in database: {e}")
+        # Continue anyway - spawning is more important
+
+    # Step 5: Spawn Ralph with the task-specific prompt
+    logger.info(f"[SPAWN_WITH_TASK] Step 5: Spawning Ralph daemon")
+    working_dir = working_dir or fix_plan_path.parent
+    success, message = spawn_ralph_daemon(
+        ralph_id=ralph_id,
+        project=project,
+        fix_plan_path=str(prompt_path),  # Use task-specific prompt, not full fix_plan
+        config=config,
+        targeting=targeting,
+        working_dir=working_dir,
+    )
+    logger.info(f"[SPAWN_WITH_TASK] Spawn result: success={success}, message={message}")
+
+    if success:
+        # Write initial status
+        write_ralph_status(ralph_id, task_id, "working", loop_count=1, message=f"Working on: {task_title}")
+        return (True, f"Spawned {ralph_id} on task: {task_title[:40]}", task_id)
+    else:
+        # Release the claim since spawn failed
+        from chiefwiggum.coordination import release_claim
+        await release_claim(ralph_id, task_id)
+        return (False, message, None)
 
 
 def _build_ralph_command(
@@ -174,58 +1277,87 @@ def _build_ralph_command(
     targeting: TargetingConfig,
     session_path: str,
 ) -> list[str]:
-    """Build the Claude command for a Ralph instance.
+    """Build the command to run ralph_loop.sh.
 
-    This constructs a command that:
-    1. Starts Claude with the ralph-loop skill
-    2. Passes configuration via environment or arguments
-    3. Sets up the appropriate model and persona
+    Uses the bundled ralph_loop.sh script from chiefwiggum.scripts,
+    which handles Claude orchestration, rate limiting, and session management.
+
+    Note: Chiefwiggum manages permissions by passing --allowed-tools to ralph_loop.sh.
+    This abstracts permission configuration from the user.
     """
-    cmd = ["claude"]
+    # Get ralph_loop.sh path (bundled or from env override)
+    ralph_script = get_ralph_loop_path()
 
-    # Add model selection
-    model_map = {
-        ClaudeModel.OPUS: "opus",
-        ClaudeModel.SONNET: "sonnet",
-        ClaudeModel.HAIKU: "haiku",
-    }
-    if config.model in model_map:
-        cmd.extend(["--model", model_map[config.model]])
+    cmd = [str(ralph_script)]
 
-    # Add the ralph-loop prompt with configuration
-    prompt_parts = [
-        f"/ralph-loop",
-        f"--ralph-id {ralph_id}",
-        f"--project {project}",
-        f"--fix-plan {fix_plan_path}",
-    ]
-
-    # Add config options
+    # Add timeout
     if config.timeout_minutes:
-        prompt_parts.append(f"--timeout {config.timeout_minutes}")
+        cmd.extend(["--timeout", str(config.timeout_minutes)])
+
+    # Don't use --monitor as it creates its own tmux session that we can't track
+    # Run directly so we can track the PID
+
+    # Session continuity (existing, but honor config default)
     if config.no_continue:
-        prompt_parts.append("--no-continue")
-    if config.max_loops:
-        prompt_parts.append(f"--max-loops {config.max_loops}")
+        cmd.append("--no-continue")
 
-    # Add targeting options
-    if targeting.priority_min:
-        prompt_parts.append(f"--priority-min {targeting.priority_min.value}")
-    if targeting.task_id:
-        prompt_parts.append(f"--task-id {targeting.task_id}")
-    if targeting.categories:
-        cats = ",".join(c.value for c in targeting.categories)
-        prompt_parts.append(f"--categories {cats}")
+    # Session expiry (only pass if non-default)
+    if config.session_expiry_hours != 24:
+        cmd.extend(["--session-expiry", str(config.session_expiry_hours)])
 
-    # Add persona if specified
-    if config.persona:
-        prompt_parts.append(f"--persona {config.persona}")
+    # Output format (only pass if non-default)
+    if config.output_format != "json":
+        cmd.extend(["--output-format", config.output_format])
 
-    # Combine into single prompt argument
-    cmd.extend(["--print", " ".join(prompt_parts)])
+    # Rate limiting (only pass if non-default)
+    if config.max_calls_per_hour != 100:
+        cmd.extend(["--calls", str(config.max_calls_per_hour)])
 
-    # Add dangerously skip permissions to avoid prompts
-    cmd.append("--dangerously-skip-permissions")
+    # Use verbose to see progress in logs
+    cmd.append("--verbose")
+
+    # CRITICAL: Pass allowed tools including Edit to ensure Ralph can make changes
+    # This abstracts permission management from the user
+    # Note: Uses colon format Bash(cmd:*) to match Claude CLI expectations
+    allowed_tools = [
+        # Core tools
+        "Read",
+        "Write",
+        "Edit",  # Essential for modifying existing files
+        "Glob",
+        "Grep",
+        # Bash commands - comprehensive set for autonomous operation
+        "Bash(git:*)",
+        "Bash(npm:*)",
+        "Bash(yarn:*)",
+        "Bash(pip:*)",
+        "Bash(uv:*)",
+        "Bash(pytest:*)",
+        "Bash(python:*)",
+        "Bash(python3:*)",
+        "Bash(node:*)",
+        "Bash(make:*)",
+        "Bash(ruff:*)",
+        "Bash(mypy:*)",
+        "Bash(cargo:*)",
+        "Bash(ls:*)",
+        "Bash(cat:*)",
+        "Bash(head:*)",
+        "Bash(tail:*)",
+        "Bash(mkdir:*)",
+        "Bash(cp:*)",
+        "Bash(mv:*)",
+        "Bash(touch:*)",
+        "Bash(chmod:*)",
+        "Bash(echo:*)",
+        "Bash(grep:*)",
+        "Bash(find:*)",
+        "Bash(sed:*)",
+    ]
+    cmd.extend(["--allowed-tools", ",".join(allowed_tools)])
+
+    # Use the fix_plan as the prompt file
+    cmd.extend(["--prompt", fix_plan_path])
 
     return cmd
 
@@ -312,7 +1444,8 @@ def read_ralph_log(ralph_id: str, lines: int = 100) -> str:
         return f"No log file found for Ralph {ralph_id}"
 
     try:
-        content = log_path.read_text()
+        # Use errors='replace' to handle non-UTF-8 bytes (terminal color codes, etc.)
+        content = log_path.read_text(encoding="utf-8", errors="replace")
         log_lines = content.splitlines()
         if len(log_lines) > lines:
             log_lines = log_lines[-lines:]
@@ -354,16 +1487,107 @@ async def set_max_concurrent_ralphs(limit: int) -> None:
     await set_setting("max_concurrent_ralphs", str(limit))
 
 
+def find_orphaned_tmux_sessions() -> list[str]:
+    """Find tmux sessions named ralph-* that aren't tracked by PID files.
+
+    Returns:
+        List of orphaned tmux session names
+    """
+    orphans = []
+    try:
+        # Get all tmux sessions
+        result = subprocess.run(
+            ["tmux", "list-sessions", "-F", "#{session_name}"],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            return []
+
+        tmux_sessions = result.stdout.strip().split("\n") if result.stdout.strip() else []
+
+        # Filter for ralph-* sessions
+        ralph_sessions = [s for s in tmux_sessions if s.startswith("ralph-")]
+
+        # Get tracked ralph IDs from PID files
+        tracked_ralphs = {r["ralph_id"] for r in get_running_ralphs()}
+
+        # Find orphans (tmux sessions not in tracked ralphs)
+        for session in ralph_sessions:
+            # Session names might be ralph-{timestamp} or ralph-{id}
+            # Check if any tracked ralph matches
+            is_tracked = any(
+                session == f"ralph-{r.split('-')[-1]}" or session in r or r in session
+                for r in tracked_ralphs
+            )
+            if not is_tracked:
+                orphans.append(session)
+
+    except FileNotFoundError:
+        # tmux not installed
+        pass
+    except Exception as e:
+        logger.warning(f"Error checking for orphaned sessions: {e}")
+
+    return orphans
+
+
+def cleanup_orphaned_tmux_sessions(dry_run: bool = False) -> list[tuple[str, bool]]:
+    """Kill orphaned ralph-* tmux sessions.
+
+    Args:
+        dry_run: If True, only report what would be killed
+
+    Returns:
+        List of (session_name, was_killed) tuples
+    """
+    results = []
+    orphans = find_orphaned_tmux_sessions()
+
+    for session in orphans:
+        if dry_run:
+            results.append((session, False))
+            logger.info(f"Would kill orphaned tmux session: {session}")
+        else:
+            try:
+                subprocess.run(
+                    ["tmux", "kill-session", "-t", session],
+                    capture_output=True,
+                    check=True,
+                )
+                results.append((session, True))
+                logger.info(f"Killed orphaned tmux session: {session}")
+            except subprocess.CalledProcessError:
+                results.append((session, False))
+                logger.warning(f"Failed to kill tmux session: {session}")
+
+    return results
+
+
 async def can_spawn_ralph() -> tuple[bool, str]:
     """Check if we can spawn another Ralph instance.
+
+    Validates:
+    1. ANTHROPIC_API_KEY is set
+    2. Claude CLI is available
+    3. Concurrent Ralph limit not exceeded
 
     Returns:
         Tuple of (can_spawn, reason)
     """
+    # Check 1: API key
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        return (False, "ANTHROPIC_API_KEY not set. Press 'S' for Settings.")
+
+    # Check 2: Claude CLI available
+    if shutil.which("claude") is None:
+        return (False, "Claude CLI not found. Install: npm install -g @anthropic-ai/claude-code")
+
+    # Check 3: Concurrent limit
     current = len(get_running_ralphs())
     max_limit = await get_max_concurrent_ralphs()
 
     if current >= max_limit:
         return (False, f"At limit: {current}/{max_limit} Ralphs running")
 
-    return (True, f"Can spawn: {current}/{max_limit} Ralphs running")
+    return (True, f"Ready: {current}/{max_limit} Ralphs")

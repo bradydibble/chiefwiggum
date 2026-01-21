@@ -7,8 +7,12 @@ ChiefWiggum orchestrates multiple Ralph (Claude Code) instances working on the s
 ## Installation
 
 ```bash
-cd chiefwiggum
-pip install -e .
+pipx install --force /Users/bdibble/claudecode/chiefwiggum
+```
+
+For development:
+```bash
+pip install -e /Users/bdibble/claudecode/chiefwiggum
 ```
 
 ## Quick Start

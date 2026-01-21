@@ -1,7 +1,7 @@
 """ChiefWiggum Database
 
 SQLite with WAL mode for concurrent access.
-Database stored at ~/.chiefwiggum/coordination.db by default.
+Database path determined by the paths module (XDG-compliant).
 """
 
 import logging
@@ -10,15 +10,22 @@ from pathlib import Path
 
 import aiosqlite
 
+from chiefwiggum.paths import get_paths
+
 logger = logging.getLogger(__name__)
 
 
 def get_database_path() -> Path:
-    """Get database path from environment or use default ~/.chiefwiggum/coordination.db."""
+    """Get database path from environment or use XDG-compliant default.
+
+    Priority:
+    1. CHIEFWIGGUM_DB environment variable (for testing/override)
+    2. XDG-compliant path from paths module (with legacy fallback)
+    """
     env_path = os.environ.get("CHIEFWIGGUM_DB")
     if env_path:
         return Path(env_path)
-    return Path.home() / ".chiefwiggum" / "coordination.db"
+    return get_paths().database_path
 
 
 # SQLite configuration for reliability

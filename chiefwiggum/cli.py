@@ -500,5 +500,121 @@ def cleanup(ralph_id: str | None, clean_all: bool, dry_run: bool, older_than: st
             console.print(f"\n[green]Deleted {deleted_count} file(s)[/green]")
 
 
+@main.command()
+@click.option("--dry-run", "-n", is_flag=True, help="Show what would be migrated without moving files")
+@click.option("--status", "-s", is_flag=True, help="Show migration status only")
+def migrate(dry_run: bool, status: bool):
+    """Migrate from legacy ~/.chiefwiggum/ to XDG-compliant paths.
+
+    This migrates configuration and data files to platform-appropriate locations:
+    - Linux: ~/.config/chiefwiggum/, ~/.local/share/chiefwiggum/
+    - macOS: ~/Library/Application Support/chiefwiggum/
+    - Windows: %LOCALAPPDATA%/chiefwiggum/
+
+    Examples:
+
+        wig migrate --status     # Check migration status
+
+        wig migrate --dry-run    # Preview what would be migrated
+
+        wig migrate              # Perform the migration
+    """
+    from rich.console import Console
+    from rich.table import Table
+
+    from chiefwiggum.paths import get_migration_status, migrate_to_xdg
+
+    console = Console()
+
+    if status:
+        # Show migration status
+        migration_status = get_migration_status()
+
+        table = Table(title="Migration Status")
+        table.add_column("Property", style="cyan")
+        table.add_column("Value", style="green")
+
+        table.add_row("Using Legacy Paths", "Yes" if migration_status["using_legacy"] else "No")
+        table.add_row("Legacy Dir Exists", "Yes" if migration_status["legacy_exists"] else "No")
+        table.add_row("XDG Dir Exists", "Yes" if migration_status["xdg_exists"] else "No")
+        table.add_row("Legacy Path", migration_status["legacy_path"])
+        table.add_row("XDG Config Path", migration_status["xdg_config_path"])
+
+        console.print(table)
+        console.print(f"\n[dim]Recommended: {migration_status['recommended_action']}[/dim]")
+        return
+
+    # Perform migration
+    console.print("[bold]Migrating to XDG-compliant paths...[/bold]\n")
+
+    result = migrate_to_xdg(dry_run=dry_run)
+
+    if result["migrated"]:
+        if dry_run:
+            console.print("[yellow]Would migrate:[/yellow]")
+        else:
+            console.print("[green]Migrated:[/green]")
+        for src, dst in result["migrated"]:
+            console.print(f"  {src} -> {dst}")
+
+    if result["skipped"]:
+        console.print("\n[dim]Skipped (destination exists):[/dim]")
+        for src, dst in result["skipped"]:
+            console.print(f"  {src}")
+
+    if result["errors"]:
+        console.print("\n[red]Errors:[/red]")
+        for src, dst in result["errors"]:
+            console.print(f"  Failed: {src}")
+
+    if dry_run:
+        console.print(f"\n[yellow]Would migrate {len(result['migrated'])} item(s)[/yellow]")
+    elif result["migrated"]:
+        console.print(f"\n[green]Migration complete: {len(result['migrated'])} item(s) migrated[/green]")
+        console.print("[dim]The legacy directory can be removed after verifying everything works.[/dim]")
+    else:
+        console.print("\n[dim]Nothing to migrate[/dim]")
+
+
+@main.command("paths")
+def show_paths():
+    """Show current path configuration.
+
+    Displays where ChiefWiggum stores its configuration, data, and state files.
+    """
+    from rich.console import Console
+    from rich.table import Table
+
+    from chiefwiggum.paths import get_paths
+
+    console = Console()
+    paths = get_paths()
+
+    table = Table(title="ChiefWiggum Paths")
+    table.add_column("Purpose", style="cyan")
+    table.add_column("Path", style="green")
+    table.add_column("Exists", style="yellow")
+
+    rows = [
+        ("Config Directory", paths.config_dir),
+        ("Config File", paths.config_path),
+        ("Data Directory", paths.data_dir),
+        ("Database", paths.database_path),
+        ("State Directory", paths.state_dir),
+        ("Ralphs Directory", paths.ralphs_dir),
+        ("Logs Directory", paths.logs_dir),
+    ]
+
+    for purpose, path in rows:
+        exists = "Yes" if path.exists() else "No"
+        table.add_row(purpose, str(path), exists)
+
+    console.print(table)
+
+    if paths.using_legacy:
+        console.print("\n[yellow]Note: Using legacy ~/.chiefwiggum/ paths[/yellow]")
+        console.print("[dim]Run 'chiefwiggum migrate' to move to XDG-compliant locations[/dim]")
+
+
 if __name__ == "__main__":
     main()

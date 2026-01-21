@@ -227,20 +227,33 @@ async def sync_tasks_from_fix_plan(fix_plan_path: str | Path, project: str | Non
 
             if existing:
                 existing_status = existing[1]
+                # Always infer and update category for existing tasks
+                category = infer_task_category(task.subtasks + task.completed_subtasks, task.title)
+
                 if task.is_complete and existing_status != TaskClaimStatus.COMPLETED.value:
                     await conn.execute(
                         """UPDATE task_claims
-                           SET status = ?, updated_at = ?
+                           SET status = ?, category = ?, updated_at = ?
                            WHERE task_id = ?""",
-                        (TaskClaimStatus.COMPLETED.value, now, task.task_id)
+                        (TaskClaimStatus.COMPLETED.value, category.value, now, task.task_id)
+                    )
+                else:
+                    # Update category even if status unchanged
+                    await conn.execute(
+                        """UPDATE task_claims
+                           SET category = ?, updated_at = ?
+                           WHERE task_id = ?""",
+                        (category.value, now, task.task_id)
                     )
             else:
                 status = TaskClaimStatus.COMPLETED.value if task.is_complete else TaskClaimStatus.PENDING.value
+                # Infer category from task title and subtasks
+                category = infer_task_category(task.subtasks + task.completed_subtasks, task.title)
                 await conn.execute(
                     """INSERT INTO task_claims
-                       (task_id, task_title, task_priority, task_section, project, status, created_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                    (task.task_id, task.title, task.priority.value, task.section, project, status, now)
+                       (task_id, task_title, task_priority, task_section, project, status, created_at, category)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (task.task_id, task.title, task.priority.value, task.section, project, status, now, category.value)
                 )
 
         await conn.commit()
@@ -370,21 +383,36 @@ async def complete_task(
     try:
         now = datetime.now()
 
+        # Get started_at before updating for history recording
+        cursor = await conn.execute(
+            "SELECT started_at FROM task_claims WHERE task_id = ? AND claimed_by_ralph_id = ?",
+            (task_id, ralph_id)
+        )
+        row = await cursor.fetchone()
+        started_at = row[0] if row else None
+
         cursor = await conn.execute(
             """UPDATE task_claims
                SET status = ?,
                    completion_message = ?,
                    git_commit_sha = ?,
+                   completed_at = ?,
                    updated_at = ?
                WHERE task_id = ?
                  AND claimed_by_ralph_id = ?
                  AND status = 'in_progress'""",
-            (TaskClaimStatus.COMPLETED.value, message, commit_sha, now, task_id, ralph_id)
+            (TaskClaimStatus.COMPLETED.value, message, commit_sha, now, now, task_id, ralph_id)
         )
-        await conn.commit()
 
         if cursor.rowcount > 0:
+            # Record in task_history
+            await _record_task_history(conn, task_id, ralph_id, started_at, now, "completed")
+            # Commit before calling helpers that open their own connections
+            await conn.commit()
             await _update_instance_task(ralph_id, None)
+            # Update instance stats
+            work_seconds = (now - datetime.fromisoformat(started_at)).total_seconds() if started_at else 0
+            await _increment_instance_stats(ralph_id, completed=True, work_seconds=work_seconds)
             return True
         return False
     finally:
@@ -426,7 +454,7 @@ async def fail_task(ralph_id: str, task_id: str, error_message: str) -> bool:
         await conn.close()
 
 
-async def release_claim(ralph_id: str, task_id: str) -> bool:
+async def release_claim(ralph_id: str, task_id: str, reason: str = "manual") -> bool:
     """Release a claim without completing or failing the task.
 
     Returns the task to 'pending' status so another Ralph can claim it.
@@ -434,6 +462,7 @@ async def release_claim(ralph_id: str, task_id: str) -> bool:
     Args:
         ralph_id: ID of the Ralph instance
         task_id: ID of the task
+        reason: Reason for the release (e.g., "manual", "ralph_crashed", "ralph_died")
 
     Returns:
         True if claim was released, False if not found or not owned
@@ -441,6 +470,14 @@ async def release_claim(ralph_id: str, task_id: str) -> bool:
     conn = await get_connection()
     try:
         now = datetime.now()
+
+        # Get started_at for history recording
+        cursor = await conn.execute(
+            "SELECT started_at FROM task_claims WHERE task_id = ? AND claimed_by_ralph_id = ?",
+            (task_id, ralph_id)
+        )
+        row = await cursor.fetchone()
+        started_at = row[0] if row else None
 
         cursor = await conn.execute(
             """UPDATE task_claims
@@ -454,12 +491,102 @@ async def release_claim(ralph_id: str, task_id: str) -> bool:
                  AND status = 'in_progress'""",
             (now, task_id, ralph_id)
         )
-        await conn.commit()
 
         if cursor.rowcount > 0:
+            # Record release in task_history for audit trail
+            await _record_task_history(
+                conn, task_id, ralph_id, started_at, now,
+                "released", error_message=f"Released: {reason}"
+            )
+            # Commit before calling helpers that open their own connections
+            await conn.commit()
             await _update_instance_task(ralph_id, None)
             return True
         return False
+    finally:
+        await conn.close()
+
+
+async def check_ralph_completions() -> list[dict]:
+    """Check all running Ralphs for task completion markers.
+
+    This function scans the logs of all running Ralph instances for
+    TASK_COMPLETE or TASK_FAILED markers and updates task status accordingly.
+    It also updates heartbeats for ALL running Ralphs to prevent stale detection.
+
+    Returns:
+        List of completion events: [{"ralph_id": str, "task_id": str, "status": "completed"|"failed", "message": str}]
+    """
+    from chiefwiggum.spawner import check_task_completion, get_running_ralphs
+
+    events = []
+    running_ralphs = get_running_ralphs()
+    running_ralph_ids = {r["ralph_id"] for r in running_ralphs}
+
+    conn = await get_connection()
+    try:
+        now = datetime.now()
+
+        # Update heartbeat for ALL running Ralphs (regardless of task assignment)
+        # This prevents instances from showing as STALE when they're actually running
+        for ralph_id in running_ralph_ids:
+            await conn.execute(
+                """UPDATE ralph_instances
+                   SET last_heartbeat = ?
+                   WHERE ralph_id = ?""",
+                (now, ralph_id)
+            )
+        await conn.commit()
+
+        # Get all active instances with assigned tasks (for completion checking)
+        cursor = await conn.execute(
+            """SELECT ri.ralph_id, ri.current_task_id
+               FROM ralph_instances ri
+               WHERE ri.status = 'active'
+                 AND ri.current_task_id IS NOT NULL"""
+        )
+        rows = await cursor.fetchall()
+
+        for row in rows:
+            ralph_id = row[0]
+            task_id = row[1]
+
+            # Check if Ralph is still running
+            if ralph_id not in running_ralph_ids:
+                # Ralph died without completing - release the task
+                await release_claim(ralph_id, task_id, reason="ralph_died")
+                events.append({
+                    "ralph_id": ralph_id,
+                    "task_id": task_id,
+                    "status": "released",
+                    "message": "Ralph died without completing task",
+                })
+                continue
+
+            # Check log for completion markers
+            completed_task_id, failure_reason = check_task_completion(ralph_id)
+
+            if completed_task_id and completed_task_id == task_id:
+                if failure_reason:
+                    # Task failed
+                    await fail_task(ralph_id, task_id, failure_reason)
+                    events.append({
+                        "ralph_id": ralph_id,
+                        "task_id": task_id,
+                        "status": "failed",
+                        "message": failure_reason,
+                    })
+                else:
+                    # Task completed successfully
+                    await complete_task(ralph_id, task_id, message="Completed via log marker")
+                    events.append({
+                        "ralph_id": ralph_id,
+                        "task_id": task_id,
+                        "status": "completed",
+                        "message": "Task completed successfully",
+                    })
+
+        return events
     finally:
         await conn.close()
 
@@ -563,6 +690,83 @@ async def shutdown_instance(ralph_id: str) -> None:
         await conn.close()
 
 
+async def delete_instance(ralph_id: str) -> bool:
+    """Delete a Ralph instance from the database.
+
+    Used for cleaning up stopped/crashed instances ("cattle not pets").
+    Task history is preserved in task_claims table.
+    Only the instance record is removed.
+
+    Args:
+        ralph_id: ID of the Ralph instance
+
+    Returns:
+        True if instance was deleted, False if not found
+    """
+    conn = await get_connection()
+    try:
+        cursor = await conn.execute(
+            "DELETE FROM ralph_instances WHERE ralph_id = ?",
+            (ralph_id,)
+        )
+        await conn.commit()
+        deleted = cursor.rowcount > 0
+        if deleted:
+            logger.info(f"Ralph instance deleted: {ralph_id}")
+        return deleted
+    finally:
+        await conn.close()
+
+
+async def update_instance_status(ralph_id: str, status: str, error_message: str | None = None) -> bool:
+    """Update a Ralph instance status.
+
+    Args:
+        ralph_id: ID of the Ralph instance
+        status: New status (ACTIVE, IDLE, PAUSED, STOPPED, CRASHED)
+        error_message: Optional error message (for CRASHED status)
+
+    Returns:
+        True if instance was updated, False if not found
+    """
+    conn = await get_connection()
+    try:
+        # Validate status
+        try:
+            status_enum = RalphInstanceStatus(status.lower())
+        except ValueError:
+            logger.warning(f"Invalid status '{status}' for Ralph {ralph_id}")
+            return False
+
+        # Build update query
+        if error_message:
+            cursor = await conn.execute(
+                """UPDATE ralph_instances
+                   SET status = ?,
+                       last_error = ?
+                   WHERE ralph_id = ?""",
+                (status_enum.value, error_message, ralph_id)
+            )
+        else:
+            cursor = await conn.execute(
+                """UPDATE ralph_instances
+                   SET status = ?
+                   WHERE ralph_id = ?""",
+                (status_enum.value, ralph_id)
+            )
+
+        await conn.commit()
+
+        if cursor.rowcount > 0:
+            logger.info(f"Updated Ralph {ralph_id} status to {status_enum.value}")
+            return True
+        else:
+            logger.warning(f"Ralph instance {ralph_id} not found for status update")
+            return False
+    finally:
+        await conn.close()
+
+
 async def mark_stale_instances_crashed() -> int:
     """Mark instances without recent heartbeat as crashed.
 
@@ -588,6 +792,17 @@ async def mark_stale_instances_crashed() -> int:
         stale_ids = [row[0] for row in stale_instances]
 
         placeholders = ",".join("?" * len(stale_ids))
+
+        # Get tasks that will be released for history recording
+        cursor = await conn.execute(
+            f"""SELECT task_id, claimed_by_ralph_id, started_at FROM task_claims
+               WHERE claimed_by_ralph_id IN ({placeholders})
+                 AND status = 'in_progress'""",
+            stale_ids
+        )
+        released_tasks = await cursor.fetchall()
+
+        # Release tasks back to pending
         await conn.execute(
             f"""UPDATE task_claims
                SET status = 'pending',
@@ -599,6 +814,13 @@ async def mark_stale_instances_crashed() -> int:
                  AND status = 'in_progress'""",
             [now] + stale_ids
         )
+
+        # Record history for each released task
+        for task_id, ralph_id, started_at in released_tasks:
+            await _record_task_history(
+                conn, task_id, ralph_id, started_at, now,
+                "released", error_message="Released: ralph_crashed"
+            )
 
         await conn.execute(
             f"""UPDATE ralph_instances
@@ -2058,3 +2280,358 @@ async def export_tasks_json(output_path: str | Path | None = None) -> str:
 
     logger.info(f"Exported data to {output_path}")
     return str(output_path)
+
+
+# ============================================================================
+# Task Assignment Strategies
+# ============================================================================
+
+
+async def get_next_task_for_ralph(
+    ralph_id: str,
+    strategy: str = "priority",
+    project: str | None = None,
+    categories: list[TaskCategory] | None = None,
+) -> dict | None:
+    """Get the next task for a ralph based on the assignment strategy.
+
+    Args:
+        ralph_id: ID of the Ralph instance claiming the task
+        strategy: Assignment strategy - 'priority', 'round_robin', or 'specialized'
+        project: Optional project to filter tasks by
+        categories: Optional categories for specialized assignment
+
+    Returns:
+        Dict with task info if available, None otherwise
+    """
+    if strategy == "priority":
+        return await claim_next_by_priority(ralph_id, project)
+    elif strategy == "round_robin":
+        return await claim_next_round_robin(ralph_id, project)
+    elif strategy == "specialized":
+        return await claim_next_by_category(ralph_id, project, categories or [])
+    else:
+        return await claim_next_by_priority(ralph_id, project)
+
+
+async def claim_next_by_priority(ralph_id: str, project: str | None = None) -> dict | None:
+    """Claim the highest priority unclaimed task. Default behavior.
+
+    Args:
+        ralph_id: ID of the Ralph instance
+        project: Optional project filter
+
+    Returns:
+        Dict with task info if claimed, None otherwise
+    """
+    return await claim_task(ralph_id, project)
+
+
+async def claim_next_round_robin(ralph_id: str, project: str | None = None) -> dict | None:
+    """Distribute tasks evenly across ralphs using round-robin.
+
+    Args:
+        ralph_id: ID of the Ralph instance
+        project: Optional project filter
+
+    Returns:
+        Dict with task info if claimed, None otherwise
+    """
+    conn = await get_connection()
+    try:
+        now = datetime.now()
+        expires_at = now + timedelta(minutes=CLAIM_EXPIRY_MINUTES)
+
+        # Build query with optional project filter
+        project_filter = "AND project = ?" if project else ""
+        params_base = [project] if project else []
+
+        # Get count of tasks currently assigned to each ralph
+        # Then assign to the ralph with the fewest active tasks
+        # For simplicity, we use oldest pending task to distribute work
+
+        for priority in PRIORITY_ORDER:
+            params = [ralph_id, now, expires_at, TaskClaimStatus.IN_PROGRESS.value, now,
+                     priority.value] + params_base + [now]
+
+            # Use random selection within priority level for distribution
+            query = f"""UPDATE task_claims
+                   SET claimed_by_ralph_id = ?,
+                       claimed_at = ?,
+                       expires_at = ?,
+                       status = ?,
+                       updated_at = ?
+                   WHERE task_id = (
+                       SELECT task_id FROM task_claims
+                       WHERE task_priority = ?
+                         {project_filter}
+                         AND (status = 'pending'
+                              OR (status = 'in_progress' AND expires_at < ?))
+                       ORDER BY RANDOM()
+                       LIMIT 1
+                   )
+                   RETURNING task_id, task_title, task_priority, task_section, project"""
+
+            cursor = await conn.execute(query, params)
+            result = await cursor.fetchone()
+
+            if result:
+                await conn.commit()
+                await _update_instance_task(ralph_id, result[0])
+                return {
+                    "task_id": result[0],
+                    "task_title": result[1],
+                    "task_priority": result[2],
+                    "task_section": result[3],
+                    "project": result[4],
+                    "claimed_at": now.isoformat(),
+                    "expires_at": expires_at.isoformat(),
+                }
+
+        return None
+    finally:
+        await conn.close()
+
+
+async def claim_next_by_category(
+    ralph_id: str,
+    project: str | None = None,
+    categories: list[TaskCategory] | None = None,
+) -> dict | None:
+    """Claim a task matching the specified categories.
+
+    Args:
+        ralph_id: ID of the Ralph instance
+        project: Optional project filter
+        categories: List of categories this ralph handles
+
+    Returns:
+        Dict with task info if claimed, None otherwise
+    """
+    if not categories:
+        # Fall back to priority if no categories specified
+        return await claim_next_by_priority(ralph_id, project)
+
+    conn = await get_connection()
+    found_task = None
+    try:
+        now = datetime.now()
+        expires_at = now + timedelta(minutes=CLAIM_EXPIRY_MINUTES)
+
+        # Build category filter
+        cat_values = [c.value for c in categories]
+        cat_placeholders = ",".join("?" * len(cat_values))
+        category_filter = f"AND category IN ({cat_placeholders})"
+
+        # Build project filter
+        project_filter = "AND project = ?" if project else ""
+        params_base = [project] if project else []
+
+        for priority in PRIORITY_ORDER:
+            params = [ralph_id, now, expires_at, TaskClaimStatus.IN_PROGRESS.value, now,
+                     priority.value] + cat_values + params_base + [now]
+
+            query = f"""UPDATE task_claims
+                   SET claimed_by_ralph_id = ?,
+                       claimed_at = ?,
+                       expires_at = ?,
+                       status = ?,
+                       updated_at = ?
+                   WHERE task_id = (
+                       SELECT task_id FROM task_claims
+                       WHERE task_priority = ?
+                         {category_filter}
+                         {project_filter}
+                         AND (status = 'pending'
+                              OR (status = 'in_progress' AND expires_at < ?))
+                       ORDER BY created_at ASC
+                       LIMIT 1
+                   )
+                   RETURNING task_id, task_title, task_priority, task_section, project"""
+
+            cursor = await conn.execute(query, params)
+            result = await cursor.fetchone()
+
+            if result:
+                await conn.commit()
+                await _update_instance_task(ralph_id, result[0])
+                found_task = {
+                    "task_id": result[0],
+                    "task_title": result[1],
+                    "task_priority": result[2],
+                    "task_section": result[3],
+                    "project": result[4],
+                    "claimed_at": now.isoformat(),
+                    "expires_at": expires_at.isoformat(),
+                }
+                break
+    finally:
+        await conn.close()
+
+    # Return found task or fallback to priority strategy
+    if found_task:
+        return found_task
+    return await claim_next_by_priority(ralph_id, project)
+
+
+def get_assigned_categories(ralph_id: str) -> list[TaskCategory]:
+    """Get the categories assigned to a ralph based on its ID prefix.
+
+    Args:
+        ralph_id: ID of the Ralph instance
+
+    Returns:
+        List of TaskCategory values this ralph should handle
+    """
+    from chiefwiggum.config import get_category_assignments
+
+    assignments = get_category_assignments()
+    for prefix, categories in assignments.items():
+        if ralph_id.startswith(prefix):
+            return [TaskCategory(c) for c in categories if hasattr(TaskCategory, c.upper())]
+    return []
+
+
+# ============================================================================
+# Auto-Scaling Logic
+# ============================================================================
+
+
+async def analyze_category_backlog() -> dict[str, float]:
+    """Count pending tasks per category, weighted by priority.
+
+    Returns:
+        Dict mapping category names to weighted pending counts
+    """
+    from collections import defaultdict
+
+    pending = await list_pending_tasks()
+    needs: dict[str, float] = defaultdict(float)
+    priority_weights = {
+        TaskPriority.HIGH: 4.0,
+        TaskPriority.MEDIUM: 2.0,
+        TaskPriority.LOWER: 1.0,
+        TaskPriority.POLISH: 0.5,
+    }
+
+    for task in pending:
+        weight = priority_weights.get(task.task_priority, 1.0)
+        category_name = task.category.value if task.category else "general"
+        needs[category_name] += weight
+
+    return dict(needs)
+
+
+async def get_idle_ralphs(older_than_minutes: int = 30) -> list[RalphInstance]:
+    """Get ralph instances that have been idle for too long.
+
+    Args:
+        older_than_minutes: Consider idle if no task for this long
+
+    Returns:
+        List of idle RalphInstance objects
+    """
+    instances = await list_active_instances()
+    now = datetime.now()
+    idle_ralphs = []
+
+    for inst in instances:
+        if inst.status == RalphInstanceStatus.IDLE:
+            idle_seconds = (now - inst.last_heartbeat).total_seconds()
+            if idle_seconds > older_than_minutes * 60:
+                idle_ralphs.append(inst)
+
+    return idle_ralphs
+
+
+async def should_spawn_ralph() -> tuple[bool, str | None]:
+    """Check if a new ralph should be spawned based on auto-scaling config.
+
+    Returns:
+        Tuple of (should_spawn, suggested_category_or_none)
+    """
+    from chiefwiggum.config import get_auto_scaling_config
+    from chiefwiggum.spawner import get_running_ralphs
+
+    config = get_auto_scaling_config()
+
+    if not config["auto_spawn_enabled"]:
+        return False, None
+
+    # Check pending count against threshold
+    pending = await list_pending_tasks()
+    if len(pending) <= config["auto_spawn_threshold"]:
+        return False, None
+
+    # Check max concurrent limit
+    running = len(get_running_ralphs())
+    if running >= config["max_concurrent_ralphs"]:
+        return False, None
+
+    # Analyze category needs to suggest specialization
+    category_needs = await analyze_category_backlog()
+    if category_needs:
+        highest_need = max(category_needs, key=lambda k: category_needs[k])
+        return True, highest_need
+
+    return True, None
+
+
+async def cleanup_idle_ralphs(idle_minutes: int | None = None) -> int:
+    """Stop ralphs that have been idle for too long.
+
+    Only cleans up if there are no pending tasks.
+
+    Args:
+        idle_minutes: Override config idle timeout
+
+    Returns:
+        Number of ralphs cleaned up
+    """
+    from chiefwiggum.config import get_auto_scaling_config
+    from chiefwiggum.spawner import stop_ralph_daemon
+
+    config = get_auto_scaling_config()
+    if not config["auto_cleanup_enabled"]:
+        return 0
+
+    timeout = idle_minutes or config["auto_cleanup_idle_minutes"]
+
+    # Only cleanup if no pending work
+    pending = await list_pending_tasks()
+    if len(pending) > 0:
+        return 0
+
+    idle_ralphs = await get_idle_ralphs(timeout)
+    cleaned = 0
+
+    for ralph in idle_ralphs:
+        try:
+            stop_ralph_daemon(ralph.ralph_id, force=False)
+            await shutdown_instance(ralph.ralph_id)
+            cleaned += 1
+            logger.info(f"Auto-cleaned idle ralph: {ralph.ralph_id}")
+        except Exception as e:
+            logger.warning(f"Failed to cleanup ralph {ralph.ralph_id}: {e}")
+
+    return cleaned
+
+
+async def count_pending_tasks() -> int:
+    """Get count of pending tasks.
+
+    Returns:
+        Number of pending tasks
+    """
+    pending = await list_pending_tasks()
+    return len(pending)
+
+
+async def count_running_ralphs() -> int:
+    """Get count of running ralph instances.
+
+    Returns:
+        Number of running ralphs
+    """
+    from chiefwiggum.spawner import get_running_ralphs
+    return len(get_running_ralphs())

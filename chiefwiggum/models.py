@@ -93,10 +93,14 @@ class RalphConfig(BaseModel):
     """Configuration for a Ralph instance."""
 
     timeout_minutes: int = 30  # Max time per task before killing
-    no_continue: bool = False  # Stop after one task (vs loop continuously)
+    no_continue: bool = True  # Stop after one task by default (vs loop continuously)
     max_loops: int | None = None  # Stop after N tasks completed (None = unlimited)
     model: ClaudeModel = ClaudeModel.SONNET  # Which Claude model to use
     persona: str | None = None  # Skill/persona to load (e.g., "ux-specialist")
+    # Ralph Loop Settings (passed to ralph_loop.sh)
+    session_expiry_hours: int = 24  # --session-expiry value
+    output_format: str = "json"  # --output-format (json/text)
+    max_calls_per_hour: int = 100  # --calls value
 
 
 class TaskClaim(BaseModel):

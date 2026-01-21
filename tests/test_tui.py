@@ -245,7 +245,7 @@ class TestModeTransitions:
         assert found, "SPAWN_CATEGORY not in handle_command spawn modes tuple"
 
     def test_spawn_mode_progression(self):
-        """PROJECT -> PRIORITY -> CATEGORY -> MODEL -> CONFIRM."""
+        """PROJECT -> PRIORITY -> CATEGORY -> MODEL -> SESSION -> CONFIRM."""
         state = TUIState()
         state.mode = TUIMode.SPAWN_PROJECT
         state.projects = ["testproject"]
@@ -274,6 +274,10 @@ class TestModeTransitions:
 
         # Model selection (1 = Sonnet)
         loop.run_until_complete(handle_spawn("1", state))
+        assert state.mode == TUIMode.SPAWN_SESSION
+
+        # Session settings (Enter to continue)
+        loop.run_until_complete(handle_spawn("\r", state))
         assert state.mode == TUIMode.SPAWN_CONFIRM
 
         loop.close()
@@ -289,6 +293,7 @@ class TestModeTransitions:
             TUIMode.SPAWN_PRIORITY,
             TUIMode.SPAWN_CATEGORY,
             TUIMode.SPAWN_MODEL,
+            TUIMode.SPAWN_SESSION,
             TUIMode.SPAWN_CONFIRM,
         ]
 
@@ -459,7 +464,7 @@ class TestKeyboardHandling:
         loop.close()
 
     def test_spawn_model_selection(self):
-        """1-3 keys select model in SPAWN_MODEL mode."""
+        """1-3 keys select model in SPAWN_MODEL mode and advance to SPAWN_SESSION."""
         import asyncio
 
         loop = asyncio.new_event_loop()
@@ -477,7 +482,7 @@ class TestKeyboardHandling:
 
             loop.run_until_complete(handle_spawn(key, state))
             assert state.spawn_config.model == expected_model
-            assert state.mode == TUIMode.SPAWN_CONFIRM
+            assert state.mode == TUIMode.SPAWN_SESSION  # Now goes to SESSION, not CONFIRM
 
         loop.close()
 
@@ -508,30 +513,30 @@ class TestKeyboardHandling:
     def test_j_scrolls_down(self):
         """j key should scroll tasks down."""
         state = TUIState()
-        state.task_scroll_offset = 0
+        state.selected_task_idx = 0
 
-        # With enough tasks, j should scroll down
+        # With enough tasks, j should move selection down
         handle_normal_mode("j", state, tasks_count=100)
 
-        assert state.task_scroll_offset == 5  # Scrolls by 5
+        assert state.selected_task_idx == 1  # Moves selection by 1
 
-    def test_k_scrolls_up(self):
-        """k key should scroll tasks up."""
+    def test_k_moves_selection_up(self):
+        """k key should move task selection up."""
         state = TUIState()
-        state.task_scroll_offset = 10
+        state.selected_task_idx = 10
 
-        handle_normal_mode("k", state)
+        handle_normal_mode("k", state, tasks_count=100)
 
-        assert state.task_scroll_offset == 5  # Scrolls up by 5
+        assert state.selected_task_idx == 9  # Moves selection up by 1
 
     def test_k_does_not_go_negative(self):
-        """k key should not scroll below 0."""
+        """k key should not move selection below 0."""
         state = TUIState()
-        state.task_scroll_offset = 2
+        state.selected_task_idx = 0
 
-        handle_normal_mode("k", state)
+        handle_normal_mode("k", state, tasks_count=100)
 
-        assert state.task_scroll_offset == 0
+        assert state.selected_task_idx == 0  # Stays at 0
 
     def test_a_toggles_all_tasks(self):
         """a key should toggle show_all_tasks."""
@@ -544,7 +549,7 @@ class TestKeyboardHandling:
 
         handle_normal_mode("a", state)
         assert state.show_all_tasks is False
-        assert "pending" in state.status_message.lower()
+        assert "active" in state.status_message.lower()
 
     def test_i_toggles_all_instances(self):
         """i key should toggle show_all_instances."""
@@ -804,7 +809,7 @@ class TestSpawnConfig:
         assert config.priority_min is None
         assert config.categories == []
         assert config.model == ClaudeModel.SONNET
-        assert config.no_continue is False
+        assert config.no_continue is True  # Default changed to stop after one task
         assert config.max_loops is None
 
     def test_spawn_config_can_be_modified(self):
@@ -896,3 +901,196 @@ class TestTUIMode:
         # All should be valid TUIMode values
         for mode in spawn_modes:
             assert isinstance(mode, TUIMode)
+
+
+# =============================================================================
+# TestOverlayToggleBehavior
+# =============================================================================
+
+
+class TestOverlayToggleBehavior:
+    """Tests for overlay toggle key behavior (Phase 1 consistency)."""
+
+    def test_help_closes_with_h_key(self):
+        """h should close help mode (toggle behavior)."""
+        import asyncio
+        from chiefwiggum.tui import handle_command
+
+        loop = asyncio.new_event_loop()
+        state = TUIState()
+        state.mode = TUIMode.HELP
+
+        loop.run_until_complete(handle_command("h", state))
+
+        assert state.mode == TUIMode.NORMAL
+        loop.close()
+
+    def test_help_closes_with_question_mark(self):
+        """? should close help mode (toggle behavior)."""
+        import asyncio
+        from chiefwiggum.tui import handle_command
+
+        loop = asyncio.new_event_loop()
+        state = TUIState()
+        state.mode = TUIMode.HELP
+
+        loop.run_until_complete(handle_command("?", state))
+
+        assert state.mode == TUIMode.NORMAL
+        loop.close()
+
+    def test_stats_closes_with_t_key(self):
+        """t should close stats mode (toggle behavior)."""
+        import asyncio
+        from chiefwiggum.tui import handle_command
+
+        loop = asyncio.new_event_loop()
+        state = TUIState()
+        state.mode = TUIMode.STATS
+
+        loop.run_until_complete(handle_command("t", state))
+
+        assert state.mode == TUIMode.NORMAL
+        loop.close()
+
+    def test_error_detail_closes_with_e_key(self):
+        """e should close error detail mode (toggle behavior)."""
+        import asyncio
+        from chiefwiggum.tui import handle_command
+
+        loop = asyncio.new_event_loop()
+        state = TUIState()
+        state.mode = TUIMode.ERROR_DETAIL
+
+        loop.run_until_complete(handle_command("e", state))
+
+        assert state.mode == TUIMode.NORMAL
+        loop.close()
+
+    def test_log_view_closes_with_l_key(self):
+        """l should close log view mode (toggle behavior)."""
+        import asyncio
+        from chiefwiggum.tui import handle_command
+
+        loop = asyncio.new_event_loop()
+        state = TUIState()
+        state.mode = TUIMode.LOG_VIEW
+
+        loop.run_until_complete(handle_command("l", state))
+
+        assert state.mode == TUIMode.NORMAL
+        loop.close()
+
+    def test_history_closes_with_H_key(self):
+        """H should close history mode (toggle behavior)."""
+        import asyncio
+        from chiefwiggum.tui import handle_command
+
+        loop = asyncio.new_event_loop()
+        state = TUIState()
+        state.mode = TUIMode.HISTORY
+
+        loop.run_until_complete(handle_command("H", state))
+
+        assert state.mode == TUIMode.NORMAL
+        loop.close()
+
+    def test_task_detail_closes_with_d_key(self):
+        """d should close task detail mode (toggle behavior)."""
+        import asyncio
+        from chiefwiggum.tui import handle_command
+
+        loop = asyncio.new_event_loop()
+        state = TUIState()
+        state.mode = TUIMode.TASK_DETAIL
+
+        loop.run_until_complete(handle_command("d", state))
+
+        assert state.mode == TUIMode.NORMAL
+        loop.close()
+
+    def test_log_stream_closes_with_v_key(self):
+        """v should close log stream mode (toggle behavior)."""
+        import asyncio
+        from chiefwiggum.tui import handle_command
+
+        loop = asyncio.new_event_loop()
+        state = TUIState()
+        state.mode = TUIMode.LOG_STREAM
+
+        loop.run_until_complete(handle_command("v", state))
+
+        assert state.mode == TUIMode.NORMAL
+        loop.close()
+
+    def test_overlays_close_with_q_key(self):
+        """q should close all overlay modes."""
+        import asyncio
+        from chiefwiggum.tui import handle_command
+
+        loop = asyncio.new_event_loop()
+
+        overlay_modes = [
+            TUIMode.STATS,
+            TUIMode.ERROR_DETAIL,
+            TUIMode.LOG_VIEW,
+            TUIMode.LOG_STREAM,
+            TUIMode.HISTORY,
+            TUIMode.TASK_DETAIL,
+        ]
+
+        for mode in overlay_modes:
+            state = TUIState()
+            state.mode = mode
+            loop.run_until_complete(handle_command("q", state))
+            assert state.mode == TUIMode.NORMAL, f"q didn't close {mode}"
+
+        loop.close()
+
+    def test_overlays_close_with_escape(self):
+        """Escape should close all overlay modes."""
+        import asyncio
+        from chiefwiggum.tui import handle_command
+
+        loop = asyncio.new_event_loop()
+
+        overlay_modes = [
+            TUIMode.STATS,
+            TUIMode.ERROR_DETAIL,
+            TUIMode.LOG_VIEW,
+            TUIMode.LOG_STREAM,
+            TUIMode.HISTORY,
+            TUIMode.TASK_DETAIL,
+        ]
+
+        for mode in overlay_modes:
+            state = TUIState()
+            state.mode = mode
+            loop.run_until_complete(handle_command("ESCAPE", state))
+            assert state.mode == TUIMode.NORMAL, f"Escape didn't close {mode}"
+
+        loop.close()
+
+    def test_overlays_ignore_other_keys(self):
+        """Other keys should be ignored in overlay modes (not close them)."""
+        import asyncio
+        from chiefwiggum.tui import handle_command
+
+        loop = asyncio.new_event_loop()
+
+        # Test that random keys don't close overlays
+        test_cases = [
+            (TUIMode.STATS, "x"),  # x shouldn't close stats
+            (TUIMode.ERROR_DETAIL, "z"),  # z shouldn't close error detail
+            (TUIMode.LOG_VIEW, "n"),  # n shouldn't close log view
+            (TUIMode.HISTORY, "a"),  # a shouldn't close history
+            (TUIMode.TASK_DETAIL, "b"),  # b shouldn't close task detail
+        ]
+
+        for mode, key in test_cases:
+            state = TUIState()
+            state.mode = mode
+            loop.run_until_complete(handle_command(key, state))
+            assert state.mode == mode, f"Key '{key}' should not close {mode}"
+
+        loop.close()
