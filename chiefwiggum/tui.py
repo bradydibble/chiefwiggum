@@ -1285,7 +1285,8 @@ async def update_dashboard(layout: Layout, state: TUIState) -> None:
         expanded = state.view_focus != ViewFocus.BOTH
 
         if state.view_focus == ViewFocus.TASKS:
-            # Tasks only - full width
+            # Tasks only - full width (must unsplit first)
+            layout["main"].unsplit()
             layout["main"].update(
                 Panel(
                     create_tasks_table(
@@ -1301,7 +1302,8 @@ async def update_dashboard(layout: Layout, state: TUIState) -> None:
                 )
             )
         elif state.view_focus == ViewFocus.INSTANCES:
-            # Instances only - full width
+            # Instances only - full width (must unsplit first)
+            layout["main"].unsplit()
             layout["main"].update(
                 Panel(create_instances_table(instances, state.show_all_instances), border_style="green")
             )
@@ -1889,11 +1891,11 @@ def run_tui(debug: bool = False):
                 key = keyboard.get_key()
                 if key:
                     if debug_file:
-                        debug_file.write(f"Key: {repr(key)} | Mode: {state.mode.name}\n")
+                        debug_file.write(f"Key: {repr(key)} | Mode: {state.mode.name} | Focus: {state.view_focus.name} | Cat: {state.category_filter}\n")
                         debug_file.flush()
                     should_quit = loop.run_until_complete(handle_command(key, state))
                     if debug_file:
-                        debug_file.write(f"  -> Mode after: {state.mode.name} | Quit: {should_quit}\n")
+                        debug_file.write(f"  -> Mode: {state.mode.name} | Focus: {state.view_focus.name} | Cat: {state.category_filter} | Quit: {should_quit}\n")
                         debug_file.flush()
                     if should_quit:
                         break
