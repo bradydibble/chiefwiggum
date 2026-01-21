@@ -54,10 +54,17 @@ def _generate_task_id(task_number: int, title: str) -> str:
 def parse_fix_plan(path: str | Path) -> list[FixPlanTask]:
     """Parse @fix_plan.md and return list of tasks.
 
-    Parses patterns like:
+    Supports multiple formats:
+
+    Format 1 (numbered):
     - Section: `## HIGH PRIORITY - Get Data Flowing`
     - Task: `### 22. File Processing Workflow COMPLETE`
     - Subtask: `- [x] Create file upload endpoint`
+
+    Format 2 (ID-based):
+    - Section: `## PRODUCT FEEDBACK (IMMEDIATE PRIORITY)`
+    - Task: `#### PF-1: Timezone to Pacific`
+    - Subtask: `- [ ] Change timezone setting`
 
     Args:
         path: Path to the fix_plan.md file
@@ -76,36 +83,79 @@ def parse_fix_plan(path: str | Path) -> list[FixPlanTask]:
     current_section: str | None = None
     current_priority: TaskPriority | None = None
     current_task: FixPlanTask | None = None
+    task_counter = 0  # For ID-based tasks without numbers
 
-    # Priority section patterns
-    section_patterns = {
-        r"##\s*HIGH\s*PRIORITY": TaskPriority.HIGH,
-        r"##\s*MEDIUM\s*PRIORITY": TaskPriority.MEDIUM,
-        r"##\s*LOWER\s*PRIORITY": TaskPriority.LOWER,
-        r"##\s*POLISH": TaskPriority.POLISH,
-    }
+    # Priority section patterns - check most specific first
+    section_patterns = [
+        # Explicit priority keywords
+        (r"##\s*HIGH\s*PRIORITY", TaskPriority.HIGH),
+        (r"##\s*MEDIUM\s*PRIORITY", TaskPriority.MEDIUM),
+        (r"##\s*LOWER\s*PRIORITY", TaskPriority.LOWER),
+        (r"##\s*POLISH", TaskPriority.POLISH),
+        # Alternative patterns
+        (r"##.*IMMEDIATE\s*PRIORITY", TaskPriority.HIGH),
+        (r"##.*CRITICAL", TaskPriority.HIGH),
+        (r"##.*Tier\s*1", TaskPriority.HIGH),
+        (r"##.*Tier\s*2", TaskPriority.MEDIUM),
+        (r"##.*Tier\s*3", TaskPriority.LOWER),
+        (r"##.*Tier\s*4", TaskPriority.POLISH),
+        (r"###\s*Tier\s*1", TaskPriority.HIGH),
+        (r"###\s*Tier\s*2", TaskPriority.MEDIUM),
+        (r"###\s*Tier\s*3", TaskPriority.LOWER),
+        (r"###\s*Tier\s*4", TaskPriority.POLISH),
+    ]
 
     for line in content.split("\n"):
         line = line.strip()
 
         # Check for section headers
-        for pattern, priority in section_patterns.items():
+        for pattern, priority in section_patterns:
             if re.match(pattern, line, re.IGNORECASE):
                 current_priority = priority
-                match = re.search(r"-\s*(.+)$", line)
-                current_section = match.group(1).strip() if match else None
+                # Extract section name after the priority indicator
+                match = re.search(r"[-:]\s*(.+)$", line)
+                if match:
+                    current_section = match.group(1).strip()
+                else:
+                    # Use the whole line minus ## as section
+                    current_section = re.sub(r"^##+\s*", "", line).strip()
                 break
 
-        # Check for task headers (### N. Title)
-        task_match = re.match(r"###\s*(\d+)\.\s*(.+)", line)
-        if task_match and current_priority:
+        # Check for task headers - multiple formats
+        task_match = None
+        task_number = None
+        title_part = None
+
+        # Format 1: ### N. Title (numbered)
+        numbered_match = re.match(r"#{2,4}\s*(\d+)\.\s*(.+)", line)
+        if numbered_match:
+            task_number = int(numbered_match.group(1))
+            title_part = numbered_match.group(2)
+            task_match = True
+
+        # Format 2: #### ID-N: Title (ID-based like PF-1, BUG-42)
+        if not task_match:
+            id_match = re.match(r"#{2,4}\s*([A-Z]+-\d+)[:\s]+(.+)", line)
+            if id_match:
+                task_counter += 1
+                task_number = task_counter
+                title_part = f"{id_match.group(1)}: {id_match.group(2)}"
+                task_match = True
+
+        # Format 3: #### Title (no number, just header under a Tier section)
+        if not task_match and current_priority:
+            plain_match = re.match(r"####\s+([A-Z][^#].{5,})", line)  # At least 6 chars, starts with capital
+            if plain_match and not plain_match.group(1).startswith("**"):  # Not bold text
+                task_counter += 1
+                task_number = task_counter
+                title_part = plain_match.group(1)
+                task_match = True
+
+        if task_match and task_number and title_part and current_priority:
             if current_task:
                 tasks.append(current_task)
 
-            task_number = int(task_match.group(1))
-            title_part = task_match.group(2)
-
-            # Check if complete (COMPLETE in title, with or without checkmark)
+            # Check if complete (COMPLETE in title, or all subtasks checked)
             is_complete = "COMPLETE" in title_part.upper()
 
             # Clean title (remove checkmarks and COMPLETE)
