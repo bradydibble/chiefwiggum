@@ -1845,12 +1845,18 @@ async def handle_command(key: str, state: TUIState) -> bool:
     return False
 
 
-def run_tui():
+def run_tui(debug: bool = False):
     """Run the TUI dashboard."""
     console = Console()
     layout = create_layout()
     state = TUIState()
     keyboard = KeyboardListener()
+
+    # Debug logging
+    debug_file = None
+    if debug or os.environ.get("CHIEFWIGGUM_DEBUG"):
+        debug_file = open("/tmp/chiefwiggum_debug.log", "a")
+        debug_file.write(f"\n=== TUI started at {datetime.now()} ===\n")
 
     try:
         keyboard.start()
@@ -1869,7 +1875,13 @@ def run_tui():
                 # Check for keyboard input
                 key = keyboard.get_key()
                 if key:
+                    if debug_file:
+                        debug_file.write(f"Key: {repr(key)} | Mode: {state.mode.name}\n")
+                        debug_file.flush()
                     should_quit = loop.run_until_complete(handle_command(key, state))
+                    if debug_file:
+                        debug_file.write(f"  -> Mode after: {state.mode.name} | Quit: {should_quit}\n")
+                        debug_file.flush()
                     if should_quit:
                         break
                     # Refresh display after command
@@ -1896,4 +1908,7 @@ def run_tui():
         pass
     finally:
         keyboard.stop()
+        if debug_file:
+            debug_file.write(f"=== TUI closed at {datetime.now()} ===\n")
+            debug_file.close()
         console.print("\n[dim]Dashboard closed[/dim]")
