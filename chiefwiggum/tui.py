@@ -63,6 +63,29 @@ from chiefwiggum.spawner import (
 )
 
 
+def discover_fix_plan_projects() -> list[tuple[str, Path]]:
+    """Discover projects by scanning for @fix_plan.md files.
+
+    Scans ~/claudecode/*/ for @fix_plan.md files and also checks cwd.
+    Returns list of (project_name, fix_plan_path) tuples.
+    """
+    projects = []
+    claudecode_dir = Path.home() / "claudecode"
+    if claudecode_dir.exists():
+        for project_dir in claudecode_dir.iterdir():
+            if project_dir.is_dir():
+                fix_plan = project_dir / "@fix_plan.md"
+                if fix_plan.exists():
+                    projects.append((project_dir.name, fix_plan))
+    # Also check cwd
+    cwd_fix_plan = Path.cwd() / "@fix_plan.md"
+    if cwd_fix_plan.exists():
+        project_name = Path.cwd().name
+        if not any(p[0] == project_name for p in projects):
+            projects.append((project_name, cwd_fix_plan))
+    return projects
+
+
 class TUIMode(Enum):
     """TUI interaction modes."""
 
@@ -417,6 +440,21 @@ def create_stats_panel(instances: list, tasks: list, state: TUIState) -> Panel:
         text.append("[i]", style="dim")
     text.append(" ", style="dim")
     text.append("All Tasks" if state.show_all_tasks else "Pending", style="cyan")
+
+    # Add ViewFocus indicator (zoom state)
+    text.append("  ", style="dim")
+    if state.view_focus == ViewFocus.BOTH:
+        text.append("[B]", style="dim")
+    elif state.view_focus == ViewFocus.TASKS:
+        text.append("[T]", style="yellow bold")
+    elif state.view_focus == ViewFocus.INSTANCES:
+        text.append("[R]", style="green bold")
+
+    # Add category filter indicator
+    if state.category_filter:
+        text.append("  |  ", style="dim")
+        text.append("Cat: ", style="dim")
+        text.append(state.category_filter.value.upper(), style="magenta bold")
 
     # Bulk mode indicator
     if state.bulk_mode_active:
@@ -980,10 +1018,20 @@ def create_command_bar(state: TUIState) -> Panel:
         text.append(" Sync  ", style="dim")
         text.append("j/k", style="yellow bold")
         text.append(" Scroll  ", style="dim")
+        # Show zoom state
         text.append("z", style="yellow bold")
-        text.append(" Zoom  ", style="dim")
+        if state.view_focus == ViewFocus.BOTH:
+            text.append(" [Both]  ", style="dim")
+        elif state.view_focus == ViewFocus.TASKS:
+            text.append(" [Tasks]  ", style="cyan")
+        else:
+            text.append(" [Ralphs]  ", style="green")
+        # Show category state
         text.append("c", style="yellow bold")
-        text.append(" Cat  ", style="dim")
+        if state.category_filter:
+            text.append(f" [{state.category_filter.value}]  ", style="magenta")
+        else:
+            text.append(" [All]  ", style="dim")
         text.append("S", style="yellow bold")
         text.append(" Settings  ", style="dim")
         text.append("q", style="yellow bold")
@@ -1169,7 +1217,7 @@ async def update_dashboard(layout: Layout, state: TUIState) -> None:
         task = state.failed_tasks[state.selected_task_idx] if state.failed_tasks else None
         layout["main"].update(create_error_detail_panel(task, state))
 
-    elif state.mode in (TUIMode.SPAWN_PROJECT, TUIMode.SPAWN_PRIORITY, TUIMode.SPAWN_MODEL, TUIMode.SPAWN_CONFIRM):
+    elif state.mode in (TUIMode.SPAWN_PROJECT, TUIMode.SPAWN_PRIORITY, TUIMode.SPAWN_CATEGORY, TUIMode.SPAWN_MODEL, TUIMode.SPAWN_CONFIRM):
         layout["main"].update(create_spawn_panel(state))
 
     elif state.mode == TUIMode.LOG_VIEW:
@@ -1298,13 +1346,13 @@ def handle_normal_mode(key: str, state: TUIState, tasks_count: int = 0) -> bool:
     elif key == "z":  # Cycle view focus: BOTH -> TASKS -> INSTANCES -> BOTH
         if state.view_focus == ViewFocus.BOTH:
             state.view_focus = ViewFocus.TASKS
-            state.status_message = "View: Tasks only"
+            state.status_message = "Zoom: Tasks only (z to cycle)"
         elif state.view_focus == ViewFocus.TASKS:
             state.view_focus = ViewFocus.INSTANCES
-            state.status_message = "View: Instances only"
+            state.status_message = "Zoom: Ralphs only (z to cycle)"
         else:
             state.view_focus = ViewFocus.BOTH
-            state.status_message = "View: Split"
+            state.status_message = "Zoom: Split view (z to cycle)"
         state.status_message_time = time.time()
     elif key == "c":  # Cycle category filter
         categories = [None, TaskCategory.UX, TaskCategory.API, TaskCategory.TESTING, TaskCategory.DATABASE, TaskCategory.INFRA]
@@ -1318,9 +1366,9 @@ def handle_normal_mode(key: str, state: TUIState, tasks_count: int = 0) -> bool:
         state.category_filter = categories[next_idx]
         state.task_scroll_offset = 0  # Reset scroll
         if state.category_filter:
-            state.status_message = f"Filter: {state.category_filter.value}"
+            state.status_message = f"Category: {state.category_filter.value} (c to cycle)"
         else:
-            state.status_message = "Filter: All categories"
+            state.status_message = "Category: All (c to cycle)"
         state.status_message_time = time.time()
     elif key == "S":  # Settings
         state.mode = TUIMode.SETTINGS
@@ -1722,17 +1770,17 @@ async def handle_command(key: str, state: TUIState) -> bool:
             state.status_message = "Syncing tasks..."
             state.status_message_time = time.time()
             synced = 0
-            for project in state.projects:
-                possible_paths = [
-                    Path.home() / "claudecode" / project / "@fix_plan.md",
-                    Path.cwd() / "@fix_plan.md",
-                ]
-                for path in possible_paths:
-                    if path.exists():
-                        count = await sync_tasks_from_fix_plan(str(path), project)
-                        synced += count
-                        break
-            state.status_message = f"Synced {synced} tasks"
+            # Use discovery to find projects instead of relying on state.projects
+            # This fixes the chicken-and-egg problem where empty DB = empty projects
+            discovered = discover_fix_plan_projects()
+            if not discovered:
+                state.status_message = "No @fix_plan.md files found"
+                state.status_message_time = time.time()
+                return False
+            for project_name, fix_plan_path in discovered:
+                count = await sync_tasks_from_fix_plan(str(fix_plan_path), project_name)
+                synced += count
+            state.status_message = f"Synced {synced} tasks from {len(discovered)} project(s)"
             state.status_message_time = time.time()
             return False
         # Handle 'w' for JSON export here since it's async
