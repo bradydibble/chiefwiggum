@@ -1174,10 +1174,12 @@ async def update_dashboard(layout: Layout, state: TUIState) -> None:
     all_tasks = await list_all_tasks()
     layout["stats"].update(create_stats_panel(state.all_instances, all_tasks, state))
 
-    # Check for overlay modes
+    # Check for overlay modes - must unsplit first to clear child layouts
     if state.mode == TUIMode.HELP:
+        layout["main"].unsplit()
         layout["main"].update(create_help_panel())
     elif state.mode == TUIMode.STATS:
+        layout["main"].unsplit()
         # Create detailed stats panel
         stats = await get_system_stats()
         text = Text()
@@ -1214,41 +1216,52 @@ async def update_dashboard(layout: Layout, state: TUIState) -> None:
         layout["main"].update(Panel(text, title="Statistics", border_style="cyan", padding=(1, 2)))
 
     elif state.mode == TUIMode.ERROR_DETAIL:
+        layout["main"].unsplit()
         task = state.failed_tasks[state.selected_task_idx] if state.failed_tasks else None
         layout["main"].update(create_error_detail_panel(task, state))
 
     elif state.mode in (TUIMode.SPAWN_PROJECT, TUIMode.SPAWN_PRIORITY, TUIMode.SPAWN_CATEGORY, TUIMode.SPAWN_MODEL, TUIMode.SPAWN_CONFIRM):
+        layout["main"].unsplit()
         layout["main"].update(create_spawn_panel(state))
 
     elif state.mode == TUIMode.LOG_VIEW:
+        layout["main"].unsplit()
         layout["main"].update(create_log_view_panel(state))
 
     elif state.mode == TUIMode.HISTORY:
+        layout["main"].unsplit()
         # Load history data
         state.history_tasks = await list_task_history(project=state.project_filter, limit=50)
         layout["main"].update(create_history_panel(state))
 
     elif state.mode == TUIMode.CONFIRM_BULK_STOP:
+        layout["main"].unsplit()
         count = len(state.instances)
         layout["main"].update(create_confirm_panel("STOP ALL Ralphs", count))
 
     elif state.mode == TUIMode.CONFIRM_BULK_PAUSE:
+        layout["main"].unsplit()
         count = len([i for i in state.instances if i.status == RalphInstanceStatus.ACTIVE])
         layout["main"].update(create_confirm_panel("PAUSE ALL Ralphs", count))
 
     elif state.mode == TUIMode.SETTINGS:
+        layout["main"].unsplit()
         layout["main"].update(create_settings_panel(state))
 
     elif state.mode == TUIMode.SEARCH:
+        layout["main"].unsplit()
         layout["main"].update(create_search_panel(state))
 
     elif state.mode == TUIMode.TASK_DETAIL:
+        layout["main"].unsplit()
         layout["main"].update(create_task_detail_panel(state.selected_task, state))
 
     elif state.mode == TUIMode.BULK_ACTION:
+        layout["main"].unsplit()
         layout["main"].update(create_bulk_action_panel(state))
 
     elif state.mode == TUIMode.LOG_STREAM:
+        layout["main"].unsplit()
         # Refresh log content for streaming
         if state.instances and state.selected_instance_idx < len(state.instances):
             ralph_id = state.instances[state.selected_instance_idx].ralph_id
