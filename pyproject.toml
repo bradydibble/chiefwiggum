@@ -1,0 +1,54 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "chiefwiggum"
+dynamic = ["version"]
+description = "Multi-Ralph coordination system for Claude Code instances"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [
+    {name = "Brady Dibble"}
+]
+keywords = ["ralph", "coordination", "claude-code", "task-management"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    "click>=8.1.0",
+    "rich>=13.0.0",
+    "aiosqlite>=0.19.0",
+    "pydantic>=2.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+]
+
+[project.scripts]
+chiefwiggum = "chiefwiggum.cli:main"
+wig = "chiefwiggum.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/bdibble/chiefwiggum"
+Repository = "https://github.com/bdibble/chiefwiggum"
+
+[tool.hatch.build.targets.wheel]
+packages = ["chiefwiggum"]
+
+[tool.hatch.version]
+path = "chiefwiggum/_version.py"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
