@@ -258,7 +258,15 @@ def claim(project: str, ralph_id: str | None, fix_plan: str | None):
 @click.option("--message", "-m", help="Completion message")
 @click.option("--commit", "-c", help="Git commit SHA")
 def complete(task_id: str, ralph_id: str, message: str | None, commit: str | None):
-    """Mark a task as complete."""
+    """Mark a task as complete.
+
+    This command is used by the system to record task completions. For manual
+    marking of tasks that were completed but not detected, use 'mark-complete'.
+
+    Examples:
+        wig complete task-1 --ralph-id ralph-123 --commit abc1234
+        wig complete task-1 -r ralph-123 -m "Manually completed"
+    """
     from rich.console import Console
 
     console = Console()
@@ -268,9 +276,100 @@ def complete(task_id: str, ralph_id: str, message: str | None, commit: str | Non
 
     if success:
         console.print(f"[green]Completed:[/green] {task_id}")
+        if commit:
+            console.print(f"[dim]Commit: {commit}[/dim]")
     else:
         console.print(f"[red]Failed to complete:[/red] {task_id}")
         console.print("[dim]Task may not be claimed by this Ralph or is not in_progress[/dim]")
+
+
+@main.command("mark-complete")
+@click.argument("task_id")
+@click.option("--commit", "-c", help="Git commit SHA (or use 'HEAD' to extract from last commit)")
+@click.option("--ralph-id", "-r", help="Ralph ID (auto-detected from current directory if not provided)")
+@click.option("--message", "-m", help="Completion message")
+def mark_complete_command(task_id: str, commit: str | None, ralph_id: str | None, message: str | None):
+    """Manually mark a task as complete (when auto-detection failed).
+
+    Use this command when:
+    - A task was completed (code committed, tests passing)
+    - But the system didn't mark it as complete in the database
+    - The TUI shows the task as "pending" despite being done
+
+    The commit SHA can be:
+    - An explicit SHA: --commit abc1234567890abcdef
+    - HEAD: --commit HEAD (extracts from last commit)
+    - Omitted: will try to find recent commit related to the task
+
+    Examples:
+        # Mark complete with explicit commit
+        wig mark-complete task-1 --commit abc1234567890abcdef
+
+        # Mark complete with last commit (HEAD)
+        wig mark-complete task-1 --commit HEAD
+
+        # Mark complete and let it find the commit
+        wig mark-complete task-1
+
+        # Specify Ralph ID explicitly
+        wig mark-complete task-1 --ralph-id ralph-123 --commit HEAD
+    """
+    import subprocess
+    from rich.console import Console
+
+    console = Console()
+    run_async(init_db())
+
+    # Extract commit SHA if HEAD or empty
+    if commit == "HEAD" or commit is None:
+        try:
+            result = subprocess.run(
+                ["git", "log", "-1", "--pretty=%H"],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            extracted_commit = result.stdout.strip()
+            if extracted_commit:
+                commit = extracted_commit
+                console.print(f"[dim]Extracted commit: {commit}[/dim]")
+            else:
+                console.print("[yellow]Warning: Could not extract commit SHA from git[/yellow]")
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            console.print("[yellow]Warning: git not available or not in a repository[/yellow]")
+
+    # Auto-detect Ralph ID from database if not provided
+    if not ralph_id:
+        # Try to get the Ralph that claimed this task
+        from chiefwiggum.coordination import get_task_claim
+        task_claim = run_async(get_task_claim(task_id))
+        if task_claim and task_claim.claimed_by_ralph_id:
+            ralph_id = task_claim.claimed_by_ralph_id
+            console.print(f"[dim]Auto-detected Ralph ID: {ralph_id}[/dim]")
+        else:
+            console.print("[red]Error:[/red] Task not claimed by any Ralph")
+            console.print("[dim]Use --ralph-id to specify the Ralph ID explicitly[/dim]")
+            raise SystemExit(1)
+
+    # Set default message if not provided
+    if not message:
+        message = "Manually marked complete via mark-complete command"
+
+    # Mark the task complete
+    success = run_async(complete_task(ralph_id, task_id, commit_sha=commit, message=message))
+
+    if success:
+        console.print(f"[green]✅ Task {task_id} marked complete[/green]")
+        if commit:
+            console.print(f"[dim]Commit: {commit}[/dim]")
+        console.print("[dim]The task status and @fix_plan.md have been updated[/dim]")
+    else:
+        console.print(f"[red]❌ Failed to mark task {task_id} complete[/red]")
+        console.print("[dim]Possible reasons:[/dim]")
+        console.print("  - Task doesn't exist")
+        console.print("  - Task is not in 'in_progress' status")
+        console.print("  - Task is not claimed by the specified Ralph")
+        console.print("\n[dim]Check task status with: wig list --all[/dim]")
 
 
 @main.command()

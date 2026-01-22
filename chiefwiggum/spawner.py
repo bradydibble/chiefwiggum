@@ -264,6 +264,21 @@ def generate_task_prompt(task: TaskClaim, fix_plan_path: Path) -> str:
     # Build the focused prompt
     prompt = f"""# Task Assignment: {task.task_title}
 
+## 🚨 CRITICAL: Task Completion Signal
+
+When you finish this task, you MUST output this exact block:
+
+---RALPH_STATUS---
+STATUS: COMPLETE
+EXIT_SIGNAL: true
+TASK_ID: {task.task_id}
+COMMIT: <your_git_commit_sha>
+VERIFICATION: <brief verification description>
+---END_RALPH_STATUS---
+
+⚠️ WITHOUT THIS BLOCK, your work will NOT be recorded as complete in the database.
+The task will remain "pending" even though you completed it.
+
 ## Task Details
 - **Task ID**: {task.task_id}
 - **Priority**: {task.task_priority.value}
@@ -298,15 +313,27 @@ When you have completed this task:
 2. Run all relevant tests and ensure they pass
 3. Verify your changes match the task requirements
 4. Commit your changes with a descriptive message
-5. Output the following status block:
+5. 🚨 **OUTPUT THE RALPH_STATUS BLOCK** (see top of prompt - this is REQUIRED)
+
+## Example: What Complete Output Should Look Like
+
+After you commit your changes, output exactly this format:
+
+```
+All changes committed successfully.
 
 ---RALPH_STATUS---
 STATUS: COMPLETE
 EXIT_SIGNAL: true
 TASK_ID: {task.task_id}
-COMMIT: <the git commit SHA from your commit>
-VERIFICATION: <brief description of how you verified the task is complete, e.g. "All 12 tests pass, lint clean">
+COMMIT: abc1234567890abcdef1234567890abcdef1234
+VERIFICATION: All 1183 tests pass, changes verified in development environment
 ---END_RALPH_STATUS---
+```
+
+This tells the system your task is complete.
+
+## Other Status Blocks
 
 If you are still working and NOT done, output:
 
@@ -329,10 +356,63 @@ REASON: <brief description of what went wrong>
 - Focus ONLY on this specific task
 - Do not work on other tasks from the fix_plan
 - If the task is unclear, make reasonable assumptions and proceed
-- Always commit your changes before marking complete
+- **THE COMMIT IS NOT THE FINAL STEP** - you must output the RALPH_STATUS block after committing
 - The ---RALPH_STATUS--- block is REQUIRED for task completion tracking
 """
     return prompt
+
+
+def generate_prompt_for_task(task_id: str, fix_plan_path: str | Path | None = None) -> str:
+    """Generate a prompt for a task by ID (synchronous wrapper for bash scripts).
+
+    This is a convenience function for bash scripts that need to generate
+    prompts for tasks. It handles async database access internally.
+
+    Args:
+        task_id: The task ID to generate a prompt for
+        fix_plan_path: Optional path to @fix_plan.md (defaults to current project's)
+
+    Returns:
+        The generated prompt string
+
+    Raises:
+        ValueError: If task not found or other error
+    """
+    import asyncio
+    from chiefwiggum.coordination import get_task_claim
+
+    # Run the async function synchronously
+    loop = asyncio.get_event_loop()
+    if loop.is_running():
+        # If event loop is already running, create a new one
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+    try:
+        task_claim = loop.run_until_complete(get_task_claim(task_id))
+        if not task_claim:
+            raise ValueError(f"Task {task_id} not found in database")
+
+        # Determine fix_plan_path
+        if fix_plan_path is None:
+            # Try to find @fix_plan.md in current directory or project
+            if task_claim.project:
+                project_dir = Path(task_claim.project)
+                if project_dir.exists():
+                    fix_plan_path = project_dir / "@fix_plan.md"
+                else:
+                    fix_plan_path = Path.cwd() / "@fix_plan.md"
+            else:
+                fix_plan_path = Path.cwd() / "@fix_plan.md"
+        else:
+            fix_plan_path = Path(fix_plan_path)
+
+        # Generate the prompt using the existing function
+        return generate_task_prompt(task_claim, fix_plan_path)
+
+    except Exception as e:
+        logger.error(f"Failed to generate prompt for task {task_id}: {e}")
+        raise
 
 
 def write_ralph_status(
@@ -342,6 +422,9 @@ def write_ralph_status(
     loop_count: int = 0,
     message: str = "",
     error_info: dict | None = None,
+    progress_data: dict | None = None,
+    needs_human_intervention: bool = False,
+    hitl_reason: str | None = None,
 ) -> None:
     """Write Ralph status to a JSON file for chiefwiggum to read.
 
@@ -352,6 +435,9 @@ def write_ralph_status(
         loop_count: Current loop iteration
         message: Optional status message
         error_info: Optional error information dict with category, count, details
+        progress_data: Optional progress data dict with test_results and stuck_indicators
+        needs_human_intervention: Whether human intervention is needed
+        hitl_reason: Reason why human intervention is needed
     """
     import json
 
@@ -374,6 +460,22 @@ def write_ralph_status(
             "count": 0,
             "details": [],
         }
+
+    # Add progress_data if provided
+    if progress_data:
+        status_data["progress_data"] = progress_data
+    else:
+        status_data["progress_data"] = {
+            "test_results": None,
+            "stuck_indicators": {
+                "same_test_failures": 0,
+                "loop_count_without_progress": 0,
+            },
+        }
+
+    # Add HITL fields
+    status_data["needs_human_intervention"] = needs_human_intervention
+    status_data["hitl_reason"] = hitl_reason
 
     status_path.write_text(json.dumps(status_data, indent=2))
 
@@ -555,6 +657,142 @@ def get_error_summary(ralph_id: str) -> dict:
         "recent_errors": recent_errors[:5],
         "last_error_time": last_error_time,
     }
+
+
+def parse_test_progress(log_content: str) -> dict | None:
+    """Parse test results from Ralph's log.
+
+    Supports formats:
+    - "pytest: 12 passed, 3 failed"
+    - "npm test: 8/10 tests passed"
+    - "12 tests run, 2 failures"
+    - "Tests: 8 passed, 2 failed, 10 total"
+    - "PASS: 8, FAIL: 2"
+
+    Args:
+        log_content: Content of the log file (typically last 10KB)
+
+    Returns:
+        Dict with:
+            - passed: int
+            - failed: int
+            - total: int
+            - timestamp: ISO datetime
+        or None if no test results found
+    """
+    import re
+    from datetime import datetime
+
+    # Common test result patterns
+    patterns = [
+        # pytest format: "12 passed, 3 failed"
+        r"(\d+)\s+passed.*?(\d+)\s+failed",
+        # npm/jest format: "Tests: 8 passed, 2 failed, 10 total"
+        r"Tests:\s*(\d+)\s+passed.*?(\d+)\s+failed.*?(\d+)\s+total",
+        # Simple format: "8/10 tests passed"
+        r"(\d+)/(\d+)\s+tests?\s+passed",
+        # Ruby/RSpec format: "12 examples, 2 failures"
+        r"(\d+)\s+examples?,\s*(\d+)\s+failures?",
+        # PASS/FAIL format: "PASS: 8, FAIL: 2"
+        r"PASS:\s*(\d+).*?FAIL:\s*(\d+)",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, log_content, re.IGNORECASE | re.MULTILINE)
+        if match:
+            groups = match.groups()
+
+            # Different patterns return different capture groups
+            if len(groups) == 2:
+                # Pattern 1, 4, 5: (passed, failed)
+                passed = int(groups[0])
+                failed = int(groups[1])
+                total = passed + failed
+            elif len(groups) == 3:
+                # Pattern 2: (passed, failed, total)
+                # Pattern 3: (passed, total) - calculate failed
+                if "total" in pattern:
+                    passed = int(groups[0])
+                    failed = int(groups[1])
+                    total = int(groups[2])
+                else:
+                    passed = int(groups[0])
+                    total = int(groups[1])
+                    failed = total - passed
+            else:
+                continue
+
+            return {
+                "passed": passed,
+                "failed": failed,
+                "total": total,
+                "timestamp": datetime.now().isoformat(),
+            }
+
+    return None
+
+
+def detect_hitl_needed(ralph_id: str) -> tuple[bool, str | None]:
+    """Detect if human intervention is needed for this Ralph instance.
+
+    Triggers:
+    - 3+ permission errors in recent history
+    - Same test failing for 5+ consecutive loops
+    - Ralph stuck (no progress for 10+ loops)
+    - Critical API errors (quota/rate limit)
+    - Explicit HITL request in Ralph's message
+
+    Args:
+        ralph_id: The Ralph instance ID
+
+    Returns:
+        Tuple of (needs_hitl: bool, reason: str | None)
+    """
+    # Get error summary
+    error_summary = get_error_summary(ralph_id)
+
+    # Check for critical permission errors (3+)
+    permission_errors = error_summary["by_category"].get("permission", 0)
+    if permission_errors >= 3:
+        return (True, f"{permission_errors} permission errors detected - requires configuration fix")
+
+    # Check for API rate limit/quota errors
+    api_errors = error_summary["by_category"].get("api_error", 0)
+    if api_errors >= 2:
+        # Check recent errors for specific patterns
+        for err in error_summary["recent_errors"][:5]:
+            message = err.get("message", "").lower()
+            if any(kw in message for kw in ["quota", "rate limit", "overloaded"]):
+                return (True, f"API {err.get('category', 'error')}: {message[:80]}")
+
+    # Check status file for explicit HITL request
+    status = read_ralph_status(ralph_id)
+    if status:
+        message = status.get("message", "").lower()
+        if any(kw in message for kw in ["need help", "stuck", "human intervention", "blocked"]):
+            return (True, f"Explicit request: {status.get('message', '')[:80]}")
+
+        # Check progress data for stuck indicators
+        progress_data = status.get("progress_data", {})
+        if progress_data:
+            stuck_indicators = progress_data.get("stuck_indicators", {})
+            same_test_failures = stuck_indicators.get("same_test_failures", 0)
+            loops_without_progress = stuck_indicators.get("loop_count_without_progress", 0)
+
+            if same_test_failures >= 5:
+                return (True, f"Same test failing {same_test_failures} times - manual fix needed")
+
+            if loops_without_progress >= 10:
+                return (True, f"No progress for {loops_without_progress} loops - check task complexity")
+
+    # Check for Ralph being stuck (using existing function)
+    from chiefwiggum.spawner import is_ralph_stuck
+    timeout_mins = 30  # Default timeout
+    is_stuck, stuck_reason = is_ralph_stuck(ralph_id, timeout_mins)
+    if is_stuck:
+        return (True, f"Ralph stuck: {stuck_reason}")
+
+    return (False, None)
 
 
 def check_task_completion(ralph_id: str) -> tuple[str | None, str | None, str | None]:

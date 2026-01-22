@@ -380,6 +380,48 @@ analyze_response() {
         fi
     fi
 
+    # 1c. FALLBACK: Extract task info from git commit if no RALPH_STATUS or TASK_COMPLETE found
+    # This catches cases where Claude commits but forgets the completion block
+    if [[ -z "$completed_task_id" ]] && command -v git &>/dev/null && git rev-parse --git-dir >/dev/null 2>&1; then
+        local last_commit_msg=$(git log -1 --pretty=%B 2>/dev/null)
+        local last_commit_sha=$(git log -1 --pretty=%H 2>/dev/null)
+        local commit_age_seconds=$(git log -1 --pretty=%ct 2>/dev/null)
+        local current_time=$(date +%s 2>/dev/null || echo "0")
+
+        # Only use fallback if commit is recent (within 5 minutes = 300 seconds)
+        if [[ -n "$commit_age_seconds" && "$commit_age_seconds" =~ ^[0-9]+$ && "$current_time" =~ ^[0-9]+$ ]]; then
+            local age_minutes=$(( (current_time - commit_age_seconds) / 60 ))
+
+            if [[ $age_minutes -le 5 ]]; then
+                # Pattern 1: "Task-N" or "Task #N" or "task-N"
+                if [[ "$last_commit_msg" =~ [Tt]ask[- ]?#?([0-9]+) ]]; then
+                    local task_num="${BASH_REMATCH[1]}"
+                    completed_task_id="task-${task_num}"
+                    completed_commit_sha="$last_commit_sha"
+                    confidence_score=75
+                    [[ "${VERBOSE_PROGRESS:-}" == "true" ]] && echo "DEBUG: Fallback extraction from commit - task-${task_num}" >&2
+
+                # Pattern 2: "Issue N" or "Issue-N"
+                elif [[ "$last_commit_msg" =~ [Ii]ssue[- ]([0-9]+) ]]; then
+                    local issue_num="${BASH_REMATCH[1]}"
+                    completed_task_id="issue-${issue_num}"
+                    completed_commit_sha="$last_commit_sha"
+                    confidence_score=75
+                    [[ "${VERBOSE_PROGRESS:-}" == "true" ]] && echo "DEBUG: Fallback extraction from commit - issue-${issue_num}" >&2
+
+                # Pattern 3: (T0.1), (T1.2), etc. - Tier notation
+                elif [[ "$last_commit_msg" =~ \(T([0-9]+)\.([0-9]+)\) ]]; then
+                    local tier="${BASH_REMATCH[1]}"
+                    local subtask="${BASH_REMATCH[2]}"
+                    completed_task_id="T${tier}.${subtask}"
+                    completed_commit_sha="$last_commit_sha"
+                    confidence_score=70
+                    [[ "${VERBOSE_PROGRESS:-}" == "true" ]] && echo "DEBUG: Fallback extraction from commit - T${tier}.${subtask}" >&2
+                fi
+            fi
+        fi
+    fi
+
     # 2. Detect completion keywords in natural language output
     for keyword in "${COMPLETION_KEYWORDS[@]}"; do
         if grep -qi "$keyword" "$output_file"; then
