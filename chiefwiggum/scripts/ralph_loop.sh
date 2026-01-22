@@ -11,20 +11,24 @@ source "$SCRIPT_DIR/lib/date_utils.sh"
 source "$SCRIPT_DIR/lib/response_analyzer.sh"
 source "$SCRIPT_DIR/lib/circuit_breaker.sh"
 source "$SCRIPT_DIR/lib/profiler.sh"
+source "$SCRIPT_DIR/lib/token_estimator.sh"
+source "$SCRIPT_DIR/lib/cost_tracker.sh"
 
 # Configuration
 PROMPT_FILE="PROMPT.md"
 LOG_DIR="logs"
 DOCS_DIR="docs/generated"
-STATUS_FILE="status.json"
+STATUS_FILE=""  # Will be set via --status-file, falls back to local status.json
 PROGRESS_FILE="progress.json"
 CLAUDE_CODE_CMD="claude"
 MAX_CALLS_PER_HOUR=100  # Adjust based on your plan
+MAX_LOOPS_SAFETY=50  # Hard limit on loop iterations (prevents runaway loops)
 VERBOSE_PROGRESS=false  # Default: no verbose progress updates
 CLAUDE_TIMEOUT_MINUTES=15  # Default: 15 minutes timeout for Claude Code execution
 SLEEP_DURATION=3600     # 1 hour in seconds
-CALL_COUNT_FILE=".call_count"
-TIMESTAMP_FILE=".last_reset"
+RALPH_ID=""  # Will be set via --ralph-id, used for per-instance call counting
+CALL_COUNT_FILE=".call_count"  # Will be made Ralph-specific if RALPH_ID is set
+TIMESTAMP_FILE=".last_reset"   # Will be made Ralph-specific if RALPH_ID is set
 USE_TMUX=false
 
 # Modern Claude CLI configuration (Phase 1.1)
@@ -62,6 +66,35 @@ VALID_TOOL_PATTERNS=(
     "Bash(python *)"
     "Bash(node *)"
     "NotebookEdit"
+)
+
+# Claude Code-specific error patterns for structured error capture
+CLAUDE_PERMISSION_PATTERNS=(
+    "Tool '.*' is not allowed"
+    "Permission denied"
+    "not authorized"
+    "Bash command not allowed"
+    "Tool is not available"
+    "Action not permitted"
+)
+CLAUDE_API_PATTERNS=(
+    "rate limit"
+    "HTTP.*429|status.*429|error.*429"  # More specific than just "429"
+    "API error"
+    "quota exceeded"
+    "insufficient_quota"
+    "overloaded"
+    "service unavailable"
+    "HTTP.*503|status.*503|error.*503"  # More specific than just "503"
+    "HTTP.*500|status.*500|error.*500"  # More specific than just "500"
+)
+CLAUDE_TOOL_FAILURE_PATTERNS=(
+    "Tool execution failed"
+    "tool failed"
+    "could not execute"
+    "command failed"
+    "execution error"
+    "tool error"
 )
 
 # Exit detection configuration
@@ -163,15 +196,24 @@ init_call_tracking() {
         log_status "INFO" "Call counter reset for new hour: $current_hour"
     fi
 
-    # Initialize exit signals tracking if it doesn't exist
-    if [[ ! -f "$EXIT_SIGNALS_FILE" ]]; then
-        echo '{"test_only_loops": [], "done_signals": [], "completion_indicators": []}' > "$EXIT_SIGNALS_FILE"
-    fi
+    # ❌ REMOVED: No longer wipes exit signals every loop
+    # Exit signals are now session-scoped (initialized once in main())
 
     # Initialize circuit breaker
     init_circuit_breaker
 
     log_status "INFO" "DEBUG: Completed init_call_tracking successfully"
+}
+
+# Initialize exit signals once per Ralph session (not per loop!)
+init_exit_signals_for_session() {
+    log_status "INFO" "Initializing exit signals for session..."
+
+    # Start fresh - don't inherit from previous sessions
+    # But signals will persist across loops within THIS session
+    echo '{"test_only_loops": [], "done_signals": [], "completion_indicators": []}' > "$EXIT_SIGNALS_FILE"
+
+    log_status "INFO" "Exit signals initialized (session-scoped, will accumulate across loops)"
 }
 
 # Log function with timestamps and colors
@@ -193,14 +235,99 @@ log_status() {
     echo "[$timestamp] [$level] $message" >> "$LOG_DIR/ralph.log"
 }
 
+# Extract and classify errors from Claude Code output
+# Returns JSON with error info: category, count, details
+extract_errors() {
+    local output_file=$1
+    local error_category="none"
+    local error_count=0
+    local error_details=""
+    local matched_patterns=""
+
+    if [[ ! -f "$output_file" ]]; then
+        echo '{"category":"none","count":0,"details":[]}'
+        return 0
+    fi
+
+    # Check for permission errors (highest priority)
+    for pattern in "${CLAUDE_PERMISSION_PATTERNS[@]}"; do
+        local matches=$(grep -ciE "$pattern" "$output_file" 2>/dev/null || echo "0")
+        if [[ $matches -gt 0 ]]; then
+            error_category="permission"
+            error_count=$((error_count + matches))
+            # Capture first 3 matches for details
+            local found=$(grep -iE "$pattern" "$output_file" 2>/dev/null | head -3)
+            if [[ -n "$found" ]]; then
+                matched_patterns="$matched_patterns$found\n"
+            fi
+        fi
+    done
+
+    # Check for API errors (if not already categorized)
+    if [[ "$error_category" == "none" || "$error_category" == "permission" ]]; then
+        for pattern in "${CLAUDE_API_PATTERNS[@]}"; do
+            local matches=$(grep -ciE "$pattern" "$output_file" 2>/dev/null || echo "0")
+            if [[ $matches -gt 0 ]]; then
+                if [[ "$error_category" == "none" ]]; then
+                    error_category="api_error"
+                fi
+                error_count=$((error_count + matches))
+                local found=$(grep -iE "$pattern" "$output_file" 2>/dev/null | head -3)
+                if [[ -n "$found" ]]; then
+                    matched_patterns="$matched_patterns$found\n"
+                fi
+            fi
+        done
+    fi
+
+    # Check for tool failures (if not already categorized as permission or API)
+    if [[ "$error_category" == "none" ]]; then
+        for pattern in "${CLAUDE_TOOL_FAILURE_PATTERNS[@]}"; do
+            local matches=$(grep -ciE "$pattern" "$output_file" 2>/dev/null || echo "0")
+            if [[ $matches -gt 0 ]]; then
+                error_category="tool_failure"
+                error_count=$((error_count + matches))
+                local found=$(grep -iE "$pattern" "$output_file" 2>/dev/null | head -3)
+                if [[ -n "$found" ]]; then
+                    matched_patterns="$matched_patterns$found\n"
+                fi
+            fi
+        done
+    fi
+
+    # Build error details array (first 3 error messages, JSON-escaped)
+    local details_json="[]"
+    if [[ -n "$matched_patterns" ]]; then
+        # Convert matched patterns to JSON array (escape quotes and newlines)
+        details_json=$(echo -e "$matched_patterns" | head -3 | jq -R -s 'split("\n") | map(select(length > 0)) | .[0:3]' 2>/dev/null || echo '[]')
+    fi
+
+    # Return JSON result
+    jq -n \
+        --arg category "$error_category" \
+        --argjson count "$error_count" \
+        --argjson details "$details_json" \
+        '{category: $category, count: $count, details: $details}'
+}
+
 # Update status JSON for external monitoring
+# Parameters: loop_count, calls_made, last_action, status, exit_reason, error_info_json
 update_status() {
     local loop_count=$1
     local calls_made=$2
     local last_action=$3
     local status=$4
     local exit_reason=${5:-""}
-    
+    local error_info=${6:-'{"category":"none","count":0,"details":[]}'}
+
+    # Parse error_info JSON (with fallback for invalid JSON)
+    local error_category
+    local error_count
+    local error_details
+    error_category=$(echo "$error_info" | jq -r '.category // "none"' 2>/dev/null || echo "none")
+    error_count=$(echo "$error_info" | jq -r '.count // 0' 2>/dev/null || echo "0")
+    error_details=$(echo "$error_info" | jq -c '.details // []' 2>/dev/null || echo '[]')
+
     cat > "$STATUS_FILE" << STATUSEOF
 {
     "timestamp": "$(get_iso_timestamp)",
@@ -210,7 +337,13 @@ update_status() {
     "last_action": "$last_action",
     "status": "$status",
     "exit_reason": "$exit_reason",
-    "next_reset": "$(get_next_hour_time)"
+    "next_reset": "$(get_next_hour_time)",
+    "error_info": {
+        "category": "$error_category",
+        "count": $error_count,
+        "details": $error_details,
+        "last_error_time": "$(get_iso_timestamp)"
+    }
 }
 STATUSEOF
 }
@@ -319,8 +452,9 @@ should_exit_gracefully() {
         claude_exit_signal=$(jq -r '.analysis.exit_signal // false' ".response_analysis" 2>/dev/null || echo "false")
     fi
 
-    if [[ $recent_completion_indicators -ge 2 ]] && [[ "$claude_exit_signal" == "true" ]]; then
-        log_status "WARN" "Exit condition: Strong completion indicators ($recent_completion_indicators) with EXIT_SIGNAL=true" >&2
+    if [[ $recent_completion_indicators -ge 5 ]] || \
+       ([[ $recent_completion_indicators -ge 2 ]] && [[ "$claude_exit_signal" == "true" ]]); then
+        log_status "WARN" "Exit condition: Strong completion indicators ($recent_completion_indicators) with EXIT_SIGNAL=$claude_exit_signal" >&2
         echo "project_complete"
         return 0
     elif [[ $recent_completion_indicators -ge 2 ]]; then
@@ -436,35 +570,53 @@ validate_allowed_tools() {
 # Provides loop-specific context via --append-system-prompt
 build_loop_context() {
     local loop_count=$1
+
+    # Use compressed context for better token efficiency
+    if [[ $loop_count -gt 1 ]]; then
+        build_compressed_context "$loop_count"
+    else
+        echo "Loop #1. Starting fresh."
+    fi
+}
+
+# Build compressed loop history for context
+build_compressed_context() {
+    local loop_count=$1
     local context=""
 
-    # Add loop number
-    context="Loop #${loop_count}. "
+    # Recent loops (last 3): Full detail
+    if [[ $loop_count -gt 3 ]]; then
+        local start_loop=$((loop_count - 3))
+        context="Recent (loops $start_loop-$loop_count): "
 
-    # Extract incomplete tasks from @fix_plan.md
-    if [[ -f "@fix_plan.md" ]]; then
-        local incomplete_tasks=$(grep -c "^- \[ \]" "@fix_plan.md" 2>/dev/null || echo "0")
-        context+="Remaining tasks: ${incomplete_tasks}. "
+        for i in $(seq $start_loop $((loop_count - 1))); do
+            if [[ -f ".response_analysis_$i" ]]; then
+                local summary=$(jq -r '.analysis.work_summary // ""' ".response_analysis_$i" 2>/dev/null | head -c 80)
+                local files=$(jq -r '.analysis.files_modified // 0' ".response_analysis_$i" 2>/dev/null)
+                context+="L$i: $summary ($files files). "
+            fi
+        done
     fi
 
-    # Add circuit breaker state
-    if [[ -f ".circuit_breaker_state" ]]; then
-        local cb_state=$(jq -r '.state // "UNKNOWN"' .circuit_breaker_state 2>/dev/null)
-        if [[ "$cb_state" != "CLOSED" && "$cb_state" != "null" && -n "$cb_state" ]]; then
-            context+="Circuit breaker: ${cb_state}. "
-        fi
+    # Older loops: Aggregate statistics
+    if [[ $loop_count -gt 5 ]]; then
+        local total_files=0
+        local total_errors=0
+
+        for i in $(seq 1 $((loop_count - 4))); do
+            if [[ -f ".response_analysis_$i" ]]; then
+                local files=$(jq -r '.analysis.files_modified // 0' ".response_analysis_$i" 2>/dev/null)
+                local errors=$(jq -r '.analysis.error_count // 0' ".response_analysis_$i" 2>/dev/null)
+                total_files=$((total_files + files))
+                total_errors=$((total_errors + errors))
+            fi
+        done
+
+        context="History (loops 1-$((loop_count-4))): $total_files files modified, $total_errors errors. $context"
     fi
 
-    # Add previous loop summary (truncated)
-    if [[ -f ".response_analysis" ]]; then
-        local prev_summary=$(jq -r '.analysis.work_summary // ""' .response_analysis 2>/dev/null | head -c 200)
-        if [[ -n "$prev_summary" && "$prev_summary" != "null" ]]; then
-            context+="Previous: ${prev_summary}"
-        fi
-    fi
-
-    # Limit total length to ~500 chars
-    echo "${context:0:500}"
+    # Limit total to 800 chars (increased from 500 for better context)
+    echo "${context:0:800}"
 }
 
 # Get session file age in hours (cross-platform)
@@ -972,14 +1124,119 @@ EOF
         update_exit_signals
         end_phase "exit_signals"
 
+        # Track token usage and cost
+        start_phase "cost_tracking"
+        local estimated_tokens=$(calculate_session_tokens)
+        local token_percentage=$(get_token_usage_percentage)
+
+        # Try to extract actual usage from Claude response
+        local usage_data=$(extract_usage_from_json "$output_file")
+        local cost_source=$(echo "$usage_data" | jq -r '.source')
+
+        # Fallback to estimation if no actual data
+        if [[ "$cost_source" == "not_available" || "$cost_source" == "not_found" ]]; then
+            # Use character-based estimation
+            local prompt_chars=0
+            if [[ -f "$PROMPT_FILE" ]]; then
+                prompt_chars=$(wc -c < "$PROMPT_FILE" 2>/dev/null || echo "0")
+            fi
+            local output_chars=$(wc -c < "$output_file" 2>/dev/null || echo "0")
+            usage_data=$(estimate_tokens_and_cost "$prompt_chars" "$output_chars")
+        fi
+
+        # Extract cost for logging
+        local loop_cost=$(echo "$usage_data" | jq -r '.cost')
+        local input_tokens=$(echo "$usage_data" | jq -r '.input_tokens')
+        local output_tokens=$(echo "$usage_data" | jq -r '.output_tokens')
+
+        if [[ "$VERBOSE_PROGRESS" == "true" ]]; then
+            log_status "INFO" "📊 Token usage: ~${estimated_tokens} tokens (${token_percentage}% of budget)"
+            log_status "INFO" "💰 Cost this loop: \$${loop_cost} (${input_tokens} in, ${output_tokens} out)"
+        fi
+
+        # Write to status for TUI display
+        echo "$estimated_tokens" > ".token_usage"
+        echo "$token_percentage" > ".token_percentage"
+        echo "$usage_data" > ".cost_data"
+
+        # Accumulate in status file (crash-resistant)
+        if [[ -n "$RALPH_ID" ]]; then
+            accumulate_cost_in_status "$RALPH_ID" "$usage_data"
+        fi
+
+        end_phase "cost_tracking"
+
+        # Preserve analysis history for context compression
+        start_phase "analysis_history"
+        if [[ -f ".response_analysis" ]]; then
+            cp ".response_analysis" ".response_analysis_$loop_count"
+
+            # Keep only last 20 analysis files (rolling window)
+            if [[ $loop_count -gt 20 ]]; then
+                local old_loop=$((loop_count - 20))
+                rm -f ".response_analysis_$old_loop" 2>/dev/null || true
+            fi
+        fi
+        end_phase "analysis_history"
+
+        # Check for immediate exit in single-task mode
+        if [[ -n "$RALPH_ID" ]]; then
+            local no_continue=$(get_ralph_no_continue_setting "$RALPH_ID")
+
+            if [[ "$no_continue" == "true" ]]; then
+                local claude_exit_signal=$(jq -r '.analysis.exit_signal // false' .response_analysis 2>/dev/null)
+
+                if [[ "$claude_exit_signal" == "true" ]]; then
+                    log_status "SUCCESS" "🏁 Single-task mode: EXIT_SIGNAL detected, stopping after 1 task"
+                    reset_session "single_task_complete"
+                    update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "single_task_exit" "completed" "exit_signal_single_task"
+                    break
+                fi
+            fi
+        fi
+
         # Log analysis summary
         log_analysis_summary
+
+        # Check for task completion and report to ChiefWiggum
+        if [[ -f ".response_analysis" && -n "$RALPH_ID" ]]; then
+            local completed_task_id=$(jq -r '.analysis.completed_task_id // ""' .response_analysis 2>/dev/null)
+            local completed_commit_sha=$(jq -r '.analysis.completed_commit_sha // ""' .response_analysis 2>/dev/null)
+
+            if [[ -n "$completed_task_id" && "$completed_task_id" != "null" ]]; then
+                log_status "INFO" "📋 Task completion detected: $completed_task_id"
+
+                # Build completion command
+                local complete_cmd="wig complete \"$completed_task_id\" --ralph-id \"$RALPH_ID\""
+                if [[ -n "$completed_commit_sha" && "$completed_commit_sha" != "null" ]]; then
+                    complete_cmd="$complete_cmd --commit \"$completed_commit_sha\""
+                fi
+
+                # Call wig complete to record in database
+                log_status "INFO" "📤 Reporting task completion to ChiefWiggum..."
+                if eval "$complete_cmd" 2>&1; then
+                    log_status "SUCCESS" "✅ Task $completed_task_id marked complete in database"
+                else
+                    log_status "WARN" "⚠️ Failed to mark task complete (may already be completed or claimed by another)"
+                fi
+            fi
+        fi
 
         # Get file change count for circuit breaker
         start_phase "git_operations"
         local files_changed=$(git diff --name-only 2>/dev/null | wc -l || echo 0)
         end_phase "git_operations" "{\"files_changed\":$files_changed}"
         local has_errors="false"
+
+        # Extract structured error information using Claude-specific patterns
+        start_phase "error_extraction"
+        local error_info
+        error_info=$(extract_errors "$output_file")
+        local error_category
+        error_category=$(echo "$error_info" | jq -r '.category // "none"' 2>/dev/null || echo "none")
+        local error_count_extracted
+        error_count_extracted=$(echo "$error_info" | jq -r '.count // 0' 2>/dev/null || echo "0")
+        end_phase "error_extraction"
 
         # Two-stage error detection to avoid JSON field false positives
         # Stage 1: Filter out JSON field patterns like "is_error": false
@@ -988,19 +1245,53 @@ EOF
         if grep -v '"[^"]*error[^"]*":' "$output_file" 2>/dev/null | \
            grep -qE '(^Error:|^ERROR:|^error:|\]: error|Link: error|Error occurred|failed with error|[Ee]xception|Fatal|FATAL)'; then
             has_errors="true"
+        fi
 
-            # Debug logging: show what triggered error detection
+        # Also set has_errors if we detected Claude-specific errors
+        if [[ "$error_category" != "none" && "$error_count_extracted" -gt 0 ]]; then
+            has_errors="true"
+        fi
+
+        # Log error details in verbose mode
+        if [[ "$has_errors" == "true" ]]; then
             if [[ "$VERBOSE_PROGRESS" == "true" ]]; then
-                log_status "DEBUG" "Error patterns found:"
+                log_status "WARN" "━━━ ERROR DETAILS ━━━"
+                log_status "WARN" "Error Category: $error_category"
+                log_status "WARN" "Error Count: $error_count_extracted"
+
+                # Show error details from structured extraction
+                if [[ "$error_category" != "none" ]]; then
+                    local error_details
+                    error_details=$(echo "$error_info" | jq -r '.details[]?' 2>/dev/null)
+                    if [[ -n "$error_details" ]]; then
+                        log_status "WARN" "Error Messages:"
+                        echo "$error_details" | head -3 | while IFS= read -r line; do
+                            log_status "WARN" "  → $line"
+                        done
+                    fi
+                fi
+
+                # Also show generic error patterns found
+                log_status "DEBUG" "Generic error patterns found:"
                 grep -v '"[^"]*error[^"]*":' "$output_file" 2>/dev/null | \
                     grep -nE '(^Error:|^ERROR:|^error:|\]: error|Link: error|Error occurred|failed with error|[Ee]xception|Fatal|FATAL)' | \
                     head -3 | while IFS= read -r line; do
                     log_status "DEBUG" "  $line"
                 done
+                log_status "WARN" "━━━━━━━━━━━━━━━━━━━━━"
+            else
+                # Brief error summary in non-verbose mode
+                if [[ "$error_category" != "none" ]]; then
+                    log_status "WARN" "Errors detected: category=$error_category, count=$error_count_extracted"
+                fi
             fi
 
             log_status "WARN" "Errors detected in output, check: $output_file"
         fi
+
+        # Persist error_info for the main loop to read
+        echo "$error_info" > ".last_error_info"
+
         local output_length=$(wc -c < "$output_file" 2>/dev/null || echo 0)
 
         # Record result in circuit breaker
@@ -1030,23 +1321,56 @@ EOF
     fi
 }
 
-# Cleanup function
+# Cleanup function for SIGINT/SIGTERM
 cleanup() {
-    log_status "INFO" "Ralph loop interrupted. Cleaning up..."
+    log_status "INFO" "Ralph loop interrupted (signal). Cleaning up..."
     reset_session "manual_interrupt"
     update_status "$loop_count" "$(cat "$CALL_COUNT_FILE" 2>/dev/null || echo "0")" "interrupted" "stopped"
     exit 0
 }
 
+# Exit handler for debugging unexpected deaths
+# This runs on ANY exit, including set -e failures
+on_exit() {
+    local exit_code=$?
+    if [[ $exit_code -ne 0 ]]; then
+        log_status "ERROR" "💀 Ralph loop exiting unexpectedly with code $exit_code"
+        log_status "ERROR" "   Last loop: #$loop_count"
+        log_status "ERROR" "   Ralph ID: ${RALPH_ID:-unknown}"
+        log_status "ERROR" "   Working dir: $(pwd)"
+
+        # Log last few lines of most recent output file if available
+        local last_output=$(ls -t "$LOG_DIR"/claude_output_*.log 2>/dev/null | head -1)
+        if [[ -n "$last_output" && -f "$last_output" ]]; then
+            log_status "ERROR" "   Last output file: $last_output"
+            log_status "ERROR" "   Last 5 lines of output:"
+            tail -5 "$last_output" 2>/dev/null | while IFS= read -r line; do
+                log_status "ERROR" "     > $line"
+            done
+        fi
+
+        # Log bash execution context
+        log_status "ERROR" "   BASH_COMMAND: ${BASH_COMMAND:-unknown}"
+        log_status "ERROR" "   BASH_LINENO: ${BASH_LINENO[*]:-unknown}"
+    fi
+}
+
 # Set up signal handlers
 trap cleanup SIGINT SIGTERM
+trap on_exit EXIT
 
 # Global variable for loop count (needed by cleanup function)
 loop_count=0
 
 # Main loop
 main() {
-    
+    # Set fallback for STATUS_FILE if not provided via --status-file
+    # This allows standalone usage (local status.json) while ChiefWiggum
+    # passes the centralized ~/.chiefwiggum/status/{ralph_id}.json path
+    if [[ -z "$STATUS_FILE" ]]; then
+        STATUS_FILE="status.json"
+    fi
+
     log_status "SUCCESS" "🚀 Ralph loop starting with Claude Code"
     log_status "INFO" "Max calls per hour: $MAX_CALLS_PER_HOUR"
     log_status "INFO" "Logs: $LOG_DIR/ | Docs: $DOCS_DIR/ | Status: $STATUS_FILE"
@@ -1078,6 +1402,9 @@ main() {
     # Initialize session tracking before entering the loop
     init_session_tracking
 
+    # Initialize exit signals ONCE per session (NOT per loop!)
+    init_exit_signals_for_session
+
     log_status "INFO" "Starting main loop..."
     log_status "INFO" "DEBUG: About to enter while loop, loop_count=$loop_count"
     
@@ -1085,6 +1412,71 @@ main() {
         loop_count=$((loop_count + 1))
         start_iteration "$loop_count"
         log_status "INFO" "DEBUG: Successfully incremented loop_count to $loop_count"
+
+        # Safety valve: prevent runaway loops
+        if [[ $loop_count -ge $MAX_LOOPS_SAFETY ]]; then
+            log_status "ERROR" "🛑 Max loop safety limit reached ($MAX_LOOPS_SAFETY loops)"
+            log_status "ERROR" "This indicates a bug - Ralph should have exited earlier"
+            reset_session "max_loops_exceeded"
+            break
+        fi
+
+        # Safety: Check if current task already completed in database
+        if [[ -n "$RALPH_ID" ]]; then
+            local current_task_id=$(get_ralph_current_task "$RALPH_ID")
+
+            if [[ -n "$current_task_id" && "$current_task_id" != "null" ]]; then
+                local task_status=$(get_task_status "$current_task_id")
+
+                if [[ "$task_status" == "completed" ]]; then
+                    log_status "WARN" "⚠️ Current task already completed, claiming next task..."
+
+                    local next_claimed=$(claim_next_task_for_ralph "$RALPH_ID")
+
+                    if [[ "$next_claimed" == "true" ]]; then
+                        log_status "SUCCESS" "✅ Claimed next available task"
+                        continue
+                    else
+                        log_status "SUCCESS" "🏁 No more tasks available, exiting"
+                        reset_session "no_more_tasks"
+                        break
+                    fi
+                fi
+            fi
+        fi
+
+        # Check for proactive session reset due to token budget
+        start_phase "token_budget_check"
+        if [[ "$CLAUDE_USE_CONTINUE" == "true" ]]; then
+            local should_reset=$(should_reset_session_for_tokens)
+
+            if [[ "$should_reset" == "true" ]]; then
+                local token_pct=$(get_token_usage_percentage)
+                log_status "WARN" "⚠️ Token budget approaching limit (${token_pct}%), resetting session..."
+                reset_session "token_budget_exceeded"
+                log_status "INFO" "🔄 Fresh session started to prevent token overflow"
+            fi
+        fi
+        end_phase "token_budget_check"
+
+        # Check cost budget if set
+        start_phase "cost_budget_check"
+        if [[ -n "$COST_BUDGET_USD" && -n "$RALPH_ID" ]]; then
+            # Read accumulated cost from status
+            local status_file="$HOME/.chiefwiggum/status/${RALPH_ID}.json"
+            if [[ -f "$status_file" ]]; then
+                local current_cost=$(jq -r '.cost_info.accumulated_cost // 0' "$status_file")
+
+                if (( $(echo "$current_cost >= $COST_BUDGET_USD" | bc -l) )); then
+                    log_status "WARN" "⚠️ Cost budget reached: \$${current_cost} / \$${COST_BUDGET_USD}"
+                    log_status "INFO" "Stopping Ralph to prevent exceeding budget"
+                    reset_session "cost_budget_exceeded"
+                    update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "cost_budget_exceeded" "stopped" "cost_limit_reached"
+                    break
+                fi
+            fi
+        fi
+        end_phase "cost_budget_check"
 
         # Update session last_used timestamp
         start_phase "session_update"
@@ -1145,23 +1537,35 @@ main() {
         execute_claude_code "$loop_count"
         local exec_result=$?
 
+        # Read error info from the last execution (written by execute_claude_code)
+        local last_error_info='{"category":"none","count":0,"details":[]}'
+        if [[ -f ".last_error_info" ]]; then
+            last_error_info=$(cat ".last_error_info" 2>/dev/null || echo '{"category":"none","count":0,"details":[]}')
+        fi
+
         if [ $exec_result -eq 0 ]; then
-            update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "completed" "success"
+            update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "completed" "success" "" "$last_error_info"
 
             # Brief pause between successful executions
             start_phase "sleep"
             sleep 5
             end_phase "sleep"
+
+            # Auto-cleanup logs periodically
+            start_phase "log_cleanup"
+            auto_cleanup_logs 50  # Keep last 50 logs
+            end_phase "log_cleanup"
         elif [ $exec_result -eq 3 ]; then
             # Circuit breaker opened
             reset_session "circuit_breaker_trip"
-            update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "circuit_breaker_open" "halted" "stagnation_detected"
+            update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "circuit_breaker_open" "halted" "stagnation_detected" "$last_error_info"
             log_status "ERROR" "🛑 Circuit breaker has opened - halting loop"
             log_status "INFO" "Run 'ralph --reset-circuit' to reset the circuit breaker after addressing issues"
             break
         elif [ $exec_result -eq 2 ]; then
             # API 5-hour limit reached - handle specially
-            update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "api_limit" "paused"
+            local api_error_info='{"category":"api_error","count":1,"details":["API 5-hour usage limit reached"]}'
+            update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "api_limit" "paused" "" "$api_error_info"
             log_status "WARN" "🛑 Claude API 5-hour limit reached!"
             
             # Ask user whether to wait or exit
@@ -1177,7 +1581,7 @@ main() {
             
             if [[ "$user_choice" == "2" ]] || [[ -z "$user_choice" ]]; then
                 log_status "INFO" "User chose to exit (or timed out). Exiting loop..."
-                update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "api_limit_exit" "stopped" "api_5hour_limit"
+                update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "api_limit_exit" "stopped" "api_5hour_limit" "$api_error_info"
                 break
             else
                 log_status "INFO" "User chose to wait. Waiting for API limit reset..."
@@ -1197,7 +1601,7 @@ main() {
                 printf "\n"
             fi
         else
-            update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "failed" "error"
+            update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "failed" "error" "" "$last_error_info"
             log_status "WARN" "Execution failed, waiting 30 seconds before retry..."
             sleep 30
         fi
@@ -1205,6 +1609,105 @@ main() {
         print_profiling_summary
         log_status "LOOP" "=== Completed Loop #$loop_count ==="
     done
+}
+
+# =============================================================================
+# LOG CLEANUP FUNCTIONS
+# =============================================================================
+
+# Cleanup old logs to prevent disk bloat
+cleanup_old_logs() {
+    local keep_count=${1:-50}  # Keep last 50 by default
+
+    log_status "INFO" "🧹 Cleaning up old logs (keeping last $keep_count)..."
+
+    # Get sorted list of output logs (newest first)
+    local output_logs=($(ls -t "$LOG_DIR"/claude_output_*.log 2>/dev/null))
+    local total_count=${#output_logs[@]}
+
+    if [[ $total_count -le $keep_count ]]; then
+        log_status "INFO" "Only $total_count logs found, no cleanup needed"
+        return 0
+    fi
+
+    # Archive old logs (compress and move)
+    local archive_dir="$LOG_DIR/archive"
+    mkdir -p "$archive_dir"
+
+    local removed_count=0
+    for ((i=$keep_count; i<$total_count; i++)); do
+        local log_file="${output_logs[$i]}"
+        local basename=$(basename "$log_file")
+
+        # Compress and move to archive
+        if gzip -c "$log_file" > "$archive_dir/$basename.gz" 2>/dev/null; then
+            rm -f "$log_file"
+            ((removed_count++))
+        fi
+    done
+
+    log_status "SUCCESS" "✅ Archived $removed_count old logs to $archive_dir/"
+}
+
+# Auto-cleanup: runs periodically during loop
+auto_cleanup_logs() {
+    local keep_count=${1:-50}
+
+    # Only cleanup every 10 loops
+    if [[ $((loop_count % 10)) -ne 0 ]]; then
+        return 0
+    fi
+
+    cleanup_old_logs "$keep_count"
+}
+
+# =============================================================================
+# DATABASE HELPER FUNCTIONS
+# =============================================================================
+
+# Get Ralph's no_continue setting from database
+get_ralph_no_continue_setting() {
+    local ralph_id=$1
+    if ! command -v wig &>/dev/null; then echo "false"; return; fi
+
+    local config_json=$(wig instances --format=json 2>/dev/null | \
+                        jq -r ".[] | select(.ralph_id == \"$ralph_id\") | .config_json" 2>/dev/null)
+
+    echo "$config_json" | jq -r '.no_continue // false' 2>/dev/null || echo "false"
+}
+
+# Get current task ID for Ralph instance
+get_ralph_current_task() {
+    local ralph_id=$1
+    if ! command -v wig &>/dev/null; then echo ""; return; fi
+
+    wig instances --format=json 2>/dev/null | \
+        jq -r ".[] | select(.ralph_id == \"$ralph_id\") | .current_task_id // \"\"" 2>/dev/null
+}
+
+# Get task status from database
+get_task_status() {
+    local task_id=$1
+    if ! command -v wig &>/dev/null; then echo "unknown"; return; fi
+
+    wig tasks --format=json 2>/dev/null | \
+        jq -r ".[] | select(.task_id == \"$task_id\") | .status // \"unknown\"" 2>/dev/null
+}
+
+# Claim next task for Ralph
+claim_next_task_for_ralph() {
+    local ralph_id=$1
+    if ! command -v wig &>/dev/null; then echo "false"; return; fi
+
+    wig release "$ralph_id" 2>/dev/null || true
+
+    if wig claim "$ralph_id" 2>/dev/null; then
+        echo "true"
+        return 0
+    else
+        echo "false"
+        return 1
+    fi
 }
 
 # Help function
@@ -1234,6 +1737,13 @@ Modern CLI Options (Phase 1.1):
     --allowed-tools TOOLS   Comma-separated list of allowed tools (default: $CLAUDE_ALLOWED_TOOLS)
     --no-continue           Disable session continuity across loops
     --session-expiry HOURS  Set session expiration time in hours (default: $CLAUDE_SESSION_EXPIRY_HOURS)
+    --ralph-id ID           Set Ralph instance ID (used for per-instance call counting)
+    --status-file PATH      Set status file path (default: local status.json)
+    --token-budget TOKENS   Override max context tokens (default: 200000 for Sonnet 4.5)
+    --cleanup-logs N        Cleanup old logs, keeping only N most recent (then exit)
+    --show-tokens           Display current token usage estimate (then exit)
+    --cost-budget USD       Set per-Ralph cost budget limit in USD (stops when reached)
+    --show-costs            Display current cost data (then exit)
 
 Files created:
     - $LOG_DIR/: All execution logs
@@ -1302,6 +1812,13 @@ while [[ $# -gt 0 ]]; do
             fi
             shift 2
             ;;
+        --ralph-id)
+            RALPH_ID="$2"
+            # Use Ralph-specific call count files to prevent cross-instance counter pollution
+            CALL_COUNT_FILE=".call_count_${RALPH_ID}"
+            TIMESTAMP_FILE=".last_reset_${RALPH_ID}"
+            shift 2
+            ;;
         --reset-circuit)
             # Source the circuit breaker library
             SCRIPT_DIR="$(dirname "${BASH_SOURCE[0]}")"
@@ -1353,6 +1870,65 @@ while [[ $# -gt 0 ]]; do
             fi
             CLAUDE_SESSION_EXPIRY_HOURS="$2"
             shift 2
+            ;;
+        --status-file)
+            STATUS_FILE="$2"
+            shift 2
+            ;;
+        --max-loops)
+            if [[ -z "$2" || ! "$2" =~ ^[1-9][0-9]*$ ]]; then
+                echo "Error: --max-loops requires a positive integer"
+                exit 1
+            fi
+            MAX_LOOPS_SAFETY="$2"
+            shift 2
+            ;;
+        --token-budget)
+            if [[ -z "$2" || ! "$2" =~ ^[1-9][0-9]*$ ]]; then
+                echo "Error: --token-budget requires a positive integer (max tokens)"
+                exit 1
+            fi
+            MAX_CONTEXT_TOKENS="$2"
+            shift 2
+            ;;
+        --cleanup-logs)
+            if [[ -z "$2" || ! "$2" =~ ^[1-9][0-9]*$ ]]; then
+                echo "Error: --cleanup-logs requires a positive integer (keep N logs)"
+                exit 1
+            fi
+            cleanup_old_logs "$2"
+            exit 0
+            ;;
+        --show-tokens)
+            if [[ -f ".token_usage" ]]; then
+                tokens=$(cat ".token_usage")
+                percentage=$(cat ".token_percentage" 2>/dev/null || echo "?")
+                echo "Token usage: ~${tokens} tokens (${percentage}% of budget)"
+            else
+                echo "No token usage data available"
+            fi
+            exit 0
+            ;;
+        --cost-budget)
+            if [[ -z "$2" ]] || ! [[ "$2" =~ ^[0-9]+\.?[0-9]*$ ]]; then
+                echo "Error: --cost-budget requires a number (USD)"
+                exit 1
+            fi
+            COST_BUDGET_USD="$2"
+            shift 2
+            ;;
+        --show-costs)
+            if [[ -f ".cost_data" ]]; then
+                cost=$(jq -r '.cost // 0' ".cost_data" 2>/dev/null || echo "0")
+                source=$(jq -r '.source // "unknown"' ".cost_data" 2>/dev/null || echo "unknown")
+                input_tokens=$(jq -r '.input_tokens // 0' ".cost_data" 2>/dev/null || echo "0")
+                output_tokens=$(jq -r '.output_tokens // 0' ".cost_data" 2>/dev/null || echo "0")
+                echo "Current loop cost: \$${cost} (source: ${source})"
+                echo "Tokens: ${input_tokens} in, ${output_tokens} out"
+            else
+                echo "No cost data available"
+            fi
+            exit 0
             ;;
         *)
             echo "Unknown option: $1"

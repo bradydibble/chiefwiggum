@@ -41,7 +41,7 @@ async def get_connection() -> aiosqlite.Connection:
     """Get a database connection with proper configuration."""
     db_path = get_database_path()
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = await aiosqlite.connect(db_path)
+    conn = await aiosqlite.connect(db_path, isolation_level=None)
 
     for pragma, value in SQLITE_PRAGMAS.items():
         await conn.execute(f"PRAGMA {pragma} = {value}")
@@ -194,6 +194,7 @@ async def _run_migrations(conn: aiosqlite.Connection):
         ("has_conflict", "INTEGER DEFAULT 0"),
         ("started_at", "TIMESTAMP"),
         ("completed_at", "TIMESTAMP"),
+        ("verified_at", "TIMESTAMP"),
     ]
 
     for col_name, col_type in new_task_columns:
@@ -226,6 +227,7 @@ async def _run_migrations(conn: aiosqlite.Connection):
         ("tasks_completed", "INTEGER DEFAULT 0"),
         ("tasks_failed", "INTEGER DEFAULT 0"),
         ("total_work_seconds", "REAL DEFAULT 0.0"),
+        ("prompt_path", "TEXT"),  # Path to the prompt file this Ralph reads from
     ]
 
     for col_name, col_type in new_instance_columns:
@@ -233,6 +235,45 @@ async def _run_migrations(conn: aiosqlite.Connection):
             try:
                 await conn.execute(f"ALTER TABLE ralph_instances ADD COLUMN {col_name} {col_type}")
                 logger.info(f"Added column {col_name} to ralph_instances")
+            except Exception as e:
+                logger.debug(f"Column {col_name} may already exist: {e}")
+
+    # Add cost tracking columns to ralph_instances
+    cost_instance_columns = [
+        ("total_input_tokens", "INTEGER DEFAULT 0"),
+        ("total_output_tokens", "INTEGER DEFAULT 0"),
+        ("total_cost_usd", "REAL DEFAULT 0.0"),
+        ("last_cost_update", "TIMESTAMP"),
+    ]
+
+    for col_name, col_type in cost_instance_columns:
+        if col_name not in existing_columns:
+            try:
+                await conn.execute(f"ALTER TABLE ralph_instances ADD COLUMN {col_name} {col_type}")
+                logger.info(f"Added cost tracking column {col_name} to ralph_instances")
+            except Exception as e:
+                logger.debug(f"Column {col_name} may already exist: {e}")
+
+    # Check task_history columns for cost tracking
+    cursor = await conn.execute("PRAGMA table_info(task_history)")
+    existing_history_columns = {row[1] for row in await cursor.fetchall()}
+
+    cost_history_columns = [
+        ("input_tokens", "INTEGER DEFAULT 0"),
+        ("output_tokens", "INTEGER DEFAULT 0"),
+        ("cache_creation_tokens", "INTEGER DEFAULT 0"),
+        ("cache_read_tokens", "INTEGER DEFAULT 0"),
+        ("estimated_cost_usd", "REAL DEFAULT 0.0"),
+        ("actual_cost_usd", "REAL"),
+        ("cost_source", "TEXT DEFAULT 'estimation'"),
+        ("model_used", "TEXT"),
+    ]
+
+    for col_name, col_type in cost_history_columns:
+        if col_name not in existing_history_columns:
+            try:
+                await conn.execute(f"ALTER TABLE task_history ADD COLUMN {col_name} {col_type}")
+                logger.info(f"Added cost tracking column {col_name} to task_history")
             except Exception as e:
                 logger.debug(f"Column {col_name} may already exist: {e}")
 

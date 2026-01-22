@@ -7,12 +7,45 @@ ChiefWiggum orchestrates multiple Ralph (Claude Code) instances working on the s
 ## Installation
 
 ```bash
-pipx install --force /Users/bdibble/claudecode/chiefwiggum
+pipx install git+https://github.com/bradydibble/chiefwiggum.git
 ```
 
-For development:
+Or for development:
 ```bash
-pip install -e /Users/bdibble/claudecode/chiefwiggum
+git clone https://github.com/bradydibble/chiefwiggum.git
+cd chiefwiggum
+pip install -e .
+```
+
+## Prerequisites
+
+Before installing ChiefWiggum, ensure you have:
+
+- **Python 3.11 or higher** - Check with `python3 --version`
+- **pipx** (for isolated installation) - Install with `brew install pipx` on macOS
+- **Claude Code CLI** - The `claude` command must be available in your PATH
+- **Anthropic API key** - Get from https://console.anthropic.com/
+
+### Setting up your API Key
+
+ChiefWiggum needs your Anthropic API key to coordinate Claude instances.
+
+**Option 1: Environment Variable (Recommended)**
+```bash
+export ANTHROPIC_API_KEY='your-api-key-here'
+# Add to ~/.bashrc or ~/.zshrc to persist
+```
+
+**Option 2: Configuration File**
+ChiefWiggum will create `~/.chiefwiggum/config.yaml` on first run where you can add:
+```yaml
+anthropic_api_key: your-api-key-here
+```
+
+**Option 3: Via TUI Settings**
+```bash
+chiefwiggum tui
+# Press 'S' for Settings, then enter your API key
 ```
 
 ## Quick Start
@@ -26,19 +59,19 @@ chiefwiggum init
 ### 2. Sync tasks from a fix plan
 
 ```bash
-chiefwiggum sync ~/claudecode/tian/@fix_plan.md --project tian
+chiefwiggum sync ~/projects/myproject/@fix_plan.md --project myproject
 ```
 
 ### 3. Register a Ralph instance
 
 ```bash
-chiefwiggum register --name ralph-1 --project tian
+chiefwiggum register --name ralph-1 --project myproject
 ```
 
 ### 4. Claim a task
 
 ```bash
-chiefwiggum claim tian --ralph-id arch-ralph-1
+chiefwiggum claim myproject --ralph-id arch-ralph-1
 ```
 
 ### 5. View status
@@ -85,13 +118,13 @@ async def main():
     await init_db()
 
     # Register this instance
-    ralph_id = await register_ralph_instance("my-ralph", project="tian")
+    ralph_id = await register_ralph_instance("my-ralph", project="myproject")
 
     # Sync tasks from fix plan
-    await sync_tasks_from_fix_plan("@fix_plan.md", project="tian")
+    await sync_tasks_from_fix_plan("@fix_plan.md", project="myproject")
 
     # Claim next available task
-    task = await claim_task(ralph_id, project="tian")
+    task = await claim_task(ralph_id, project="myproject")
     if task:
         print(f"Claimed: {task['task_title']}")
 
@@ -141,6 +174,53 @@ Tasks are claimed in priority order:
 Claims automatically expire after 7 minutes if not extended. This prevents tasks from being locked by crashed instances.
 
 Instances are marked as crashed after 10 minutes without a heartbeat, and their claims are released.
+
+## Troubleshooting
+
+### Installation Issues
+
+**Python version too old**
+```bash
+# macOS - install newer Python
+brew install python@3.11
+# Verify
+python3 --version
+```
+
+**pipx not found**
+```bash
+# macOS
+brew install pipx
+pipx ensurepath
+# Restart your terminal
+```
+
+### Runtime Issues
+
+**"ANTHROPIC_API_KEY not set"**
+- Set via environment: `export ANTHROPIC_API_KEY='your-key'`
+- Or configure via TUI: `chiefwiggum tui` → Press 'S'
+
+**"No active Ralph instances"**
+- Register a Ralph first: `chiefwiggum register --name my-ralph --project myproject`
+- Or spawn via TUI: `chiefwiggum tui` → Press 'n'
+
+**"Task stays in pending status"**
+- Ensure Ralph instances are actually running and claiming tasks
+- Check instance status: `chiefwiggum status`
+- View detailed status: `chiefwiggum tui`
+
+**Database corruption or errors**
+- Reset database: `chiefwiggum reset` (Warning: deletes all data)
+- View database location: `chiefwiggum paths`
+
+**macOS permission errors**
+- Ensure terminal has Full Disk Access (System Settings → Privacy & Security)
+- Database directory `~/.chiefwiggum/` must be writable
+
+### Getting Help
+
+For internal support, contact the ChiefWiggum maintainer or file an issue in the repository.
 
 ## Development
 

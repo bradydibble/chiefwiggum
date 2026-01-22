@@ -285,34 +285,67 @@ You are working on a SINGLE task. Focus ONLY on this task.
 {task_section_content}
 ''' if task_section_content else ""}
 
+## Before Marking Complete
+
+You MUST verify completion by:
+1. Running tests: `pytest` or the project's test command
+2. Checking for errors: Review any error output from tests or linting
+3. Validating against spec: Re-read the task description and confirm all requirements are met
+
+Only mark the task complete if ALL verification steps pass.
+
 ## Completion Criteria
 
 When you have completed this task:
 1. Ensure all changes are saved
-2. Run any relevant tests
-3. Output the following marker on its own line:
+2. Run all relevant tests and ensure they pass
+3. Verify your changes match the task requirements
+4. Commit your changes with a descriptive message
+5. Output the following status block:
 
-```
-TASK_COMPLETE: {task.task_id}
-```
+---RALPH_STATUS---
+STATUS: COMPLETE
+EXIT_SIGNAL: true
+TASK_ID: {task.task_id}
+COMMIT: <the git commit SHA from your commit>
+VERIFICATION: <brief description of how you verified the task is complete, e.g. "All 12 tests pass, lint clean">
+---END_RALPH_STATUS---
+
+If you are still working and NOT done, output:
+
+---RALPH_STATUS---
+STATUS: IN_PROGRESS
+EXIT_SIGNAL: false
+---END_RALPH_STATUS---
 
 If you cannot complete the task due to an error:
-```
-TASK_FAILED: {task.task_id}
+
+---RALPH_STATUS---
+STATUS: FAILED
+EXIT_SIGNAL: true
+TASK_ID: {task.task_id}
 REASON: <brief description of what went wrong>
-```
+---END_RALPH_STATUS---
 
 ## Important Notes
 
 - Focus ONLY on this specific task
 - Do not work on other tasks from the fix_plan
 - If the task is unclear, make reasonable assumptions and proceed
-- Commit your changes with a descriptive message when done
+- Always commit your changes before marking complete
+- The ---RALPH_STATUS--- block is REQUIRED for task completion tracking
 """
     return prompt
 
 
-def write_ralph_status(ralph_id: str, task_id: str | None, status: str, loop_count: int = 0, message: str = "") -> None:
+def write_ralph_status(
+    ralph_id: str,
+    task_id: str | None,
+    status: str,
+    loop_count: int = 0,
+    message: str = "",
+    error_info: dict | None = None,
+) -> None:
     """Write Ralph status to a JSON file for chiefwiggum to read.
 
     Args:
@@ -321,6 +354,7 @@ def write_ralph_status(ralph_id: str, task_id: str | None, status: str, loop_cou
         status: Status string (working, idle, complete, failed)
         loop_count: Current loop iteration
         message: Optional status message
+        error_info: Optional error information dict with category, count, details
     """
     import json
 
@@ -333,6 +367,17 @@ def write_ralph_status(ralph_id: str, task_id: str | None, status: str, loop_cou
         "message": message,
         "updated_at": datetime.now().isoformat(),
     }
+
+    # Add error_info if provided
+    if error_info:
+        status_data["error_info"] = error_info
+    else:
+        status_data["error_info"] = {
+            "category": "none",
+            "count": 0,
+            "details": [],
+        }
+
     status_path.write_text(json.dumps(status_data, indent=2))
 
 
@@ -353,17 +398,179 @@ def read_ralph_status(ralph_id: str) -> dict | None:
         return None
 
 
-def check_task_completion(ralph_id: str) -> tuple[str | None, str | None]:
+# Claude Code-specific error patterns (mirrors ralph_loop.sh patterns)
+CLAUDE_PERMISSION_PATTERNS = [
+    r"Tool '.*' is not allowed",
+    r"Permission denied",
+    r"not authorized",
+    r"Bash command not allowed",
+    r"Tool is not available",
+    r"Action not permitted",
+]
+
+CLAUDE_API_PATTERNS = [
+    r"rate limit",
+    r"HTTP.*429|status.*429|error.*429",  # More specific than just "429"
+    r"API error",
+    r"quota exceeded",
+    r"insufficient_quota",
+    r"overloaded",
+    r"service unavailable",
+    r"HTTP.*503|status.*503|error.*503",  # More specific than just "503"
+    r"HTTP.*500|status.*500|error.*500",  # More specific than just "500"
+]
+
+CLAUDE_TOOL_FAILURE_PATTERNS = [
+    r"Tool execution failed",
+    r"tool failed",
+    r"could not execute",
+    r"command failed",
+    r"execution error",
+    r"tool error",
+]
+
+
+def get_recent_errors(ralph_id: str, max_errors: int = 10) -> list[dict]:
+    """Scan ralph.log for Claude Code error patterns.
+
+    Args:
+        ralph_id: The Ralph instance ID
+        max_errors: Maximum number of errors to return
+
+    Returns:
+        List of error dicts with timestamp, category, message
+    """
+    import re
+
+    log_path = get_ralph_log_path(ralph_id)
+    if not log_path.exists():
+        return []
+
+    errors = []
+
+    try:
+        # Read last 100KB of log to find recent errors
+        with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+            f.seek(0, 2)  # Go to end
+            size = f.tell()
+            f.seek(max(0, size - 100000))  # Read last 100KB
+            content = f.read()
+
+        lines = content.split("\n")
+
+        for line in lines:
+            # Extract timestamp if present (format: [YYYY-MM-DD HH:MM:SS])
+            timestamp_match = re.search(r"\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]", line)
+            timestamp = timestamp_match.group(1) if timestamp_match else None
+
+            # Check for permission errors
+            for pattern in CLAUDE_PERMISSION_PATTERNS:
+                if re.search(pattern, line, re.IGNORECASE):
+                    errors.append({
+                        "timestamp": timestamp,
+                        "category": "permission",
+                        "message": line.strip()[:200],  # Truncate long lines
+                    })
+                    break
+
+            # Check for API errors
+            for pattern in CLAUDE_API_PATTERNS:
+                if re.search(pattern, line, re.IGNORECASE):
+                    errors.append({
+                        "timestamp": timestamp,
+                        "category": "api_error",
+                        "message": line.strip()[:200],
+                    })
+                    break
+
+            # Check for tool failures
+            for pattern in CLAUDE_TOOL_FAILURE_PATTERNS:
+                if re.search(pattern, line, re.IGNORECASE):
+                    errors.append({
+                        "timestamp": timestamp,
+                        "category": "tool_failure",
+                        "message": line.strip()[:200],
+                    })
+                    break
+
+            # Stop if we have enough errors
+            if len(errors) >= max_errors:
+                break
+
+        # Return most recent errors first
+        return errors[-max_errors:][::-1]
+
+    except IOError as e:
+        logger.warning(f"Error reading log for {ralph_id}: {e}")
+        return []
+
+
+def get_error_summary(ralph_id: str) -> dict:
+    """Aggregate errors by category and flag critical issues.
+
+    Args:
+        ralph_id: The Ralph instance ID
+
+    Returns:
+        Dict with:
+            - total_errors: int
+            - by_category: dict[str, int] - counts per category
+            - has_critical: bool - True if permission or API errors need attention
+            - recent_errors: list - last 5 errors
+            - last_error_time: str | None - timestamp of most recent error
+    """
+    # First check status file for error_info (written by ralph_loop.sh)
+    status = read_ralph_status(ralph_id)
+    error_info_from_status = status.get("error_info", {}) if status else {}
+
+    # Also scan logs for additional context
+    recent_errors = get_recent_errors(ralph_id, max_errors=20)
+
+    # Aggregate by category
+    by_category: dict[str, int] = {}
+    for error in recent_errors:
+        cat = error.get("category", "unknown")
+        by_category[cat] = by_category.get(cat, 0) + 1
+
+    # Include counts from status file if available
+    if error_info_from_status.get("category") and error_info_from_status.get("category") != "none":
+        status_cat = error_info_from_status["category"]
+        status_count = error_info_from_status.get("count", 0)
+        by_category[status_cat] = max(by_category.get(status_cat, 0), status_count)
+
+    total_errors = sum(by_category.values())
+
+    # Check for critical errors that need user attention
+    critical_categories = {"permission", "api_error"}
+    has_critical = any(cat in critical_categories for cat in by_category.keys())
+
+    # Get last error time
+    last_error_time = None
+    if recent_errors and recent_errors[0].get("timestamp"):
+        last_error_time = recent_errors[0]["timestamp"]
+    elif error_info_from_status.get("last_error_time"):
+        last_error_time = error_info_from_status["last_error_time"]
+
+    return {
+        "total_errors": total_errors,
+        "by_category": by_category,
+        "has_critical": has_critical,
+        "recent_errors": recent_errors[:5],
+        "last_error_time": last_error_time,
+    }
+
+
+def check_task_completion(ralph_id: str) -> tuple[str | None, str | None, str | None]:
     """Check if Ralph has signaled task completion.
 
     Scans Ralph's log for TASK_COMPLETE or TASK_FAILED markers.
 
     Returns:
-        Tuple of (completed_task_id, failure_reason) - both None if no completion
+        Tuple of (completed_task_id, failure_reason, commit_sha) - all None if no completion
     """
     log_path = get_ralph_log_path(ralph_id)
     if not log_path.exists():
-        return (None, None)
+        return (None, None, None)
 
     try:
         # Read last 50KB of log to check for completion markers
@@ -377,16 +584,20 @@ def check_task_completion(ralph_id: str) -> tuple[str | None, str | None]:
         import re
         complete_match = re.search(r"TASK_COMPLETE:\s*(\S+)", content)
         if complete_match:
-            return (complete_match.group(1), None)
+            task_id = complete_match.group(1)
+            # Look for commit SHA nearby (within next few lines)
+            commit_match = re.search(r"COMMIT:\s*([a-fA-F0-9]{7,40})", content)
+            commit_sha = commit_match.group(1) if commit_match else None
+            return (task_id, None, commit_sha)
 
         # Check for failure marker
         fail_match = re.search(r"TASK_FAILED:\s*(\S+)\s*\nREASON:\s*(.+)", content)
         if fail_match:
-            return (fail_match.group(1), fail_match.group(2))
+            return (fail_match.group(1), fail_match.group(2), None)
 
-        return (None, None)
+        return (None, None, None)
     except IOError:
-        return (None, None)
+        return (None, None, None)
 
 
 def is_ralph_running(ralph_id: str) -> tuple[bool, int | None]:
@@ -538,7 +749,33 @@ def get_status_staleness(ralph_id: str) -> dict:
     result["exists"] = True
     result["status_data"] = status_data
 
-    updated_at_str = status_data.get("updated_at")
+    # Check log activity first - if log is very recent, instance is clearly working
+    # This handles the case where Claude runs for 30+ minutes without status updates
+    log_path = get_ralph_log_path(ralph_id)
+    if log_path.exists():
+        try:
+            log_mtime = log_path.stat().st_mtime
+            log_age = datetime.now().timestamp() - log_mtime
+            if log_age < 30:
+                # Log proves instance is actively working
+                result["stale"] = False
+                result["message"] = f"Active (log updated {log_age:.0f}s ago)"
+                # Still populate timestamp info if available, but don't let it override staleness
+                updated_at_str = status_data.get("updated_at") or status_data.get("timestamp")
+                if updated_at_str:
+                    try:
+                        updated_at = datetime.fromisoformat(updated_at_str)
+                        result["last_updated"] = updated_at
+                        result["age_seconds"] = (datetime.now() - updated_at).total_seconds()
+                    except (ValueError, TypeError):
+                        pass
+                return result
+        except (OSError, IOError):
+            pass  # Fall through to status file check
+
+    # Check both field names for backwards compatibility
+    # ralph_loop.sh writes "timestamp", but older code may write "updated_at"
+    updated_at_str = status_data.get("updated_at") or status_data.get("timestamp")
     if updated_at_str:
         try:
             updated_at = datetime.fromisoformat(updated_at_str)
@@ -671,10 +908,17 @@ def is_ralph_stuck(ralph_id: str, timeout_minutes: int = 30) -> tuple[bool, str]
         if not health["running"]:
             return False, "Not running"
 
-    # Check 2: Log hasn't updated in 5+ minutes
-    if activity["log_age_seconds"] is not None:
-        if activity["log_age_seconds"] > 300:  # 5 minutes
+    # Check 2: Log hasn't updated in 5+ minutes AND status is also stale
+    # (Fresh status file proves Ralph is actively working even without log output)
+    if activity["log_age_seconds"] is not None and activity["log_age_seconds"] > 300:
+        # Only stuck if status file is ALSO stale (> 2 minutes)
+        status_also_stale = (
+            activity["status_age_seconds"] is None or
+            activity["status_age_seconds"] > 120
+        )
+        if status_also_stale:
             return True, f"No log activity for {activity['log_age_seconds']/60:.1f}m"
+        # else: status is fresh, Ralph is working (Claude thinking cycle)
 
     # Check 3: Status file extremely stale (8+ minutes)
     if activity["status_age_seconds"] is not None:
@@ -1185,6 +1429,21 @@ async def spawn_ralph_with_task_claim(
     targeting = targeting or TargetingConfig()
     fix_plan_path = Path(fix_plan_path).resolve()
 
+    # Check daily cost budget if configured
+    from chiefwiggum.coordination import get_cost_stats
+    from datetime import datetime
+    cost_budget_daily = loop_settings.get("cost_budget_daily")
+    if cost_budget_daily:
+        try:
+            today_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+            today_stats = await get_cost_stats(since_date=today_start)
+            if today_stats["total_cost_usd"] >= cost_budget_daily:
+                logger.warning(f"[SPAWN_WITH_TASK] Daily cost budget exceeded: ${today_stats['total_cost_usd']:.2f} / ${cost_budget_daily:.2f}")
+                return (False, f"Daily cost budget exceeded: ${today_stats['total_cost_usd']:.2f} / ${cost_budget_daily:.2f}", None)
+        except Exception as e:
+            logger.warning(f"[SPAWN_WITH_TASK] Failed to check cost budget: {e}")
+            # Continue anyway - cost check is not critical
+
     logger.info(f"[SPAWN_WITH_TASK] Starting for {ralph_id} on project {project}")
     logger.info(f"[SPAWN_WITH_TASK] Fix plan: {fix_plan_path}")
 
@@ -1238,6 +1497,7 @@ async def spawn_ralph_with_task_claim(
             project=project,
             config=config,
             targeting=targeting,
+            prompt_path=str(prompt_path),
         )
         await _update_instance_task(ralph_id, task_id)
         logger.info(f"[SPAWN_WITH_TASK] Ralph registered successfully")
@@ -1289,6 +1549,9 @@ def _build_ralph_command(
     ralph_script = get_ralph_loop_path()
 
     cmd = [str(ralph_script)]
+
+    # Pass ralph_id for per-instance call counting
+    cmd.extend(["--ralph-id", ralph_id])
 
     # Add timeout
     if config.timeout_minutes:
@@ -1358,6 +1621,12 @@ def _build_ralph_command(
 
     # Use the fix_plan as the prompt file
     cmd.extend(["--prompt", fix_plan_path])
+
+    # Pass status file path so ralph_loop.sh writes to the correct location
+    # This ensures status is written to ~/.chiefwiggum/status/{ralph_id}.json
+    # instead of a per-project status.json (which causes conflicts with multiple ralphs)
+    status_path = get_ralph_status_path(ralph_id)
+    cmd.extend(["--status-file", str(status_path)])
 
     return cmd
 

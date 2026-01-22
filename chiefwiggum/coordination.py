@@ -14,7 +14,9 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from chiefwiggum.database import get_connection
+from chiefwiggum.database import get_connection, get_setting
+from chiefwiggum.fix_plan_writer import update_task_completion_marker
+from chiefwiggum.git_verifier import verify_commit_in_repo
 from chiefwiggum.models import (
     ClaudeModel,
     ErrorCategory,
@@ -153,13 +155,22 @@ def parse_fix_plan(path: str | Path) -> list[FixPlanTask]:
 
         if task_match and task_number and title_part and current_priority:
             if current_task:
+                # Before appending, check if task is complete based on subtasks
+                # A task is complete if it has subtasks and ALL are checked
+                if not current_task.is_complete and current_task.completed_subtasks:
+                    if not current_task.subtasks:  # No unchecked subtasks remain
+                        current_task.is_complete = True
                 tasks.append(current_task)
 
-            # Check if complete (COMPLETE in title, or all subtasks checked)
-            is_complete = "COMPLETE" in title_part.upper()
+            # Check if complete: "COMPLETE" in title, or checkmark emoji
+            is_complete = (
+                "COMPLETE" in title_part.upper() or
+                "✅" in title_part or
+                "✓" in title_part
+            )
 
-            # Clean title (remove checkmarks and COMPLETE)
-            title = re.sub(r"\s*[✅✓]\s*COMPLETE\s*", "", title_part, flags=re.IGNORECASE).strip()
+            # Clean title (remove checkmarks and COMPLETE markers)
+            title = re.sub(r"\s*[✅✓]\s*", "", title_part).strip()
             title = re.sub(r"\s*COMPLETE\s*", "", title, flags=re.IGNORECASE).strip()
 
             current_task = FixPlanTask(
@@ -187,6 +198,10 @@ def parse_fix_plan(path: str | Path) -> list[FixPlanTask]:
 
     # Don't forget the last task
     if current_task:
+        # Check if task is complete based on subtasks
+        if not current_task.is_complete and current_task.completed_subtasks:
+            if not current_task.subtasks:  # No unchecked subtasks remain
+                current_task.is_complete = True
         tasks.append(current_task)
 
     return tasks
@@ -270,6 +285,9 @@ async def claim_task(ralph_id: str, project: str | None = None, fix_plan_path: s
     - status is 'pending' OR
     - status is 'in_progress' AND expires_at < now (stale claim)
 
+    Uses BEGIN IMMEDIATE to acquire a RESERVED lock at transaction start,
+    preventing race conditions where multiple Ralphs claim the same task.
+
     Args:
         ralph_id: ID of the Ralph instance claiming the task
         project: Optional project to filter tasks by
@@ -283,6 +301,10 @@ async def claim_task(ralph_id: str, project: str | None = None, fix_plan_path: s
 
     conn = await get_connection()
     try:
+        # BEGIN IMMEDIATE acquires RESERVED lock immediately
+        # This prevents other Ralphs from claiming until we commit/rollback
+        await conn.execute("BEGIN IMMEDIATE")
+
         now = datetime.now()
         expires_at = now + timedelta(minutes=CLAIM_EXPIRY_MINUTES)
 
@@ -291,31 +313,45 @@ async def claim_task(ralph_id: str, project: str | None = None, fix_plan_path: s
         params_base = [project] if project else []
 
         for priority in PRIORITY_ORDER:
-            params = [ralph_id, now, expires_at, TaskClaimStatus.IN_PROGRESS.value, now,
-                     priority.value] + params_base + [now]
+            # Params: SET values, then inner SELECT conditions, then outer WHERE conditions
+            params = [ralph_id, now, expires_at, TaskClaimStatus.IN_PROGRESS.value, now, now,
+                     priority.value] + params_base + [now, now, now]  # Extra 'now' for claimed_by check and outer WHERE
 
             query = f"""UPDATE task_claims
                    SET claimed_by_ralph_id = ?,
                        claimed_at = ?,
                        expires_at = ?,
                        status = ?,
-                       updated_at = ?
+                       updated_at = ?,
+                       started_at = ?
                    WHERE task_id = (
                        SELECT task_id FROM task_claims
                        WHERE task_priority = ?
                          {project_filter}
                          AND (status = 'pending'
                               OR (status = 'in_progress' AND expires_at < ?))
+                         AND (claimed_by_ralph_id IS NULL OR expires_at < ?)
                        ORDER BY created_at ASC
                        LIMIT 1
                    )
+                   AND (status = 'pending' OR (status = 'in_progress' AND expires_at < ?))
                    RETURNING task_id, task_title, task_priority, task_section, project"""
 
             cursor = await conn.execute(query, params)
             result = await cursor.fetchone()
 
             if result:
+                await conn.commit()  # Release lock
+
+                # Clear any stale current_task_id from other Ralphs
+                await conn.execute(
+                    """UPDATE ralph_instances
+                       SET current_task_id = NULL
+                       WHERE current_task_id = ? AND ralph_id != ?""",
+                    (result[0], ralph_id)
+                )
                 await conn.commit()
+
                 await _update_instance_task(ralph_id, result[0])
 
                 return {
@@ -328,7 +364,11 @@ async def claim_task(ralph_id: str, project: str | None = None, fix_plan_path: s
                     "expires_at": expires_at.isoformat(),
                 }
 
+        await conn.rollback()  # Release lock if no task found
         return None
+    except Exception:
+        await conn.rollback()  # Release lock on error
+        raise
     finally:
         await conn.close()
 
@@ -405,16 +445,313 @@ async def complete_task(
         )
 
         if cursor.rowcount > 0:
+            # Read cost data from status file
+            from chiefwiggum.spawner import get_ralph_status_path
+            cost_data = None
+            status_file = get_ralph_status_path(ralph_id)
+            if status_file.exists():
+                try:
+                    status_json = json.loads(status_file.read_text())
+                    cost_data = status_json.get("cost_info", {})
+                except Exception:
+                    pass  # Ignore cost data errors, not critical
+
             # Record in task_history
-            await _record_task_history(conn, task_id, ralph_id, started_at, now, "completed")
+            await _record_task_history(conn, task_id, ralph_id, started_at, now, "completed", cost_data=cost_data)
             # Commit before calling helpers that open their own connections
             await conn.commit()
             await _update_instance_task(ralph_id, None)
             # Update instance stats
             work_seconds = (now - datetime.fromisoformat(started_at)).total_seconds() if started_at else 0
-            await _increment_instance_stats(ralph_id, completed=True, work_seconds=work_seconds)
+            cost_usd = cost_data.get("accumulated_cost", 0.0) if cost_data else 0.0
+            input_tok = cost_data.get("input_tokens", 0) if cost_data else 0
+            output_tok = cost_data.get("output_tokens", 0) if cost_data else 0
+            await _increment_instance_stats(
+                ralph_id,
+                completed=True,
+                work_seconds=work_seconds,
+                cost_increment=cost_usd,
+                input_tokens=input_tok,
+                output_tokens=output_tok
+            )
+
+            # Update @fix_plan.md with completion marker
+            task_claim = await get_task_claim(task_id)
+            if task_claim and task_claim.project:
+                await update_fix_plan_on_completion(task_id, task_claim.project)
+
             return True
         return False
+    finally:
+        await conn.close()
+
+
+async def update_fix_plan_on_completion(task_id: str, project: str | None = None) -> bool:
+    """Update @fix_plan.md when a task completes in the database.
+
+    Args:
+        task_id: ID of the completed task
+        project: Project name (used to locate @fix_plan.md)
+
+    Returns:
+        True if @fix_plan.md was updated successfully, False otherwise
+    """
+    # Check if auto-update is enabled
+    auto_update = await get_setting("update_fix_plan_on_complete", "true")
+    if auto_update.lower() != "true":
+        logger.debug(f"Auto-update disabled, skipping @fix_plan.md update for {task_id}")
+        return False
+
+    try:
+        # Get task details from database
+        task_claim = await get_task_claim(task_id)
+        if not task_claim:
+            logger.warning(f"Task {task_id} not found in database")
+            return False
+
+        # Determine fix_plan_path from project
+        # Default: look for @fix_plan.md in current directory or ../tian
+        fix_plan_path = None
+        if project == "tian":
+            fix_plan_path = Path("../tian/@fix_plan.md")
+        elif project == "chiefwiggum":
+            fix_plan_path = Path("@fix_plan.md")
+        else:
+            # Try current directory first
+            fix_plan_path = Path("@fix_plan.md")
+            if not fix_plan_path.exists():
+                fix_plan_path = Path("..") / (project or "tian") / "@fix_plan.md"
+
+        if not fix_plan_path.exists():
+            logger.warning(f"@fix_plan.md not found at {fix_plan_path}")
+            return False
+
+        # Extract task number from task_id if possible
+        # Task IDs are typically in format "task-22" or "PF-1"
+        task_number = None
+        if match := re.match(r"task-(\d+)", task_id):
+            task_number = int(match.group(1))
+
+        # Update the fix plan file
+        success = update_task_completion_marker(
+            fix_plan_path=fix_plan_path,
+            task_id=task_id,
+            task_number=task_number,
+            mark_complete=True,
+        )
+
+        if success:
+            logger.info(f"Updated @fix_plan.md for completed task {task_id}")
+        else:
+            logger.warning(f"Failed to update @fix_plan.md for task {task_id}")
+
+        return success
+
+    except Exception as e:
+        logger.error(f"Error updating @fix_plan.md for task {task_id}: {e}")
+        return False
+
+
+async def verify_and_record_commit(
+    task_id: str, commit_sha: str, project: str | None = None
+) -> bool:
+    """Verify a commit exists in the project repository and record verification.
+
+    Args:
+        task_id: ID of the task
+        commit_sha: Git commit SHA to verify
+        project: Project name (used to determine repo path)
+
+    Returns:
+        True if commit was verified and recorded, False otherwise
+    """
+    # Check if auto-verify is enabled
+    auto_verify = await get_setting("verify_commits_on_complete", "true")
+    if auto_verify.lower() != "true":
+        logger.debug(f"Auto-verify disabled, skipping commit verification for {task_id}")
+        return False
+
+    try:
+        # Determine repo_path from project
+        repo_path = Path(".")
+        if project == "tian":
+            repo_path = Path("../tian")
+        elif project == "chiefwiggum":
+            repo_path = Path(".")
+        elif project:
+            # Try to get from settings
+            repo_setting = await get_setting(f"repo_path:{project}")
+            if repo_setting:
+                repo_path = Path(repo_setting)
+            else:
+                repo_path = Path("..") / project
+
+        # Verify commit exists
+        exists, commit_message = await verify_commit_in_repo(commit_sha, repo_path)
+
+        if not exists:
+            logger.warning(
+                f"Commit {commit_sha[:8]} not found in repo {repo_path} for task {task_id}"
+            )
+            return False
+
+        # Record verification timestamp in database
+        conn = await get_connection()
+        try:
+            now = datetime.now()
+            await conn.execute(
+                """UPDATE task_claims
+                   SET verified_at = ?
+                   WHERE task_id = ?""",
+                (now, task_id),
+            )
+            await conn.commit()
+            logger.info(
+                f"Verified commit {commit_sha[:8]} in {repo_path} for task {task_id}"
+            )
+            return True
+        finally:
+            await conn.close()
+
+    except Exception as e:
+        logger.error(f"Error verifying commit for task {task_id}: {e}")
+        return False
+
+
+async def complete_and_claim_next(
+    ralph_id: str,
+    task_id: str,
+    project: str | None = None,
+    commit_sha: str | None = None,
+    message: str | None = None,
+) -> dict | None:
+    """Atomically complete task and claim next in single transaction.
+
+    This prevents race conditions where another Ralph could claim a task
+    between complete and claim operations.
+
+    Args:
+        ralph_id: ID of the Ralph instance
+        task_id: ID of the task being completed
+        project: Optional project to filter next task by
+        commit_sha: Optional git commit SHA for the completed task
+        message: Optional completion message
+
+    Returns:
+        Dict with next task info if claim successful, None if no tasks available
+    """
+    conn = await get_connection()
+    try:
+        await conn.execute("BEGIN EXCLUSIVE")
+        now = datetime.now()
+
+        # 1. Get started_at for history recording
+        cursor = await conn.execute(
+            "SELECT started_at FROM task_claims WHERE task_id = ? AND claimed_by_ralph_id = ?",
+            (task_id, ralph_id)
+        )
+        row = await cursor.fetchone()
+        started_at = row[0] if row else None
+
+        # 2. Mark task complete
+        await conn.execute(
+            """UPDATE task_claims
+               SET status = ?, completion_message = ?, git_commit_sha = ?,
+                   completed_at = ?, updated_at = ?
+               WHERE task_id = ? AND claimed_by_ralph_id = ?
+                 AND status = 'in_progress'""",
+            (TaskClaimStatus.COMPLETED.value, message, commit_sha, now, now, task_id, ralph_id)
+        )
+
+        # 3. Read cost data from status file
+        from chiefwiggum.spawner import get_ralph_status_path
+        cost_data = None
+        status_file = get_ralph_status_path(ralph_id)
+        if status_file.exists():
+            try:
+                status_json = json.loads(status_file.read_text())
+                cost_data = status_json.get("cost_info", {})
+            except Exception:
+                pass  # Ignore cost data errors, not critical
+
+        # 4. Record in task_history
+        await _record_task_history(conn, task_id, ralph_id, started_at, now, "completed", cost_data=cost_data)
+
+        # 5. Clear ralph's current task
+        await conn.execute(
+            "UPDATE ralph_instances SET current_task_id = NULL WHERE ralph_id = ?",
+            (ralph_id,)
+        )
+
+        # 6. Claim next task in same transaction (only pending tasks)
+        expires_at = now + timedelta(minutes=CLAIM_EXPIRY_MINUTES)
+        project_filter = "AND project = ?" if project else ""
+        params_base = [project] if project else []
+
+        next_task = None
+        for priority in PRIORITY_ORDER:
+            params = [ralph_id, now, expires_at, TaskClaimStatus.IN_PROGRESS.value, now, now,
+                     priority.value] + params_base
+
+            query = f"""UPDATE task_claims
+                   SET claimed_by_ralph_id = ?, claimed_at = ?, expires_at = ?,
+                       status = ?, updated_at = ?, started_at = ?
+                   WHERE task_id = (
+                       SELECT task_id FROM task_claims
+                       WHERE task_priority = ?
+                         {project_filter}
+                         AND status = 'pending'
+                       ORDER BY created_at ASC
+                       LIMIT 1
+                   )
+                   AND status = 'pending'
+                   RETURNING task_id, task_title, task_priority, task_section, project"""
+
+            cursor = await conn.execute(query, params)
+            result = await cursor.fetchone()
+            if result:
+                # Clear any stale current_task_id from other Ralphs
+                await conn.execute(
+                    """UPDATE ralph_instances
+                       SET current_task_id = NULL
+                       WHERE current_task_id = ? AND ralph_id != ?""",
+                    (result[0], ralph_id)
+                )
+
+                # Update ralph's current task
+                await conn.execute(
+                    "UPDATE ralph_instances SET current_task_id = ? WHERE ralph_id = ?",
+                    (result[0], ralph_id)
+                )
+                next_task = {
+                    "task_id": result[0],
+                    "task_title": result[1],
+                    "task_priority": result[2],
+                    "task_section": result[3],
+                    "project": result[4],
+                }
+                break
+
+        await conn.commit()
+
+        # Update instance stats (outside transaction, uses own connection)
+        work_seconds = (now - datetime.fromisoformat(started_at)).total_seconds() if started_at else 0
+        cost_usd = cost_data.get("accumulated_cost", 0.0) if cost_data else 0.0
+        input_tok = cost_data.get("input_tokens", 0) if cost_data else 0
+        output_tok = cost_data.get("output_tokens", 0) if cost_data else 0
+        await _increment_instance_stats(
+            ralph_id,
+            completed=True,
+            work_seconds=work_seconds,
+            cost_increment=cost_usd,
+            input_tokens=input_tok,
+            output_tokens=output_tok
+        )
+
+        return next_task
+    except Exception:
+        await conn.rollback()
+        raise
     finally:
         await conn.close()
 
@@ -517,7 +854,7 @@ async def check_ralph_completions() -> list[dict]:
     Returns:
         List of completion events: [{"ralph_id": str, "task_id": str, "status": "completed"|"failed", "message": str}]
     """
-    from chiefwiggum.spawner import check_task_completion, get_running_ralphs
+    from chiefwiggum.spawner import check_task_completion, get_running_ralphs, read_ralph_status
 
     events = []
     running_ralphs = get_running_ralphs()
@@ -527,20 +864,37 @@ async def check_ralph_completions() -> list[dict]:
     try:
         now = datetime.now()
 
-        # Update heartbeat for ALL running Ralphs (regardless of task assignment)
+        # Update heartbeat and loop_count for ALL running Ralphs (regardless of task assignment)
         # This prevents instances from showing as STALE when they're actually running
         for ralph_id in running_ralph_ids:
+            # Read status file to get loop_count
+            status_data = read_ralph_status(ralph_id)
+            loop_count = status_data.get("loop_count", 0) if status_data else 0
+
             await conn.execute(
                 """UPDATE ralph_instances
-                   SET last_heartbeat = ?
+                   SET last_heartbeat = ?, loop_count = ?
                    WHERE ralph_id = ?""",
-                (now, ralph_id)
+                (now, loop_count, ralph_id)
+            )
+        await conn.commit()
+
+        # Extend claim expiry for all running Ralphs with active tasks
+        # This prevents claims from expiring while Ralph is still running
+        expires_at = now + timedelta(minutes=CLAIM_EXPIRY_MINUTES)
+        for ralph_id in running_ralph_ids:
+            await conn.execute(
+                """UPDATE task_claims
+                   SET expires_at = ?, updated_at = ?
+                   WHERE claimed_by_ralph_id = ?
+                     AND status = 'in_progress'""",
+                (expires_at, now, ralph_id)
             )
         await conn.commit()
 
         # Get all active instances with assigned tasks (for completion checking)
         cursor = await conn.execute(
-            """SELECT ri.ralph_id, ri.current_task_id
+            """SELECT ri.ralph_id, ri.current_task_id, ri.project, ri.prompt_path
                FROM ralph_instances ri
                WHERE ri.status = 'active'
                  AND ri.current_task_id IS NOT NULL"""
@@ -550,6 +904,8 @@ async def check_ralph_completions() -> list[dict]:
         for row in rows:
             ralph_id = row[0]
             task_id = row[1]
+            project = row[2]
+            prompt_path = row[3]
 
             # Check if Ralph is still running
             if ralph_id not in running_ralph_ids:
@@ -564,7 +920,7 @@ async def check_ralph_completions() -> list[dict]:
                 continue
 
             # Check log for completion markers
-            completed_task_id, failure_reason = check_task_completion(ralph_id)
+            completed_task_id, failure_reason, commit_sha = check_task_completion(ralph_id)
 
             if completed_task_id and completed_task_id == task_id:
                 if failure_reason:
@@ -577,14 +933,61 @@ async def check_ralph_completions() -> list[dict]:
                         "message": failure_reason,
                     })
                 else:
-                    # Task completed successfully
-                    await complete_task(ralph_id, task_id, message="Completed via log marker")
+                    # Task completed successfully - atomically complete and claim next
+                    next_task = await complete_and_claim_next(
+                        ralph_id, task_id, project=project,
+                        commit_sha=commit_sha, message="Completed via log marker"
+                    )
                     events.append({
                         "ralph_id": ralph_id,
                         "task_id": task_id,
                         "status": "completed",
-                        "message": "Task completed successfully",
+                        "message": f"Task completed{f' (commit: {commit_sha[:8]})' if commit_sha else ''}",
                     })
+
+                    if next_task:
+                        # Generate and write new prompt to the same path
+                        if prompt_path and project:
+                            try:
+                                from chiefwiggum.spawner import generate_task_prompt, write_ralph_status
+                                from chiefwiggum.models import TaskClaim, TaskClaimStatus
+
+                                # Build TaskClaim for prompt generation
+                                new_task = TaskClaim(
+                                    task_id=next_task["task_id"],
+                                    task_title=next_task["task_title"],
+                                    task_priority=next_task.get("task_priority", "MEDIUM"),
+                                    task_section=next_task.get("task_section"),
+                                    project=project,
+                                    status=TaskClaimStatus.IN_PROGRESS,
+                                )
+
+                                # Get fix_plan path for this project
+                                fix_plan_path = Path.home() / "claudecode" / project / "@fix_plan.md"
+
+                                # Generate and write new prompt
+                                new_prompt = generate_task_prompt(new_task, fix_plan_path)
+                                Path(prompt_path).write_text(new_prompt, encoding="utf-8")
+                                logger.info(f"Updated prompt for {ralph_id} with new task: {next_task['task_title']}")
+
+                                # Update status file with new task info so TUI shows fresh activity
+                                # Shell will update loop_count, but we set message for immediate TUI feedback
+                                write_ralph_status(
+                                    ralph_id,
+                                    next_task["task_id"],
+                                    "working",
+                                    loop_count=1,  # Shell will update with real count
+                                    message=f"Working on: {next_task['task_title']}"
+                                )
+                            except Exception as e:
+                                logger.warning(f"Failed to update prompt for {ralph_id}: {e}")
+
+                        events.append({
+                            "ralph_id": ralph_id,
+                            "task_id": next_task["task_id"],
+                            "status": "claimed",
+                            "message": f"Auto-claimed next task: {next_task['task_title']}",
+                        })
 
         return events
     finally:
@@ -931,6 +1334,11 @@ async def safe_git_commit(
         commit_sha = sha_result.stdout.strip()
 
         await complete_task(ralph_id, task_id, commit_sha, message)
+
+        # Verify commit in target repository
+        task_claim = await get_task_claim(task_id)
+        if task_claim and task_claim.project and commit_sha:
+            await verify_and_record_commit(task_id, commit_sha, task_claim.project)
 
         return (True, commit_sha)
 
@@ -1536,8 +1944,19 @@ async def fail_task_with_retry(
                 )
             )
 
+            # Read cost data from status file
+            from chiefwiggum.spawner import get_ralph_status_path
+            cost_data = None
+            status_file = get_ralph_status_path(ralph_id)
+            if status_file.exists():
+                try:
+                    status_json = json.loads(status_file.read_text())
+                    cost_data = status_json.get("cost_info", {})
+                except Exception:
+                    pass  # Ignore cost data errors, not critical
+
             # Record in history
-            await _record_task_history(conn, task_id, ralph_id, started_at, now, "failed", error_message)
+            await _record_task_history(conn, task_id, ralph_id, started_at, now, "failed", error_message, cost_data=cost_data)
 
         await conn.commit()
 
@@ -1850,6 +2269,7 @@ async def _record_task_history(
     completed_at: datetime,
     status: str,
     error_message: str | None = None,
+    cost_data: dict | None = None,
 ) -> None:
     """Record task completion in history table."""
     # Get task details
@@ -1865,13 +2285,26 @@ async def _record_task_history(
     start_time = datetime.fromisoformat(started_at) if started_at else completed_at
     duration = (completed_at - start_time).total_seconds()
 
+    # Extract cost fields
+    input_tokens = cost_data.get("input_tokens", 0) if cost_data else 0
+    output_tokens = cost_data.get("output_tokens", 0) if cost_data else 0
+    cache_creation = cost_data.get("cache_creation_tokens", 0) if cost_data else 0
+    cache_read = cost_data.get("cache_read_tokens", 0) if cost_data else 0
+    estimated_cost = cost_data.get("accumulated_cost", 0.0) if cost_data else 0.0
+    cost_source = cost_data.get("source", "estimation") if cost_data else "estimation"
+    model_used = "claude-sonnet-4.5"  # Default model
+
     await conn.execute(
         """INSERT INTO task_history
            (task_id, task_title, ralph_id, project, started_at, completed_at,
-            duration_seconds, status, commit_sha, error_message)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            duration_seconds, status, commit_sha, error_message,
+            input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens,
+            estimated_cost_usd, cost_source, model_used)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (task_id, task_title, ralph_id, project, start_time, completed_at,
-         duration, status, commit_sha, error_message)
+         duration, status, commit_sha, error_message,
+         input_tokens, output_tokens, cache_creation, cache_read,
+         estimated_cost, cost_source, model_used)
     )
 
 
@@ -1880,6 +2313,9 @@ async def _increment_instance_stats(
     completed: bool = False,
     failed: bool = False,
     work_seconds: float = 0.0,
+    cost_increment: float = 0.0,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
 ) -> None:
     """Increment instance statistics."""
     conn = await get_connection()
@@ -1894,6 +2330,15 @@ async def _increment_instance_stats(
         if work_seconds > 0:
             updates.append("total_work_seconds = total_work_seconds + ?")
             params.append(work_seconds)
+        if cost_increment > 0:
+            updates.append("total_cost_usd = total_cost_usd + ?")
+            params.append(cost_increment)
+            updates.append("total_input_tokens = total_input_tokens + ?")
+            params.append(input_tokens)
+            updates.append("total_output_tokens = total_output_tokens + ?")
+            params.append(output_tokens)
+            updates.append("last_cost_update = ?")
+            params.append(datetime.now().isoformat())
 
         if updates:
             params.append(ralph_id)
@@ -1953,6 +2398,67 @@ async def list_task_history(
             )
             for row in rows
         ]
+    finally:
+        await conn.close()
+
+
+async def get_cost_stats(
+    project: str | None = None,
+    ralph_id: str | None = None,
+    since_date: datetime | None = None
+) -> dict:
+    """Get aggregated cost statistics.
+
+    Args:
+        project: Filter by project name
+        ralph_id: Filter by Ralph instance ID
+        since_date: Filter tasks completed since this date
+
+    Returns:
+        Dict with cost statistics including:
+        - task_count: Number of tasks
+        - total_cost_usd: Total estimated cost
+        - avg_cost_per_task: Average cost per task
+        - total_input_tokens: Total input tokens used
+        - total_output_tokens: Total output tokens used
+    """
+    conn = await get_connection()
+    try:
+        conditions = []
+        params = []
+
+        if project:
+            conditions.append("project = ?")
+            params.append(project)
+        if ralph_id:
+            conditions.append("ralph_id = ?")
+            params.append(ralph_id)
+        if since_date:
+            conditions.append("completed_at >= ?")
+            params.append(since_date.isoformat())
+
+        where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+
+        cursor = await conn.execute(
+            f"""SELECT
+                COUNT(*) as task_count,
+                SUM(estimated_cost_usd) as total_cost,
+                AVG(estimated_cost_usd) as avg_cost_per_task,
+                SUM(input_tokens) as total_input_tokens,
+                SUM(output_tokens) as total_output_tokens
+            FROM task_history
+            {where_clause}""",
+            params
+        )
+        row = await cursor.fetchone()
+
+        return {
+            "task_count": row[0] or 0,
+            "total_cost_usd": row[1] or 0.0,
+            "avg_cost_per_task": row[2] or 0.0,
+            "total_input_tokens": row[3] or 0,
+            "total_output_tokens": row[4] or 0,
+        }
     finally:
         await conn.close()
 
@@ -2031,6 +2537,7 @@ async def register_ralph_instance_with_config(
     project: str | None = None,
     config: RalphConfig | None = None,
     targeting: TargetingConfig | None = None,
+    prompt_path: str | None = None,
 ) -> str:
     """Register a new Ralph instance with configuration.
 
@@ -2040,6 +2547,7 @@ async def register_ralph_instance_with_config(
         project: Optional project being worked on
         config: Optional Ralph configuration
         targeting: Optional task targeting configuration
+        prompt_path: Optional path to the prompt file this Ralph reads from
 
     Returns:
         The ralph_id
@@ -2056,8 +2564,8 @@ async def register_ralph_instance_with_config(
         await conn.execute(
             """INSERT INTO ralph_instances
                (ralph_id, hostname, pid, session_file, project, started_at,
-                last_heartbeat, status, config_json, targeting_json)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                last_heartbeat, status, config_json, targeting_json, prompt_path)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(ralph_id) DO UPDATE SET
                    hostname = excluded.hostname,
                    pid = excluded.pid,
@@ -2067,9 +2575,10 @@ async def register_ralph_instance_with_config(
                    last_heartbeat = excluded.last_heartbeat,
                    status = excluded.status,
                    config_json = excluded.config_json,
-                   targeting_json = excluded.targeting_json""",
+                   targeting_json = excluded.targeting_json,
+                   prompt_path = excluded.prompt_path""",
             (ralph_id, hostname, pid, session_file, project, now, now,
-             RalphInstanceStatus.ACTIVE.value, config_json, targeting_json)
+             RalphInstanceStatus.ACTIVE.value, config_json, targeting_json, prompt_path)
         )
         await conn.commit()
 
@@ -2377,6 +2886,16 @@ async def claim_next_round_robin(ralph_id: str, project: str | None = None) -> d
 
             if result:
                 await conn.commit()
+
+                # Clear any stale current_task_id from other Ralphs
+                await conn.execute(
+                    """UPDATE ralph_instances
+                       SET current_task_id = NULL
+                       WHERE current_task_id = ? AND ralph_id != ?""",
+                    (result[0], ralph_id)
+                )
+                await conn.commit()
+
                 await _update_instance_task(ralph_id, result[0])
                 return {
                     "task_id": result[0],
@@ -2454,6 +2973,16 @@ async def claim_next_by_category(
 
             if result:
                 await conn.commit()
+
+                # Clear any stale current_task_id from other Ralphs
+                await conn.execute(
+                    """UPDATE ralph_instances
+                       SET current_task_id = NULL
+                       WHERE current_task_id = ? AND ralph_id != ?""",
+                    (result[0], ralph_id)
+                )
+                await conn.commit()
+
                 await _update_instance_task(ralph_id, result[0])
                 found_task = {
                     "task_id": result[0],
@@ -2635,3 +3164,304 @@ async def count_running_ralphs() -> int:
     """
     from chiefwiggum.spawner import get_running_ralphs
     return len(get_running_ralphs())
+
+
+async def reconcile_completed_tasks(
+    project: str | None = None, dry_run: bool = False
+) -> dict:
+    """Reconcile all completed tasks with @fix_plan.md.
+
+    For each completed task in the database:
+    1. Check if @fix_plan.md has a completion marker (✓)
+    2. If not, verify the commit exists in git (if git_commit_sha present)
+    3. If commit verified (or no commit needed), update @fix_plan.md
+
+    Args:
+        project: Optional project filter (e.g., "tian", "chiefwiggum")
+        dry_run: If True, report what would be done without making changes
+
+    Returns:
+        Dictionary with:
+        - scanned: Total tasks checked
+        - updated: Tasks marked complete in file
+        - skipped: Tasks already marked complete
+        - failed: Verification or update failures
+        - details: List of per-task results
+    """
+    from chiefwiggum.fix_plan_writer import check_task_marked_complete
+
+    result = {
+        "scanned": 0,
+        "updated": 0,
+        "skipped": 0,
+        "failed": 0,
+        "details": [],
+    }
+
+    try:
+        # Query all completed tasks
+        conn = await get_connection()
+        try:
+            query = "SELECT * FROM task_claims WHERE status = 'completed'"
+            params = []
+            if project:
+                query += " AND project = ?"
+                params.append(project)
+
+            cursor = await conn.execute(query, params)
+            rows = await cursor.fetchall()
+        finally:
+            await conn.close()
+
+        result["scanned"] = len(rows)
+
+        # Determine fix_plan_path
+        fix_plan_path = None
+        if project == "tian":
+            fix_plan_path = Path("../tian/@fix_plan.md")
+        elif project == "chiefwiggum":
+            fix_plan_path = Path("@fix_plan.md")
+        else:
+            # Try current directory first
+            fix_plan_path = Path("@fix_plan.md")
+            if not fix_plan_path.exists():
+                fix_plan_path = Path("..") / (project or "tian") / "@fix_plan.md"
+
+        if not fix_plan_path.exists():
+            logger.error(f"@fix_plan.md not found at {fix_plan_path}")
+            result["failed"] = result["scanned"]
+            return result
+
+        # Process each completed task
+        for row in rows:
+            task_claim = _row_to_task_claim(row)
+            task_id = task_claim.task_id
+
+            # Extract task number from task_id
+            task_number = None
+            if match := re.match(r"task-(\d+)", task_id):
+                task_number = int(match.group(1))
+
+            # Check if already marked complete
+            already_marked = check_task_marked_complete(
+                fix_plan_path, task_id, task_number
+            )
+
+            if already_marked:
+                result["skipped"] += 1
+                result["details"].append(
+                    {
+                        "task_id": task_id,
+                        "action": "skipped",
+                        "reason": "already_marked_complete",
+                    }
+                )
+                continue
+
+            # If task has a git commit, verify it exists
+            commit_verified = False
+            if task_claim.git_commit_sha:
+                repo_path = Path(".")
+                if task_claim.project == "tian":
+                    repo_path = Path("../tian")
+                elif task_claim.project == "chiefwiggum":
+                    repo_path = Path(".")
+                elif task_claim.project:
+                    # Try to get from settings
+                    repo_setting = await get_setting(f"repo_path:{task_claim.project}")
+                    if repo_setting:
+                        repo_path = Path(repo_setting)
+                    else:
+                        repo_path = Path("..") / task_claim.project
+
+                exists, _ = await verify_commit_in_repo(
+                    task_claim.git_commit_sha, repo_path
+                )
+
+                if not exists:
+                    result["failed"] += 1
+                    result["details"].append(
+                        {
+                            "task_id": task_id,
+                            "action": "failed",
+                            "reason": f"commit_not_found: {task_claim.git_commit_sha[:8]}",
+                        }
+                    )
+                    logger.warning(
+                        f"Reconcile: Commit {task_claim.git_commit_sha[:8]} not found for task {task_id}"
+                    )
+                    continue
+
+                commit_verified = True
+
+            # Update @fix_plan.md
+            if not dry_run:
+                success = update_task_completion_marker(
+                    fix_plan_path=fix_plan_path,
+                    task_id=task_id,
+                    task_number=task_number,
+                    mark_complete=True,
+                )
+
+                if success:
+                    result["updated"] += 1
+                    result["details"].append(
+                        {
+                            "task_id": task_id,
+                            "action": "marked_complete",
+                            "commit_verified": commit_verified,
+                        }
+                    )
+                    logger.info(f"Reconcile: Marked task {task_id} as complete")
+                else:
+                    result["failed"] += 1
+                    result["details"].append(
+                        {
+                            "task_id": task_id,
+                            "action": "failed",
+                            "reason": "update_failed",
+                        }
+                    )
+                    logger.error(
+                        f"Reconcile: Failed to mark task {task_id} as complete"
+                    )
+            else:
+                # Dry run - just report what would be done
+                result["updated"] += 1
+                result["details"].append(
+                    {
+                        "task_id": task_id,
+                        "action": "would_mark_complete",
+                        "commit_verified": commit_verified,
+                    }
+                )
+
+        logger.info(
+            f"Reconciliation complete: scanned={result['scanned']}, "
+            f"updated={result['updated']}, skipped={result['skipped']}, "
+            f"failed={result['failed']}"
+        )
+
+        return result
+
+    except Exception as e:
+        logger.error(f"Error during reconciliation: {e}")
+        result["failed"] = result["scanned"] - result["updated"] - result["skipped"]
+        return result
+
+
+def extract_progress_from_logs(ralph_id: str) -> dict:
+    """Parse Ralph logs for progress markers and last update time.
+
+    Looks for patterns like:
+    - "Processing 5/10"
+    - "[50%]"
+    - "Step 3 of 6"
+    - Progress bar patterns
+
+    Args:
+        ralph_id: The Ralph instance ID
+
+    Returns:
+        Dict with keys:
+        - percent: int (0-100, or -1 if unknown)
+        - last_update: datetime of last log line
+    """
+    from chiefwiggum.spawner import read_ralph_log
+
+    result = {"percent": -1, "last_update": None}
+
+    try:
+        log_content = read_ralph_log(ralph_id, lines=50)
+        if not log_content:
+            return result
+
+        lines = log_content.strip().split("\n")
+        if not lines:
+            return result
+
+        # Get timestamp from last line (if available)
+        # Many log formats include timestamps at the start
+        last_line = lines[-1] if lines else ""
+
+        # Try to extract timestamp from log line
+        # Common format: [HH:MM:SS] or YYYY-MM-DD HH:MM:SS
+        timestamp_match = re.search(r"(\d{2}:\d{2}:\d{2})", last_line)
+        if timestamp_match:
+            try:
+                time_str = timestamp_match.group(1)
+                today = datetime.now().date()
+                result["last_update"] = datetime.combine(today, datetime.strptime(time_str, "%H:%M:%S").time())
+            except ValueError:
+                pass
+
+        # If no timestamp in log, use file modification time as proxy
+        if result["last_update"] is None:
+            from chiefwiggum.paths import get_paths
+            log_path = get_paths().log_dir / f"ralph-{ralph_id}.log"
+            if log_path.exists():
+                result["last_update"] = datetime.fromtimestamp(log_path.stat().st_mtime)
+
+        # Look for progress indicators in recent lines (scan last 20)
+        for line in reversed(lines[-20:]):
+            line_lower = line.lower()
+
+            # Pattern: "X/Y" (e.g., "Processing 5/10")
+            ratio_match = re.search(r"(\d+)\s*/\s*(\d+)", line)
+            if ratio_match:
+                current = int(ratio_match.group(1))
+                total = int(ratio_match.group(2))
+                if total > 0 and current <= total:
+                    result["percent"] = int(current / total * 100)
+                    break
+
+            # Pattern: "[XX%]" or "XX%"
+            percent_match = re.search(r"(\d{1,3})\s*%", line)
+            if percent_match:
+                pct = int(percent_match.group(1))
+                if 0 <= pct <= 100:
+                    result["percent"] = pct
+                    break
+
+            # Pattern: "Step X of Y"
+            step_match = re.search(r"step\s+(\d+)\s+of\s+(\d+)", line_lower)
+            if step_match:
+                current = int(step_match.group(1))
+                total = int(step_match.group(2))
+                if total > 0 and current <= total:
+                    result["percent"] = int(current / total * 100)
+                    break
+
+            # Pattern: "Phase X/Y" or "Task X/Y"
+            phase_match = re.search(r"(?:phase|task)\s+(\d+)\s*/\s*(\d+)", line_lower)
+            if phase_match:
+                current = int(phase_match.group(1))
+                total = int(phase_match.group(2))
+                if total > 0 and current <= total:
+                    result["percent"] = int(current / total * 100)
+                    break
+
+    except Exception as e:
+        logger.debug(f"Error extracting progress for {ralph_id}: {e}")
+
+    return result
+
+
+def get_all_instance_progress() -> dict[str, dict]:
+    """Get progress data for all active Ralph instances.
+
+    Returns:
+        Dict mapping ralph_id -> {percent: int, last_update: datetime}
+    """
+    from chiefwiggum.spawner import get_running_ralphs
+
+    progress_data = {}
+    running_ralphs = get_running_ralphs()
+
+    for ralph_info in running_ralphs:
+        # get_running_ralphs returns list of dicts with 'ralph_id' key
+        ralph_id = ralph_info.get("ralph_id") if isinstance(ralph_info, dict) else ralph_info
+        if ralph_id:
+            progress_data[ralph_id] = extract_progress_from_logs(ralph_id)
+
+    return progress_data

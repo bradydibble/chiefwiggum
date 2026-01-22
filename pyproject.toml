@@ -55,6 +55,8 @@ packages = ["chiefwiggum"]
 "chiefwiggum/scripts/lib/response_analyzer.sh" = "chiefwiggum/scripts/lib/response_analyzer.sh"
 "chiefwiggum/scripts/lib/circuit_breaker.sh" = "chiefwiggum/scripts/lib/circuit_breaker.sh"
 "chiefwiggum/scripts/lib/profiler.sh" = "chiefwiggum/scripts/lib/profiler.sh"
+"chiefwiggum/scripts/lib/token_estimator.sh" = "chiefwiggum/scripts/lib/token_estimator.sh"
+"chiefwiggum/scripts/lib/cost_tracker.sh" = "chiefwiggum/scripts/lib/cost_tracker.sh"
 
 [tool.hatch.build.targets.sdist]
 include = [

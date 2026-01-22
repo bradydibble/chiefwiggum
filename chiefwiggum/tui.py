@@ -43,6 +43,7 @@ from chiefwiggum import (
     stop_all_instances,
     sync_tasks_from_fix_plan,
 )
+from chiefwiggum.coordination import get_all_instance_progress
 from chiefwiggum.config import (
     get_api_key_source,
     validate_api_key,
@@ -83,14 +84,19 @@ from chiefwiggum.models import (
 from chiefwiggum.spawner import (
     can_spawn_ralph,
     generate_ralph_id,
+    get_error_summary,
+    get_process_health,
+    get_recent_errors,
     get_running_ralphs,
     read_ralph_log,
+    read_ralph_status,
     spawn_ralph_daemon,
     spawn_ralph_with_task_claim,
     stop_all_ralph_daemons,
     stop_ralph_daemon,
 )
 from chiefwiggum.icons import (
+    # Icons
     ICON_ACTIVE,
     ICON_CRASHED,
     ICON_DAEMON,
@@ -109,8 +115,48 @@ from chiefwiggum.icons import (
     ICON_STALE,
     ICON_STOPPED,
     ICON_WORKING,
+    ICON_STALL,
+    # Error icons
+    ICON_ERROR_PERMISSION,
+    ICON_ERROR_API,
+    ICON_ERROR_TOOL,
+    ICON_ERROR_GENERAL,
+    # Alert icons
+    ICON_ALERT_CRITICAL,
+    ICON_ALERT_WARNING,
+    # Progress/capacity chars
+    PROGRESS_FILLED,
+    PROGRESS_EMPTY,
     SEP_VERTICAL,
     SPINNER,
+    SPINNER_BARS,
+    # Semantic colors
+    COLOR_SUCCESS,
+    COLOR_WARNING,
+    COLOR_ERROR,
+    COLOR_ACCENT,
+    COLOR_MUTED,
+    COLOR_ALERT_CRITICAL,
+    COLOR_ALERT_WARNING,
+    COLOR_OVERDUE,
+    # Background colors
+    BG_SELECTED,
+    BG_STRIPE,
+    BG_HEADER,
+    # Border colors
+    BORDER_INSTANCES,
+    BORDER_TASKS,
+    BORDER_OVERLAY,
+    BORDER_ERROR,
+    BORDER_SPAWN,
+    BORDER_STATS,
+    BORDER_ALERTS,
+    # Styles
+    STYLE_ACTIVE,
+    STYLE_IDLE,
+    STYLE_STALE,
+    STYLE_HIGHLIGHT,
+    STYLE_TABLE_ROW_EVEN,
 )
 
 
@@ -241,6 +287,7 @@ class TUIMode(Enum):
     INSTANCE_DETAIL = auto()  # Instance detail drill-down view
     INSTANCE_ERROR_DETAIL = auto()  # Full error message overlay
     CLEANUP_CONFIRM = auto()  # Confirm cleanup of idle ralphs
+    RECONCILE = auto()  # Reconcile completed tasks with @fix_plan.md
 
 
 class InstanceDetailTab(Enum):
@@ -269,6 +316,41 @@ class ViewFocus(Enum):
     BOTH = auto()  # Default: split view
     TASKS = auto()  # Tasks only (full width)
     INSTANCES = auto()  # Ralph instances only (full width)
+
+
+class AlertType(Enum):
+    """Types of alerts for the alerts panel."""
+    TASK_FAILED = auto()
+    INSTANCE_DOWN = auto()
+    QUEUE_OVERDUE = auto()
+    INSTANCE_STALE = auto()
+
+
+@dataclass
+class Alert:
+    """An alert to display in the alerts panel."""
+    alert_type: AlertType
+    message: str
+    created_at: float = field(default_factory=time.time)
+    critical: bool = False  # Critical alerts persist until acknowledged
+    source_id: str = ""  # Task ID or Ralph ID for deduplication
+
+    def __hash__(self):
+        return hash((self.alert_type, self.source_id))
+
+    def __eq__(self, other):
+        if not isinstance(other, Alert):
+            return False
+        return self.alert_type == other.alert_type and self.source_id == other.source_id
+
+
+@dataclass
+class RenderState:
+    """State for dirty-bit rendering to reduce flicker."""
+    previous_instances_hash: str = ""
+    previous_tasks_hash: str = ""
+    previous_alerts_hash: str = ""
+    previous_stats_hash: str = ""
 
 
 @dataclass
@@ -358,53 +440,157 @@ class TUIState:
     help_scroll_offset: int = 0  # For scrolling through help content
     # Console dimensions for responsive layout
     console_width: int = 80  # Updated dynamically in run_tui
+    # Alerts system
+    alerts: list = field(default_factory=list)  # List of Alert objects
+    alerts_scroll_offset: int = 0  # For scrolling through alerts
+    # Reconcile results
+    reconcile_result: Optional[dict] = None  # Results from reconcile_completed_tasks()
+    # Dirty-bit rendering state
+    render_state: RenderState = field(default_factory=RenderState)
 
 
-def create_instances_table(instances: list, show_all: bool = False, selected_idx: int | None = None) -> Table:
-    """Create a table showing Ralph instances."""
+def _get_error_indicator(ralph_id: str) -> str:
+    """Get error indicator icon and style for a Ralph instance.
+
+    Returns a Rich-formatted string with appropriate icon based on error category.
+    """
+    status = read_ralph_status(ralph_id)
+    if not status:
+        return ""
+
+    error_info = status.get("error_info", {})
+    category = error_info.get("category", "none")
+    count = error_info.get("count", 0)
+
+    if category == "none" or count == 0:
+        return ""
+
+    # Map category to icon and color
+    error_icons = {
+        "permission": (ICON_ERROR_PERMISSION, "magenta"),
+        "api_error": (ICON_ERROR_API, "red"),
+        "tool_failure": (ICON_ERROR_TOOL, "yellow"),
+    }
+
+    icon, color = error_icons.get(category, (ICON_ERROR_GENERAL, "orange1"))
+    return f"[{color}]{icon}[/{color}]"
+
+
+def create_progress_bar(percent: int, width: int = 5) -> str:
+    """Create a progress bar string from percentage.
+
+    Args:
+        percent: Progress percentage (0-100)
+        width: Number of characters in the bar
+
+    Returns:
+        Progress bar string like [███░░]
+    """
+    if percent < 0:
+        percent = 0
+    elif percent > 100:
+        percent = 100
+
+    filled = int(width * percent / 100)
+    empty = width - filled
+    return f"[{PROGRESS_FILLED * filled}{PROGRESS_EMPTY * empty}]"
+
+
+def create_instances_table(instances: list, show_all: bool = False, selected_idx: int | None = None, progress_data: dict | None = None) -> Table:
+    """Create a table showing Ralph instances.
+
+    Args:
+        instances: List of RalphInstance objects
+        show_all: If True, show all instances; if False, show only active
+        selected_idx: Index of selected row for highlighting
+        progress_data: Dict mapping ralph_id -> {percent: int, last_update: datetime}
+    """
     title = "Ralph Instances" + (" (All)" if show_all else " (Active)")
     table = Table(title=title, expand=True)
     table.add_column("#", style="dim", no_wrap=True, width=2)
-    table.add_column("ID", no_wrap=True)
-    table.add_column("Host")
-    table.add_column("Project")
-    table.add_column("Current Task")
-    table.add_column("Done", justify="right", style="dim")
-    table.add_column("Heartbeat", style="dim")
-    table.add_column("Status", justify="center")
+    table.add_column("ID", no_wrap=True, width=10)
+    table.add_column("Current Task", width=25)  # Merged with progress
+    table.add_column("Done", justify="right", style="dim", width=4)
+    table.add_column("Cost", justify="right", style="cyan", width=7)
+    table.add_column("Err", justify="center", width=3)  # Error indicator column
+    table.add_column("Elapsed", style="dim", width=7)  # Changed from Heartbeat to Elapsed
+    table.add_column("Status", justify="center", width=10)
 
     now = datetime.now()
+    progress_data = progress_data or {}
 
     for idx, inst in enumerate(instances, 1):
-        # Calculate heartbeat age
-        age_seconds = (now - inst.last_heartbeat).total_seconds()
-        if age_seconds < 60:
-            heartbeat_str = f"{int(age_seconds)}s ago"
-        elif age_seconds < 3600:
-            heartbeat_str = f"{int(age_seconds / 60)}m ago"
-        else:
-            heartbeat_str = f"{int(age_seconds / 3600)}h ago"
+        # Calculate heartbeat age (still used for stale detection)
+        heartbeat_age = (now - inst.last_heartbeat).total_seconds()
 
-        # Status styling with icons
+        # Calculate elapsed time (time since task started)
+        elapsed_str = "-"
+        if inst.current_task_id and inst.status == RalphInstanceStatus.ACTIVE:
+            # Use started_at if available, otherwise use last_heartbeat as proxy
+            started = getattr(inst, 'started_at', None) or inst.last_heartbeat
+            elapsed_seconds = (now - started).total_seconds()
+            elapsed_str = format_age(elapsed_seconds)
+
+        # Get error indicator for this instance
+        error_indicator = _get_error_indicator(inst.ralph_id)
+
+        # Status styling with icons (using semantic colors)
+        # First, check actual process health if status shows ACTIVE
+        process_is_dead = False
+        if inst.status == RalphInstanceStatus.ACTIVE:
+            health = get_process_health(inst.ralph_id)
+            process_is_dead = not health.get("healthy", True)
+
+        # Check for stalled task (no log updates in 30s while active)
+        is_stalled = False
+        progress_info = progress_data.get(inst.ralph_id, {})
+        last_log_update = progress_info.get("last_update")
+        if last_log_update and inst.status == RalphInstanceStatus.ACTIVE and inst.current_task_id:
+            log_age = (now - last_log_update).total_seconds()
+            if log_age > 30:
+                is_stalled = True
+
+        # Show DEAD if process is dead but database still shows ACTIVE
+        if process_is_dead:
+            status_str = f"[bold {COLOR_ERROR}]{ICON_CRASHED} DEAD[/bold {COLOR_ERROR}]"
         # Check for stale ACTIVE instances (heartbeat > 5min old)
-        if inst.status == RalphInstanceStatus.ACTIVE and age_seconds > 300:
+        elif inst.status == RalphInstanceStatus.ACTIVE and heartbeat_age > 300:
             # Stale ACTIVE - show warning instead of green
-            status_str = f"[bold yellow]{ICON_STALE} STALE[/bold yellow]"
-            heartbeat_str = f"[yellow]{heartbeat_str}[/yellow]"
+            status_str = f"[{STYLE_STALE}]{ICON_STALE} STALE[/{STYLE_STALE}]"
         else:
             status_styles = {
-                RalphInstanceStatus.ACTIVE: f"[bold green]{ICON_ACTIVE} ACTIVE[/bold green]",
-                RalphInstanceStatus.IDLE: f"[yellow]{ICON_IDLE} IDLE[/yellow]",
+                RalphInstanceStatus.ACTIVE: f"[{STYLE_ACTIVE}]{ICON_ACTIVE} ACTIVE[/{STYLE_ACTIVE}]",
+                RalphInstanceStatus.IDLE: f"[{STYLE_IDLE}]{ICON_IDLE} IDLE[/{STYLE_IDLE}]",
                 RalphInstanceStatus.PAUSED: f"[blue]{ICON_PAUSED} PAUSED[/blue]",
                 RalphInstanceStatus.STOPPED: f"[dim]{ICON_STOPPED} STOP[/dim]",
-                RalphInstanceStatus.CRASHED: f"[bold red]{ICON_CRASHED} CRASH[/bold red]",
+                RalphInstanceStatus.CRASHED: f"[bold {COLOR_ERROR}]{ICON_CRASHED} CRASH[/bold {COLOR_ERROR}]",
             }
             status_str = status_styles.get(inst.status, inst.status.value)
 
         # Show completed task count
         done_count = str(inst.tasks_completed) if inst.tasks_completed else "0"
 
-        # Highlight selected row
+        # Show cost
+        cost_display = f"${inst.total_cost_usd:.2f}" if inst.total_cost_usd else "$0.00"
+
+        # Build current task display with progress bar
+        task_display = "-"
+        if inst.current_task_id:
+            task_name = inst.current_task_id[:15]
+            progress_percent = progress_info.get("percent", -1)
+
+            if progress_percent >= 0:
+                # Show progress bar with percentage
+                progress_bar = create_progress_bar(progress_percent, 5)
+                task_display = f"{task_name} {progress_bar}"
+            else:
+                task_display = task_name
+
+            # Add stall indicator
+            if is_stalled:
+                task_display += f" [{COLOR_WARNING}]{ICON_STALL}[/{COLOR_WARNING}]"
+
+        # Highlight selected row and zebra striping
         is_selected = selected_idx is not None and (idx - 1) == selected_idx
         # Show only the suffix of ralph_id (without hostname prefix) for readability
         id_display = inst.ralph_id
@@ -414,18 +600,20 @@ def create_instances_table(instances: list, show_all: bool = False, selected_idx
         idx_display = f"{ICON_SELECTED} {idx}" if is_selected and idx <= 9 else (str(idx) if idx <= 9 else "")
         row_args = (
             idx_display,
-            id_display[:12],
-            inst.hostname or "-",
-            inst.project or "-",
-            inst.current_task_id[:25] if inst.current_task_id else "-",
+            id_display[:10],
+            task_display,
             done_count,
-            heartbeat_str,
+            cost_display,
+            error_indicator or "-",
+            elapsed_str,
             status_str,
         )
         if is_selected:
-            table.add_row(*row_args, style="bold white on grey23")
+            table.add_row(*row_args, style=STYLE_HIGHLIGHT)
         else:
-            table.add_row(*row_args)
+            # Zebra striping for non-selected rows
+            row_style = STYLE_TABLE_ROW_EVEN if (idx % 2 == 0) else ""
+            table.add_row(*row_args, style=row_style)
 
     if not instances:
         msg = "[dim]No instances" + (" registered" if show_all else " active (press i to show all)") + "[/dim]"
@@ -454,10 +642,11 @@ def create_tasks_table(
     if show_numbers:
         table.add_column("#", style="dim", no_wrap=True, width=2)
     table.add_column("Priority", style="bold", no_wrap=True, width=8)
+    table.add_column("Age", style="dim", no_wrap=True, width=5, justify="right")  # New Age column
     if show_category:
         table.add_column("Cat", style="dim", no_wrap=True, width=5)
     # Wider task column when expanded
-    task_width = None if expanded else 35
+    task_width = None if expanded else 30  # Slightly smaller to make room for Age
     table.add_column("Task", max_width=task_width)
     table.add_column("Project", width=10)
     table.add_column("Status", justify="center", width=12)
@@ -488,6 +677,7 @@ def create_tasks_table(
     }
 
     selected_ids = selected_ids or set()
+    now = datetime.now()
 
     # Show tasks from offset to offset+limit
     visible_tasks = tasks[offset : offset + limit]
@@ -495,8 +685,16 @@ def create_tasks_table(
         priority_str = priority_styles.get(task.task_priority.value, task.task_priority.value)
         status_str = status_styles.get(task.status, task.status.value)
 
+        # Calculate task age
+        age_seconds = (now - task.created_at).total_seconds()
+        age_str = format_age(age_seconds)
+        # Highlight overdue tasks (>30min)
+        is_overdue = age_seconds > 1800 and task.status == TaskClaimStatus.PENDING
+        if is_overdue:
+            age_str = f"[bold {COLOR_OVERDUE}]{age_str}[/bold {COLOR_OVERDUE}]"
+
         # Add error indicator for failed tasks
-        max_title_len = 60 if expanded else 35
+        max_title_len = 55 if expanded else 30  # Adjusted for Age column
         task_title = task.task_title[:max_title_len]
         if task.status == TaskClaimStatus.FAILED and task.error_category:
             task_title += f" [red]({task.error_category.value})[/red]"
@@ -518,6 +716,7 @@ def create_tasks_table(
             idx_display = f"{ICON_SELECTED} {idx}" if is_row_selected and idx <= 9 else (str(idx) if idx <= 9 else "")
             row.append(idx_display)
         row.append(priority_str)
+        row.append(age_str)  # Add age column
         if show_category:
             row.append(cat_str)
         row.append(task_title)
@@ -531,14 +730,16 @@ def create_tasks_table(
         else:
             row.append("-")
 
-        # Highlight selected row with softer style
+        # Highlight selected row with zebra striping
         if is_row_selected:
-            table.add_row(*row, style="bold white on grey23")
+            table.add_row(*row, style=STYLE_HIGHLIGHT)
         else:
-            table.add_row(*row)
+            # Zebra striping for non-selected rows
+            row_style = STYLE_TABLE_ROW_EVEN if (idx % 2 == 0) else ""
+            table.add_row(*row, style=row_style)
 
     # Calculate number of empty columns for footer rows
-    num_cols = 5  # Base: Priority, Task, Project, Status, Claimed By
+    num_cols = 6  # Base: Priority, Age, Task, Project, Status, Claimed By
     if bulk_mode:
         num_cols += 1
     if show_numbers:
@@ -581,12 +782,12 @@ def create_stats_panel(instances: list, tasks: list, state: TUIState) -> Panel:
 
     text = Text()
 
-    # Notification badges at start with icons
+    # Notification badges at start with icons (softer colors)
     if failed_count > 0:
-        text.append(f" {ICON_FAILED} {failed_count} FAILED ", style="bold white on red")
+        text.append(f" {ICON_FAILED} {failed_count} FAILED ", style=f"bold white on {COLOR_ERROR}")
         text.append(f"  {SEP_VERTICAL}  ", style="dim")
     if stale_count > 0:
-        text.append(f" {ICON_STALE} {stale_count} STALE ", style="bold black on yellow")
+        text.append(f" {ICON_STALE} {stale_count} STALE ", style="bold grey11 on yellow3")
         text.append(f"  {SEP_VERTICAL}  ", style="dim")
 
     # Instances section
@@ -650,19 +851,142 @@ def create_stats_panel(instances: list, tasks: list, state: TUIState) -> Panel:
         text.append("  |  ", style="dim")
         text.append(f"[BULK: {len(state.selected_task_ids)} selected]", style="magenta bold")
 
-    return Panel(text, title="Summary", border_style="blue")
+    return Panel(text, title="Summary", border_style=BORDER_STATS)
 
 
-def create_layout() -> Layout:
+def generate_alerts(state: TUIState) -> list[Alert]:
+    """Generate current alerts from system state.
+
+    Scans for failed tasks, down instances, stale instances, and overdue queued tasks.
+    """
+    alerts = []
+    now = datetime.now()
+    current_time = time.time()
+
+    # 1. Failed tasks
+    for task in state.failed_tasks:
+        alerts.append(Alert(
+            alert_type=AlertType.TASK_FAILED,
+            message=f"{task.task_id[:25]} (FAILED) - {task.error_category.value if task.error_category else 'unknown'}",
+            created_at=current_time,
+            critical=True,
+            source_id=f"task-{task.task_id}",
+        ))
+
+    # 2. Down/crashed instances
+    for inst in state.all_instances:
+        if inst.status == RalphInstanceStatus.CRASHED:
+            alerts.append(Alert(
+                alert_type=AlertType.INSTANCE_DOWN,
+                message=f"{inst.ralph_id[:15]} (DOWN) - Crashed",
+                created_at=current_time,
+                critical=True,
+                source_id=f"inst-{inst.ralph_id}",
+            ))
+
+    # 3. Stale active instances (heartbeat > 5min old)
+    for inst in state.all_instances:
+        if inst.status == RalphInstanceStatus.ACTIVE:
+            age_seconds = (now - inst.last_heartbeat).total_seconds()
+            if age_seconds > 300:  # 5 minutes
+                age_str = format_age(age_seconds)
+                alerts.append(Alert(
+                    alert_type=AlertType.INSTANCE_STALE,
+                    message=f"{inst.ralph_id[:15]} (STALE) - Heartbeat lost {age_str}",
+                    created_at=current_time,
+                    critical=False,
+                    source_id=f"stale-{inst.ralph_id}",
+                ))
+
+    # 4. Overdue tasks (queued >30min)
+    overdue_count = 0
+    for task in state.all_tasks_cache:
+        if task.status == TaskClaimStatus.PENDING:
+            age_seconds = (now - task.created_at).total_seconds()
+            if age_seconds > 1800:  # 30 minutes
+                overdue_count += 1
+
+    if overdue_count > 0:
+        alerts.append(Alert(
+            alert_type=AlertType.QUEUE_OVERDUE,
+            message=f"{overdue_count} task(s) queued >30min",
+            created_at=current_time,
+            critical=False,
+            source_id="overdue-tasks",
+        ))
+
+    return alerts
+
+
+def create_alerts_panel(state: TUIState) -> Panel | None:
+    """Create the alerts panel showing critical issues.
+
+    Returns None if there are no alerts to show.
+    """
+    if not state.alerts:
+        return None
+
+    text = Text()
+
+    # Show up to 3 alerts (most recent first for critical, then warnings)
+    critical_alerts = [a for a in state.alerts if a.critical]
+    warning_alerts = [a for a in state.alerts if not a.critical]
+
+    displayed_alerts = critical_alerts[:2] + warning_alerts[:1] if critical_alerts else warning_alerts[:3]
+
+    for i, alert in enumerate(displayed_alerts):
+        if alert.critical:
+            icon = ICON_ALERT_CRITICAL
+            style = f"bold {COLOR_ALERT_CRITICAL}"
+        else:
+            icon = ICON_ALERT_WARNING
+            style = COLOR_ALERT_WARNING
+
+        text.append(f" {icon} ", style=style)
+        text.append(alert.message, style=style)
+
+        if i < len(displayed_alerts) - 1:
+            text.append("  │  ", style="dim")
+
+    # Show count if more alerts exist
+    remaining = len(state.alerts) - len(displayed_alerts)
+    if remaining > 0:
+        text.append(f"  (+{remaining} more)", style="dim")
+
+    return Panel(text, title="ALERTS", border_style=BORDER_ALERTS, height=3)
+
+
+def format_age(seconds: float) -> str:
+    """Format age in seconds to human-readable string."""
+    if seconds < 60:
+        return f"{int(seconds)}s"
+    elif seconds < 3600:
+        return f"{int(seconds / 60)}m"
+    elif seconds < 86400:
+        return f"{int(seconds / 3600)}h"
+    else:
+        return f"{int(seconds / 86400)}d"
+
+
+def create_layout(has_alerts: bool = False) -> Layout:
     """Create the dashboard layout."""
     layout = Layout()
 
-    layout.split_column(
-        Layout(name="header", size=3),
-        Layout(name="stats", size=3),
-        Layout(name="main"),
-        Layout(name="command_bar", size=3),
-    )
+    if has_alerts:
+        layout.split_column(
+            Layout(name="header", size=3),
+            Layout(name="alerts", size=3),
+            Layout(name="stats", size=3),
+            Layout(name="main"),
+            Layout(name="command_bar", size=3),
+        )
+    else:
+        layout.split_column(
+            Layout(name="header", size=3),
+            Layout(name="stats", size=3),
+            Layout(name="main"),
+            Layout(name="command_bar", size=3),
+        )
 
     layout["main"].split_row(
         Layout(name="instances"),
@@ -703,6 +1027,7 @@ def get_help_lines() -> list[tuple[str, str]]:
     lines.append(("  y      Sync current project from @fix_plan.md", ""))
     lines.append(("  Y      Sync ALL projects from @fix_plan.md", ""))
     lines.append(("  r      Release task claim", ""))
+    lines.append(("  R      Reconcile completed tasks with @fix_plan.md", ""))
     lines.append(("  e      View error details for failed task", ""))
     lines.append(("", ""))
 
@@ -799,7 +1124,7 @@ def create_help_panel(offset: int = 0, visible_lines: int = 30) -> Panel:
     help_text.append("q/Esc", style="yellow bold")
     help_text.append(" Close", style="dim")
 
-    return Panel(help_text, title="Help", border_style="cyan", padding=(1, 2))
+    return Panel(help_text, title="Help", border_style=BORDER_OVERLAY, box=box.DOUBLE, padding=(1, 2))
 
 
 def create_stats_view_panel(state: TUIState) -> Panel:
@@ -810,7 +1135,7 @@ def create_stats_view_panel(state: TUIState) -> Panel:
     # We'll populate this with actual stats in update_dashboard
     text.append("Press any key to close", style="dim")
 
-    return Panel(text, title="Statistics (t)", border_style="cyan", padding=(1, 2))
+    return Panel(text, title="Statistics (t)", border_style=BORDER_OVERLAY, box=box.DOUBLE, padding=(1, 2))
 
 
 def create_error_detail_panel(task, state: TUIState) -> Panel:
@@ -819,7 +1144,7 @@ def create_error_detail_panel(task, state: TUIState) -> Panel:
 
     if not task:
         text.append("No failed task selected", style="dim")
-        return Panel(text, title="Error Details", border_style="red")
+        return Panel(text, title="Error Details", border_style=BORDER_ERROR)
 
     text.append(f"Task: ", style="bold")
     text.append(f"{task.task_title}\n\n", style="white")
@@ -873,7 +1198,7 @@ def create_error_detail_panel(task, state: TUIState) -> Panel:
 
     text.append("\n\nPress any key to close", style="dim")
 
-    return Panel(text, title="Error Details (e)", border_style="red", padding=(1, 2))
+    return Panel(text, title="Error Details (e)", border_style=BORDER_ERROR, box=box.DOUBLE, padding=(1, 2))
 
 
 def create_spawn_panel(state: TUIState) -> Panel:
@@ -1003,7 +1328,7 @@ def create_spawn_panel(state: TUIState) -> Panel:
         text.append("  Esc", style="yellow bold")
         text.append(" = Cancel\n", style="dim")
 
-    return Panel(text, title="Spawn Ralph (n)", border_style="green", padding=(1, 2))
+    return Panel(text, title="Spawn Ralph (n)", border_style=BORDER_SPAWN, box=box.DOUBLE, padding=(1, 2))
 
 
 def create_log_view_panel(state: TUIState) -> Panel:
@@ -1025,7 +1350,7 @@ def create_log_view_panel(state: TUIState) -> Panel:
 
     text.append("\nPress any key to close", style="dim")
 
-    return Panel(text, title="Ralph Logs (l)", border_style="blue", padding=(1, 2))
+    return Panel(text, title="Ralph Logs (l)", border_style=BORDER_OVERLAY, box=box.DOUBLE, padding=(1, 2))
 
 
 def create_history_panel(state: TUIState) -> Panel:
@@ -1063,7 +1388,7 @@ def create_history_panel(state: TUIState) -> Panel:
 
     text.append("\n\nPress any key to close", style="dim")
 
-    return Panel(text, title="History (H)", border_style="magenta", padding=(1, 2))
+    return Panel(text, title="History (H)", border_style=BORDER_OVERLAY, box=box.DOUBLE, padding=(1, 2))
 
 
 def create_settings_panel(state: TUIState) -> Panel:
@@ -1084,7 +1409,7 @@ def create_settings_panel(state: TUIState) -> Panel:
         text.append(" = save  ", style="dim")
         text.append("Esc", style="yellow bold")
         text.append(" = cancel", style="dim")
-        return Panel(text, title="Settings - Edit API Key", border_style="cyan", padding=(1, 2))
+        return Panel(text, title="Settings - Edit API Key", border_style=BORDER_OVERLAY, box=box.DOUBLE, padding=(1, 2))
 
     elif state.mode == TUIMode.SETTINGS_EDIT_MAX_RALPHS:
         text.append("Edit Max Concurrent Ralphs\n\n", style="bold cyan")
@@ -1097,7 +1422,7 @@ def create_settings_panel(state: TUIState) -> Panel:
         text.append(" = save  ", style="dim")
         text.append("Esc", style="yellow bold")
         text.append(" = cancel", style="dim")
-        return Panel(text, title="Settings - Edit Max Ralphs", border_style="cyan", padding=(1, 2))
+        return Panel(text, title="Settings - Edit Max Ralphs", border_style=BORDER_OVERLAY, box=box.DOUBLE, padding=(1, 2))
 
     elif state.mode == TUIMode.SETTINGS_EDIT_MODEL:
         text.append("Select Default Model\n\n", style="bold cyan")
@@ -1111,7 +1436,7 @@ def create_settings_panel(state: TUIState) -> Panel:
         text.append(" = select  ", style="dim")
         text.append("Esc", style="yellow bold")
         text.append(" = cancel", style="dim")
-        return Panel(text, title="Settings - Default Model", border_style="cyan", padding=(1, 2))
+        return Panel(text, title="Settings - Default Model", border_style=BORDER_OVERLAY, box=box.DOUBLE, padding=(1, 2))
 
     elif state.mode == TUIMode.SETTINGS_EDIT_TIMEOUT:
         text.append("Edit Default Timeout (minutes)\n\n", style="bold cyan")
@@ -1124,7 +1449,7 @@ def create_settings_panel(state: TUIState) -> Panel:
         text.append(" = save  ", style="dim")
         text.append("Esc", style="yellow bold")
         text.append(" = cancel", style="dim")
-        return Panel(text, title="Settings - Default Timeout", border_style="cyan", padding=(1, 2))
+        return Panel(text, title="Settings - Default Timeout", border_style=BORDER_OVERLAY, box=box.DOUBLE, padding=(1, 2))
 
     elif state.mode == TUIMode.SETTINGS_EDIT_PERMISSIONS:
         text.append("Ralph Permissions\n\n", style="bold cyan")
@@ -1151,7 +1476,7 @@ def create_settings_panel(state: TUIState) -> Panel:
         text.append("=nav  ", style="dim")
         text.append("Esc", style="yellow bold")
         text.append("=done", style="dim")
-        return Panel(text, title="Settings - Permissions", border_style="cyan", padding=(1, 2))
+        return Panel(text, title="Settings - Permissions", border_style=BORDER_OVERLAY, box=box.DOUBLE, padding=(1, 2))
 
     elif state.mode == TUIMode.SETTINGS_EDIT_STRATEGY:
         text.append("Task Assignment Strategy\n\n", style="bold cyan")
@@ -1169,7 +1494,7 @@ def create_settings_panel(state: TUIState) -> Panel:
         text.append(" = select  ", style="dim")
         text.append("Esc", style="yellow bold")
         text.append(" = cancel", style="dim")
-        return Panel(text, title="Settings - Assignment Strategy", border_style="cyan", padding=(1, 2))
+        return Panel(text, title="Settings - Assignment Strategy", border_style=BORDER_OVERLAY, box=box.DOUBLE, padding=(1, 2))
 
     elif state.mode == TUIMode.SETTINGS_EDIT_AUTO_SPAWN:
         text.append("Auto-Scaling Settings\n\n", style="bold cyan")
@@ -1188,7 +1513,7 @@ def create_settings_panel(state: TUIState) -> Panel:
         text.append(" = toggle/edit  ", style="dim")
         text.append("Esc", style="yellow bold")
         text.append(" = done", style="dim")
-        return Panel(text, title="Settings - Auto-Scaling", border_style="cyan", padding=(1, 2))
+        return Panel(text, title="Settings - Auto-Scaling", border_style=BORDER_OVERLAY, box=box.DOUBLE, padding=(1, 2))
 
     elif state.mode == TUIMode.SETTINGS_EDIT_RALPH_LOOP:
         text.append("Ralph Loop Settings\n\n", style="bold cyan")
@@ -1214,7 +1539,7 @@ def create_settings_panel(state: TUIState) -> Panel:
         text.append(" = toggle/edit  ", style="dim")
         text.append("Esc", style="yellow bold")
         text.append(" = done", style="dim")
-        return Panel(text, title="Settings - Ralph Loop", border_style="cyan", padding=(1, 2))
+        return Panel(text, title="Settings - Ralph Loop", border_style=BORDER_OVERLAY, box=box.DOUBLE, padding=(1, 2))
 
     # Main settings view with sections
     text.append("Settings & Configuration\n\n", style="bold cyan")
@@ -1314,7 +1639,7 @@ def create_settings_panel(state: TUIState) -> Panel:
     text.append("Esc", style="yellow bold")
     text.append("=close", style="dim")
 
-    return Panel(text, title="Settings (S)", border_style="cyan", padding=(1, 2))
+    return Panel(text, title="Settings (S)", border_style=BORDER_OVERLAY, box=box.DOUBLE, padding=(1, 2))
 
 
 def create_search_panel(state: TUIState) -> Panel:
@@ -1347,22 +1672,32 @@ def create_search_panel(state: TUIState) -> Panel:
     text.append("Esc", style="yellow bold")
     text.append(" = cancel", style="dim")
 
-    return Panel(text, title="Search (/)", border_style="cyan", padding=(1, 2))
+    return Panel(text, title="Search (/)", border_style=BORDER_OVERLAY, box=box.DOUBLE, padding=(1, 2))
 
 
 def create_task_detail_panel(task, state: TUIState) -> Panel:
-    """Create detailed task view panel."""
+    """Create detailed task view panel with enhanced information."""
     text = Text()
 
     if not task:
         text.append("No task selected", style="dim")
-        return Panel(text, title="Task Detail", border_style="cyan")
+        return Panel(text, title="Task Detail", border_style=BORDER_OVERLAY)
 
-    # Title and ID
+    # Header with status icon
+    status_icons = {
+        TaskClaimStatus.PENDING: (ICON_PENDING, "yellow"),
+        TaskClaimStatus.IN_PROGRESS: (ICON_WORKING, "blue"),
+        TaskClaimStatus.COMPLETED: (ICON_DONE, "green"),
+        TaskClaimStatus.FAILED: (ICON_FAILED, "red"),
+        TaskClaimStatus.RELEASED: (ICON_RELEASED, "dim"),
+        TaskClaimStatus.RETRY_PENDING: (ICON_RETRY, "magenta"),
+    }
+    icon, icon_style = status_icons.get(task.status, (ICON_PENDING, "white"))
+    text.append(f"{icon} ", style=icon_style)
     text.append(f"{task.task_title}\n", style="bold white")
     text.append(f"ID: {task.task_id}\n\n", style="dim cyan")
 
-    # Status and Priority
+    # Status with attempt count for failed tasks
     status_styles = {
         TaskClaimStatus.PENDING: "yellow",
         TaskClaimStatus.IN_PROGRESS: "blue",
@@ -1372,7 +1707,10 @@ def create_task_detail_panel(task, state: TUIState) -> Panel:
         TaskClaimStatus.RETRY_PENDING: "magenta",
     }
     text.append("Status: ", style="dim")
-    text.append(f"{task.status.value}\n", style=status_styles.get(task.status, "white"))
+    status_display = f"{task.status.value}"
+    if task.status == TaskClaimStatus.FAILED and task.retry_count > 0:
+        status_display += f" (attempt {task.retry_count + 1} of {task.max_retries})"
+    text.append(f"{status_display}\n", style=status_styles.get(task.status, "white"))
 
     priority_styles = {"HIGH": "red", "MEDIUM": "yellow", "LOWER": "blue", "POLISH": "dim"}
     text.append("Priority: ", style="dim")
@@ -1386,31 +1724,38 @@ def create_task_detail_panel(task, state: TUIState) -> Panel:
         text.append("Project: ", style="dim")
         text.append(f"{task.project}\n", style="blue")
 
+    # Worker info
+    if task.claimed_by_ralph_id:
+        text.append("Worker: ", style="dim")
+        text.append(f"{task.claimed_by_ralph_id}\n", style="cyan")
+
     text.append("\n")
 
-    # Assignment info
-    if task.claimed_by_ralph_id:
-        text.append("Claimed By: ", style="dim")
-        text.append(f"{task.claimed_by_ralph_id}\n", style="cyan")
-    if task.claimed_at:
-        text.append("Claimed At: ", style="dim")
-        text.append(f"{task.claimed_at.strftime('%Y-%m-%d %H:%M:%S')}\n", style="white")
-
-    # Timestamps
+    # Timestamps and elapsed time
     if task.started_at:
         text.append("Started: ", style="dim")
         text.append(f"{task.started_at.strftime('%Y-%m-%d %H:%M:%S')}\n", style="white")
-        # Calculate running time for in-progress tasks
+
+        # Calculate elapsed time
+        end_time = task.completed_at if task.completed_at else datetime.now()
+        elapsed = (end_time - task.started_at).total_seconds()
+        if elapsed < 60:
+            elapsed_str = f"{int(elapsed)}s"
+        elif elapsed < 3600:
+            elapsed_str = f"{int(elapsed // 60)}m {int(elapsed % 60)}s"
+        else:
+            elapsed_str = f"{int(elapsed // 3600)}h {int((elapsed % 3600) // 60)}m"
+
+        text.append("Elapsed: ", style="dim")
         if task.status == TaskClaimStatus.IN_PROGRESS:
-            elapsed = (datetime.now() - task.started_at).total_seconds()
-            if elapsed < 60:
-                elapsed_str = f"{int(elapsed)}s"
-            elif elapsed < 3600:
-                elapsed_str = f"{int(elapsed // 60)}m {int(elapsed % 60)}s"
-            else:
-                elapsed_str = f"{int(elapsed // 3600)}h {int((elapsed % 3600) // 60)}m"
-            text.append("Running Time: ", style="dim")
-            text.append(f"{elapsed_str}\n", style="yellow")
+            text.append(f"{elapsed_str}", style="yellow")
+            # Show timeout warning if close to limit
+            default_timeout = 30 * 60  # 30 min default
+            if elapsed > default_timeout * 0.8:
+                text.append(f" (approaching timeout)", style="red")
+            text.append("\n")
+        else:
+            text.append(f"{elapsed_str}\n", style="white")
 
     if task.completed_at:
         text.append("Completed: ", style="dim")
@@ -1421,24 +1766,61 @@ def create_task_detail_panel(task, state: TUIState) -> Panel:
         text.append("\nCommit: ", style="dim")
         text.append(f"{task.git_commit_sha[:12]}\n", style="yellow")
 
-    # Error info (full, not truncated)
-    if task.error_message:
-        text.append("\nError Message:\n", style="bold red")
-        text.append(f"{task.error_message}\n", style="white")
+    # Error info section with full message
+    if task.error_message or task.error_category:
+        text.append("\n")
+        text.append("─" * 40 + "\n", style="dim")
 
-    if task.error_category:
-        text.append("Error Category: ", style="dim")
-        text.append(f"{task.error_category.value}\n", style="red")
+        if task.error_category:
+            text.append("Error: ", style="bold red")
+            text.append(f"{task.error_category.value}\n", style="red")
+
+        if task.error_message:
+            text.append("\nError Message:\n", style="bold red")
+            # Show full error message (up to 500 chars)
+            error_display = task.error_message[:500]
+            if len(task.error_message) > 500:
+                error_display += "..."
+            text.append(f"{error_display}\n", style="white")
 
     # Retry info
-    if task.retry_count > 0:
-        text.append(f"\nRetry Count: {task.retry_count}/{task.max_retries}\n", style="yellow")
-    if task.next_retry_at:
-        text.append(f"Next Retry: {task.next_retry_at.strftime('%H:%M:%S')}\n", style="yellow")
+    if task.retry_count > 0 or task.next_retry_at:
+        text.append("\n")
+        if task.retry_count > 0:
+            text.append(f"Retry Count: {task.retry_count}/{task.max_retries}\n", style="yellow")
+        if task.next_retry_at:
+            text.append(f"Next Retry: {task.next_retry_at.strftime('%H:%M:%S')}\n", style="yellow")
 
-    text.append("\n\nPress any key to close", style="dim")
+    # Log tail section - show last few lines if we have the worker ID
+    if task.claimed_by_ralph_id and task.status in (TaskClaimStatus.IN_PROGRESS, TaskClaimStatus.FAILED):
+        text.append("\n")
+        text.append("─" * 40 + "\n", style="dim")
+        text.append("Recent Log Output:\n", style="bold yellow")
+        try:
+            log_content = read_ralph_log(task.claimed_by_ralph_id, 10)
+            if log_content:
+                lines = log_content.strip().split("\n")[-8:]  # Last 8 lines
+                for line in lines:
+                    line_lower = line.lower()
+                    if "error" in line_lower or "failed" in line_lower:
+                        text.append(f"  {line[:70]}\n", style="red")
+                    elif "warning" in line_lower:
+                        text.append(f"  {line[:70]}\n", style="yellow")
+                    else:
+                        text.append(f"  {line[:70]}\n", style="dim")
+            else:
+                text.append("  [No log data available]\n", style="dim")
+        except Exception:
+            text.append("  [Unable to read logs]\n", style="dim")
 
-    return Panel(text, title="Task Detail (d)", border_style="cyan", padding=(1, 2))
+    # Footer with keyboard shortcuts
+    text.append("\n")
+    text.append("─" * 40 + "\n", style="dim")
+    text.append("[r] Retry  ", style="yellow")
+    text.append("[l] Full Logs  ", style="yellow")
+    text.append("[Esc] Back", style="dim")
+
+    return Panel(text, title="Task Detail (d)", border_style=BORDER_OVERLAY, box=box.DOUBLE, padding=(1, 2))
 
 
 def create_bulk_action_panel(state: TUIState) -> Panel:
@@ -1456,7 +1838,7 @@ def create_bulk_action_panel(state: TUIState) -> Panel:
     text.append("\n\nEsc", style="yellow bold")
     text.append(" = cancel", style="dim")
 
-    return Panel(text, title="Bulk Actions (m)", border_style="magenta", padding=(1, 2))
+    return Panel(text, title="Bulk Actions (m)", border_style=BORDER_OVERLAY, box=box.DOUBLE, padding=(1, 2))
 
 
 def create_log_stream_panel(state: TUIState) -> Panel:
@@ -1482,7 +1864,7 @@ def create_log_stream_panel(state: TUIState) -> Panel:
     text.append("\n[Auto-refreshing every 2s] ", style="dim")
     text.append("Press any key to close", style="dim")
 
-    return Panel(text, title="Log Stream (v)", border_style="blue", padding=(1, 2))
+    return Panel(text, title="Log Stream (v)", border_style=BORDER_OVERLAY, box=box.DOUBLE, padding=(1, 2))
 
 
 def create_instance_tab_bar(active_tab: int) -> Text:
@@ -1501,7 +1883,7 @@ def create_instance_tab_bar(active_tab: int) -> Text:
 
 def create_instance_dashboard_content(instance, state: TUIState, current_task, process_health: dict | None = None, status_staleness: dict | None = None, skip_health_checks: bool = False) -> Text:
     """Create dashboard content for instance detail view."""
-    from chiefwiggum.spawner import get_process_health, get_status_staleness
+    from chiefwiggum.spawner import get_process_health, get_status_staleness, read_ralph_status
 
     text = Text()
 
@@ -1630,7 +2012,7 @@ def create_instance_dashboard_content(instance, state: TUIState, current_task, p
             bar_width = 10
             filled = int(progress * bar_width)
             bar_style = "green" if progress < 0.5 else ("yellow" if progress < 0.75 else "red")
-            text.append("Progress: ", style="dim")
+            text.append("Time Elapsed: ", style="dim")
             text.append("\u2588" * filled, style=bar_style)  # █ filled
             text.append("\u2591" * (bar_width - filled), style="dim")  # ░ empty
             text.append(f" {int(progress * 100)}%\n", style=bar_style)
@@ -1644,14 +2026,41 @@ def create_instance_dashboard_content(instance, state: TUIState, current_task, p
     else:
         text.append("Idle\n", style="dim")
 
-    # Loop Count
+    # Loop Count - read from status file for real-time display
     text.append("Loop Count: ", style="dim")
-    text.append(f"#{instance.loop_count}\n", style="cyan")
+    status = read_ralph_status(instance.ralph_id)
+    real_loop_count = status.get("loop_count", instance.loop_count) if status else instance.loop_count
+    text.append(f"#{real_loop_count}\n", style="cyan")
 
-    # Activity message from status file
-    if state.instance_status_message:
+    # Token Usage - read from token tracking files
+    if instance.project:
+        project_dir = Path.home() / "claudecode" / instance.project
+        token_usage_file = project_dir / ".token_usage"
+        token_pct_file = project_dir / ".token_percentage"
+
+        if token_usage_file.exists() and token_pct_file.exists():
+            try:
+                tokens = token_usage_file.read_text().strip()
+                pct = token_pct_file.read_text().strip()
+                pct_int = int(pct)
+
+                # Color code by percentage
+                if pct_int >= 80:
+                    token_color = "red"
+                elif pct_int >= 60:
+                    token_color = "yellow"
+                else:
+                    token_color = "green"
+
+                text.append("Tokens: ", style="dim")
+                text.append(f"~{tokens} ({pct}%)\n", style=token_color)
+            except (ValueError, IOError):
+                pass  # Silently skip if files are unreadable
+
+    # Activity message from status file (read fresh on every render)
+    if status and status.get("message"):
         text.append("Activity: ", style="dim")
-        text.append(f"{state.instance_status_message[:50]}\n", style="white")
+        text.append(f"{status['message'][:50]}\n", style="white")
 
     text.append("\n")
 
@@ -1682,6 +2091,36 @@ def create_instance_dashboard_content(instance, state: TUIState, current_task, p
         text.append("  Streak: ", style="dim")
         text.append(f"{state.instance_failure_streak} failure(s)\n", style="yellow")
 
+    # Error Status section - show Claude Code-specific errors
+    error_summary = get_error_summary(instance.ralph_id)
+    if error_summary["total_errors"] > 0:
+        text.append("\nError Status", style="bold red")
+        if error_summary["has_critical"]:
+            text.append(" ⚠ needs attention", style="yellow bold")
+        text.append("\n")
+
+        # Error icons mapping
+        error_icons = {
+            "permission": (ICON_ERROR_PERMISSION, "magenta"),
+            "api_error": (ICON_ERROR_API, "red"),
+            "tool_failure": (ICON_ERROR_TOOL, "yellow"),
+        }
+
+        # Show counts by category on one line
+        text.append("  ", style="dim")
+        for category, count in error_summary["by_category"].items():
+            icon, color = error_icons.get(category, (ICON_ERROR_GENERAL, "orange1"))
+            text.append(f"{icon} {category}:{count}  ", style=color)
+        text.append("\n")
+
+        # Show last error time
+        if error_summary["last_error_time"]:
+            text.append("  Last error: ", style="dim")
+            text.append(f"{error_summary['last_error_time']}\n", style="dim")
+
+        # Show hint to view errors tab
+        text.append("  (Tab 3 for details)\n", style="dim")
+
     text.append("\n")
 
     # Stats
@@ -1695,6 +2134,35 @@ def create_instance_dashboard_content(instance, state: TUIState, current_task, p
         minutes = int((instance.total_work_seconds % 3600) // 60)
         text.append("  Total Work Time: ", style="dim")
         text.append(f"{hours}h {minutes}m\n", style="white")
+
+    text.append("\n")
+
+    # Cost Metrics
+    text.append("Cost Metrics\n", style="bold yellow")
+    text.append("  Total Cost: ", style="dim")
+    cost_color = "cyan"
+    if instance.total_cost_usd > 10.0:
+        cost_color = "yellow"
+    if instance.total_cost_usd > 50.0:
+        cost_color = "red"
+    text.append(f"${instance.total_cost_usd:.2f}\n", style=cost_color)
+
+    # Cost per task
+    if instance.tasks_completed > 0:
+        cost_per_task = instance.total_cost_usd / instance.tasks_completed
+        text.append("  Cost/Task: ", style="dim")
+        text.append(f"${cost_per_task:.3f}\n", style="cyan")
+
+    # Cost per hour
+    if instance.started_at:
+        hours_running = max(0.1, (datetime.now() - instance.started_at).total_seconds() / 3600)
+        cost_per_hour = instance.total_cost_usd / hours_running
+        text.append("  Cost/Hour: ", style="dim")
+        text.append(f"${cost_per_hour:.2f}\n", style="cyan")
+
+    # Token usage summary
+    text.append("  Tokens: ", style="dim")
+    text.append(f"{instance.total_input_tokens:,} in / {instance.total_output_tokens:,} out\n", style="dim")
 
     text.append("\n")
 
@@ -1779,18 +2247,73 @@ def create_instance_history_content(state: TUIState) -> Text:
 
 
 def create_instance_errors_content(state: TUIState) -> Text:
-    """Create errors tab content for instance detail view."""
+    """Create errors tab content for instance detail view.
+
+    Shows two sections:
+    1. Claude Code Errors: Permission denials, API errors, tool failures (from status file)
+    2. Failed Tasks: Task-level errors with retry information
+    """
     text = Text()
 
+    # Get selected instance
+    instance = None
+    if state.instances and state.selected_instance_idx < len(state.instances):
+        instance = state.instances[state.selected_instance_idx]
+
+    # Section 1: Claude Code Errors (from error_info in status)
+    if instance:
+        error_summary = get_error_summary(instance.ralph_id)
+        if error_summary["total_errors"] > 0:
+            text.append("Claude Code Errors\n", style="bold cyan")
+            text.append("─" * 40 + "\n", style="dim")
+
+            # Error category icons
+            error_icons = {
+                "permission": (ICON_ERROR_PERMISSION, "magenta"),
+                "api_error": (ICON_ERROR_API, "red"),
+                "tool_failure": (ICON_ERROR_TOOL, "yellow"),
+            }
+
+            # Show counts by category
+            for category, count in error_summary["by_category"].items():
+                icon, color = error_icons.get(category, (ICON_ERROR_GENERAL, "orange1"))
+                text.append(f"  {icon} ", style=color)
+                text.append(f"{category}: ", style="white")
+                text.append(f"{count}\n", style=f"bold {color}")
+
+            # Show critical warning if applicable
+            if error_summary["has_critical"]:
+                text.append("\n")
+                text.append(f"  {ICON_STALE} ", style="yellow")
+                text.append("Critical errors detected - may need user attention\n", style="yellow")
+
+            # Show recent error messages
+            if error_summary["recent_errors"]:
+                text.append("\nRecent Errors:\n", style="dim")
+                for err in error_summary["recent_errors"][:3]:
+                    timestamp = err.get("timestamp", "")
+                    msg = err.get("message", "")[:60]
+                    if timestamp:
+                        text.append(f"  [{timestamp}] ", style="dim")
+                    text.append(f"{msg}\n", style="white")
+
+            text.append("\n")
+
+    # Section 2: Failed Tasks
     if not state.instance_failed_tasks:
-        text.append("No failed tasks for this instance", style="dim")
+        if not instance or get_error_summary(instance.ralph_id)["total_errors"] == 0:
+            text.append("No errors for this instance", style="dim")
+        else:
+            text.append("No failed tasks for this instance", style="dim")
         return text
 
-    text.append("Failed tasks (Enter for full error)\n\n", style="dim")
+    text.append("Failed Tasks ", style="bold red")
+    text.append("(Enter for full error)\n", style="dim")
+    text.append("─" * 40 + "\n", style="dim")
 
     # Scrollable list with selection
     visible_start = state.instance_error_scroll
-    visible_end = visible_start + 12
+    visible_end = visible_start + 8  # Reduced to make room for Claude errors
     visible_errors = state.instance_failed_tasks[visible_start:visible_end]
 
     for idx, task in enumerate(visible_errors):
@@ -1813,6 +2336,8 @@ def create_instance_errors_content(state: TUIState) -> Text:
                 ErrorCategory.PERMISSION: "magenta",
                 ErrorCategory.CONFLICT: "blue",
                 ErrorCategory.TIMEOUT: "yellow",
+                ErrorCategory.API_ERROR: "red",
+                ErrorCategory.TOOL_FAILURE: "yellow",
                 ErrorCategory.UNKNOWN: "dim",
             }
             cat_style = cat_styles.get(task.error_category, "white")
@@ -1820,7 +2345,7 @@ def create_instance_errors_content(state: TUIState) -> Text:
             text.append(f" retry {task.retry_count}/{task.max_retries}\n", style="dim")
 
     # Scroll hint
-    if len(state.instance_failed_tasks) > 12:
+    if len(state.instance_failed_tasks) > 8:
         remaining = len(state.instance_failed_tasks) - visible_end
         if remaining > 0:
             text.append(f"\n... {remaining} more (j/k to scroll)\n", style="dim")
@@ -1834,7 +2359,7 @@ def create_instance_error_detail_overlay(state: TUIState) -> Panel:
 
     if not state.instance_failed_tasks or state.instance_selected_error_idx >= len(state.instance_failed_tasks):
         text.append("No error selected", style="dim")
-        return Panel(text, title="Error Detail", border_style="red")
+        return Panel(text, title="Error Detail", border_style=BORDER_ERROR)
 
     task = state.instance_failed_tasks[state.instance_selected_error_idx]
 
@@ -1857,7 +2382,7 @@ def create_instance_error_detail_overlay(state: TUIState) -> Panel:
 
     text.append("\n\nPress Esc to close", style="dim")
 
-    return Panel(text, title="Error Detail", border_style="red", padding=(1, 2))
+    return Panel(text, title="Error Detail", border_style=BORDER_ERROR, box=box.DOUBLE, padding=(1, 2))
 
 
 def create_instance_logs_content(state: TUIState) -> Text:
@@ -1915,7 +2440,7 @@ def create_instance_detail_panel(instance, state: TUIState, current_task=None, s
     full_content.append("\n\n")
     full_content.append_text(content)
 
-    return Panel(full_content, title=f"Instance: {id_display[:20]}", border_style="green", padding=(1, 2))
+    return Panel(full_content, title=f"Instance: {id_display[:20]}", border_style=BORDER_INSTANCES, box=box.DOUBLE, padding=(1, 2))
 
 
 def create_confirm_panel(action: str, count: int) -> Panel:
@@ -1930,7 +2455,77 @@ def create_confirm_panel(action: str, count: int) -> Panel:
     text.append("  n, Esc", style="yellow bold")
     text.append(" = Cancel\n", style="white")
 
-    return Panel(text, title="Confirm Action", border_style="red", padding=(1, 2))
+    return Panel(text, title="Confirm Action", border_style=BORDER_ERROR, box=box.DOUBLE, padding=(1, 2))
+
+
+def create_reconcile_panel(reconcile_result: dict | None) -> Panel:
+    """Create panel showing reconciliation results."""
+    text = Text()
+    text.append("Task Reconciliation Results\n\n", style="bold cyan")
+
+    if reconcile_result is None:
+        text.append("No reconciliation data available.\n", style="dim")
+        text.append("\nPress ", style="white")
+        text.append("Esc", style="yellow bold")
+        text.append(" to close", style="white")
+        return Panel(text, title="Reconcile", border_style="cyan", box=box.ROUNDED, padding=(1, 2))
+
+    # Summary statistics
+    text.append("Summary:\n", style="bold white")
+    text.append(f"  • Scanned: ", style="white")
+    text.append(f"{reconcile_result['scanned']}\n", style="cyan bold")
+
+    text.append(f"  • Updated: ", style="white")
+    text.append(f"{reconcile_result['updated']}", style="green bold")
+    text.append(f" tasks marked complete in @fix_plan.md\n", style="white")
+
+    text.append(f"  • Skipped: ", style="white")
+    text.append(f"{reconcile_result['skipped']}", style="yellow")
+    text.append(f" (already marked)\n", style="white")
+
+    text.append(f"  • Failed: ", style="white")
+    text.append(f"{reconcile_result['failed']}\n", style="red bold")
+
+    # Show details (first 10)
+    details = reconcile_result.get("details", [])
+    if details:
+        text.append("\nDetails (first 10):\n", style="bold white")
+        for i, detail in enumerate(details[:10]):
+            task_id = detail.get("task_id", "unknown")
+            action = detail.get("action", "unknown")
+            reason = detail.get("reason", "")
+
+            if action == "marked_complete" or action == "would_mark_complete":
+                icon = "✓"
+                style = "green"
+                commit_verified = detail.get("commit_verified", False)
+                status = " (commit verified)" if commit_verified else ""
+            elif action == "skipped":
+                icon = "○"
+                style = "yellow"
+                status = f" ({reason})"
+            elif action == "failed":
+                icon = "✗"
+                style = "red"
+                status = f" ({reason})"
+            else:
+                icon = "?"
+                style = "dim"
+                status = ""
+
+            text.append(f"  {icon} ", style=style)
+            text.append(f"{task_id}", style="cyan")
+            text.append(f"{status}\n", style="dim")
+
+        if len(details) > 10:
+            text.append(f"\n  ... and {len(details) - 10} more\n", style="dim")
+
+    text.append("\nPress ", style="white")
+    text.append("Esc", style="yellow bold")
+    text.append(" to close", style="white")
+
+    border_style = "green" if reconcile_result["failed"] == 0 else "yellow"
+    return Panel(text, title="Reconcile Results", border_style=border_style, box=box.ROUNDED, padding=(1, 2))
 
 
 async def create_cleanup_panel() -> Panel:
@@ -1967,7 +2562,7 @@ async def create_cleanup_panel() -> Panel:
     text.append("  n, Esc", style="yellow bold")
     text.append(" = Cancel\n", style="white")
 
-    return Panel(text, title="Cleanup Confirmation (C)", border_style="cyan", padding=(1, 2))
+    return Panel(text, title="Cleanup Confirmation (C)", border_style=BORDER_OVERLAY, box=box.DOUBLE, padding=(1, 2))
 
 
 def create_command_bar(state: TUIState, console_width: int = 80) -> Panel:
@@ -2077,7 +2672,11 @@ def create_command_bar(state: TUIState, console_width: int = 80) -> Panel:
         text.append("  Select instance to shutdown: ", style="red bold")
         for idx, inst in enumerate(state.instances[:9], 1):
             text.append(f" {idx}", style="yellow bold")
-            text.append(f"={inst.ralph_id[:8]}", style="dim")
+            # Strip hostname prefix for readability (same logic as instances table)
+            id_display = inst.ralph_id
+            if inst.hostname and inst.ralph_id.startswith(inst.hostname + "-"):
+                id_display = inst.ralph_id[len(inst.hostname) + 1:]
+            text.append(f"={id_display[:8]}", style="dim")
         text.append("  Esc", style="yellow bold")
         text.append("=cancel", style="dim")
 
@@ -2217,12 +2816,13 @@ async def update_dashboard(layout: Layout, state: TUIState) -> None:
         state.status_message = f"Cleaned up {len(cleaned)} dead Ralph(s): {', '.join(r[:12] for r in cleaned)}"
         state.status_message_time = time.time()
 
-    # Mark stale instances and process retries
+    # Check for task completions from Ralph logs FIRST
+    # This also updates heartbeats for running Ralphs, preventing false stale detection
+    completion_events = await check_ralph_completions()
+
+    # Mark stale instances and process retries AFTER heartbeats are updated
     await mark_stale_instances_crashed()
     await process_retry_tasks()
-
-    # Check for task completions from Ralph logs
-    completion_events = await check_ralph_completions()
     for event in completion_events:
         # Update status message with completion info
         if event["status"] == "completed":
@@ -2252,6 +2852,12 @@ async def update_dashboard(layout: Layout, state: TUIState) -> None:
     state.in_progress_tasks = in_progress_tasks
     state.failed_tasks = failed_tasks
     state.projects = list(set(t.project for t in all_tasks if t.project))
+
+    # Generate alerts from current state
+    state.alerts = generate_alerts(state)
+
+    # Get progress data for all running instances
+    progress_data = get_all_instance_progress()
 
     # Get display data based on filters (use state.instances which respects flag)
     instances = state.instances
@@ -2294,33 +2900,55 @@ async def update_dashboard(layout: Layout, state: TUIState) -> None:
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     running_count = len(get_running_ralphs())
 
-    # Build header text with branding and version
+    # Count actively working instances for contextual spinner
+    active_working = sum(
+        1 for i in state.all_instances
+        if i.status == RalphInstanceStatus.ACTIVE and i.current_task_id
+    )
+
+    # Build header text with branding and version (with subtle background)
     from chiefwiggum._version import __version__
     header_text = Text()
-    header_text.append("  CHIEF", style="bold cyan")
-    header_text.append("WIGGUM", style="bold white")
-    header_text.append(f" v{__version__}", style="dim cyan")
-    header_text.append(f"    {now}  ", style="dim")
+    header_text.append(" ", style=f"on {BG_HEADER}")
+    header_text.append(" CHIEF", style=f"bold {COLOR_ACCENT} on {BG_HEADER}")
+    header_text.append("WIGGUM ", style=f"bold white on {BG_HEADER}")
+    header_text.append(f"v{__version__} ", style=f"{COLOR_MUTED} on {BG_HEADER}")
+    header_text.append(f"   {now}  ", style=f"dim on {BG_HEADER}")
 
-    # Daemon count with icon and optional spinner for active instances
+    # Daemon count with icon and contextual spinner
     if running_count > 0:
-        # Add spinner when instances are active
-        spinner_idx = int(time.time() * 4) % len(SPINNER)
-        header_text.append(f" {SPINNER[spinner_idx]} ", style="cyan")
-        header_text.append(f"{ICON_DAEMON} {running_count}", style="bold green")
+        # Use bars spinner when actively working, braille otherwise
+        if active_working > 0:
+            spinner_idx = int(time.time() * 6) % len(SPINNER_BARS)
+            header_text.append(f" {SPINNER_BARS[spinner_idx]} ", style=f"bold {COLOR_SUCCESS} on {BG_HEADER}")
+        else:
+            spinner_idx = int(time.time() * 4) % len(SPINNER)
+            header_text.append(f" {SPINNER[spinner_idx]} ", style=f"grey50 on {BG_HEADER}")
+        header_text.append(f"{ICON_DAEMON} {running_count}", style=f"bold {COLOR_SUCCESS} on {BG_HEADER}")
     else:
-        header_text.append(f"{ICON_DAEMON} 0", style="dim")
-    header_text.append(" daemons", style="dim")
+        header_text.append(f"{ICON_DAEMON} 0", style=f"dim on {BG_HEADER}")
+    header_text.append(" daemons ", style=f"dim on {BG_HEADER}")
 
     header = Panel(
         header_text,
-        style="blue",
+        style=COLOR_ACCENT,
         box=box.ROUNDED,
     )
     layout["header"].update(header)
 
     # Update stats (reuse all_tasks fetched at start)
     layout["stats"].update(create_stats_panel(state.all_instances, all_tasks, state))
+
+    # Update alerts panel if it exists in layout and there are alerts
+    alerts_panel = create_alerts_panel(state)
+    try:
+        if alerts_panel:
+            layout["alerts"].update(alerts_panel)
+        else:
+            # No alerts - show an empty panel
+            layout["alerts"].update(Panel("", height=3, border_style="dim"))
+    except KeyError:
+        pass  # Layout doesn't have alerts section
 
     # Check for overlay modes - must unsplit first to clear child layouts
     if state.mode == TUIMode.HELP:
@@ -2363,7 +2991,7 @@ async def update_dashboard(layout: Layout, state: TUIState) -> None:
             text.append(f"\nSession:       {hours}h {minutes}m\n", style="dim")
 
         text.append("\n\nPress any key to close", style="dim")
-        layout["main"].update(Panel(text, title="Statistics", border_style="cyan", padding=(1, 2)))
+        layout["main"].update(Panel(text, title="Statistics", border_style=BORDER_OVERLAY, box=box.DOUBLE, padding=(1, 2)))
 
     elif state.mode == TUIMode.ERROR_DETAIL:
         layout["main"].unsplit()
@@ -2393,6 +3021,10 @@ async def update_dashboard(layout: Layout, state: TUIState) -> None:
         layout["main"].unsplit()
         count = len([i for i in state.instances if i.status == RalphInstanceStatus.ACTIVE])
         layout["main"].update(create_confirm_panel("PAUSE ALL Ralphs", count))
+
+    elif state.mode == TUIMode.RECONCILE:
+        layout["main"].unsplit()
+        layout["main"].update(create_reconcile_panel(state.reconcile_result))
 
     elif state.mode == TUIMode.CLEANUP_CONFIRM:
         layout["main"].unsplit()
@@ -2514,14 +3146,14 @@ async def update_dashboard(layout: Layout, state: TUIState) -> None:
                         selected_ids=state.selected_task_ids,
                         selected_idx=state.selected_task_idx,
                     ),
-                    border_style="yellow",
+                    border_style=BORDER_TASKS,
                 )
             )
         elif state.view_focus == ViewFocus.INSTANCES:
             # Instances only - full width (must unsplit first)
             layout["main"].unsplit()
             layout["main"].update(
-                Panel(create_instances_table(instances, state.show_all_instances, selected_idx=state.selected_instance_idx), border_style="green")
+                Panel(create_instances_table(instances, state.show_all_instances, selected_idx=state.selected_instance_idx, progress_data=progress_data), border_style=BORDER_INSTANCES)
             )
         else:
             # Both - split view (default)
@@ -2529,7 +3161,7 @@ async def update_dashboard(layout: Layout, state: TUIState) -> None:
                 Layout(name="instances"),
                 Layout(name="tasks"),
             )
-            layout["main"]["instances"].update(Panel(create_instances_table(instances, state.show_all_instances, selected_idx=state.selected_instance_idx), border_style="green"))
+            layout["main"]["instances"].update(Panel(create_instances_table(instances, state.show_all_instances, selected_idx=state.selected_instance_idx, progress_data=progress_data), border_style=BORDER_INSTANCES))
             layout["main"]["tasks"].update(
                 Panel(
                     create_tasks_table(
@@ -2541,7 +3173,7 @@ async def update_dashboard(layout: Layout, state: TUIState) -> None:
                         selected_ids=state.selected_task_ids,
                         selected_idx=state.selected_task_idx,
                     ),
-                    border_style="yellow",
+                    border_style=BORDER_TASKS,
                 )
             )
 
@@ -2644,6 +3276,11 @@ def handle_normal_mode(key: str, state: TUIState, tasks_count: int = 0) -> bool:
         else:
             state.status_message = "No in-progress tasks"
             state.status_message_time = time.time()
+    elif key == "R":  # Shift+R: Reconcile completed tasks
+        state.mode = TUIMode.RECONCILE
+        state.status_message = "Starting reconciliation..."
+        state.status_message_time = time.time()
+        return False  # Will be handled in handle_command (async)
     elif key == "y":  # US1: Sync tasks immediately
         # Show syncing message before starting
         state.status_message = "Syncing tasks..."
@@ -3522,6 +4159,28 @@ async def handle_command(key: str, state: TUIState) -> bool:
             state.status_message_time = time.time()
             return False
 
+        # Handle 'R' (Shift+R) for reconcile completed tasks
+        if key == "R":
+            from chiefwiggum.coordination import reconcile_completed_tasks
+
+            state.status_message = "Reconciling completed tasks..."
+            state.status_message_time = time.time()
+
+            # Run reconciliation with project filter if set
+            result = await reconcile_completed_tasks(
+                project=state.project_filter,
+                dry_run=False
+            )
+
+            state.reconcile_result = result
+            state.status_message = (
+                f"Reconciled: {result['updated']} updated, "
+                f"{result['skipped']} skipped, {result['failed']} failed"
+            )
+            state.status_message_time = time.time()
+            # Keep mode as RECONCILE to display the results panel
+            return False
+
         # Handle 'N' (Shift+N) for quickstart spawn
         if key == "N":
             can_spawn, reason = await can_spawn_ralph()
@@ -3641,6 +4300,12 @@ async def handle_command(key: str, state: TUIState) -> bool:
             state.mode = TUIMode.NORMAL
         # Other keys ignored
 
+    elif state.mode == TUIMode.RECONCILE:
+        if key in ("q", "ESCAPE"):  # q or Esc to close
+            state.mode = TUIMode.NORMAL
+            state.reconcile_result = None  # Clear results
+        # Other keys ignored
+
     elif state.mode == TUIMode.LOG_VIEW:
         if key in ("l", "q", "ESCAPE"):  # l toggle, q, or Esc
             state.mode = TUIMode.NORMAL
@@ -3720,7 +4385,7 @@ def run_tui(debug: bool = False):
         cleanup_orphaned_tmux_sessions()
 
     console = Console()
-    layout = create_layout()
+    layout = create_layout(has_alerts=True)  # Always include alerts row
     state = TUIState()
 
     # Initialize console width

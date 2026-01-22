@@ -49,6 +49,8 @@ class ErrorCategory(str, Enum):
     CONFLICT = "conflict"  # Git conflicts - manual resolution
     TIMEOUT = "timeout"  # Task took too long - retry with longer timeout
     UNKNOWN = "unknown"  # Unclassified errors
+    API_ERROR = "api_error"  # Rate limits, auth failures, API issues
+    TOOL_FAILURE = "tool_failure"  # Tool execution failures
 
 
 class TaskCategory(str, Enum):
@@ -132,6 +134,7 @@ class TaskClaim(BaseModel):
     updated_at: datetime | None = None
     started_at: datetime | None = None  # When work actually started
     completed_at: datetime | None = None  # When task finished
+    verified_at: datetime | None = None  # When git commit was verified in target repo
 
 
 class RalphInstance(BaseModel):
@@ -155,6 +158,11 @@ class RalphInstance(BaseModel):
     tasks_completed: int = 0
     tasks_failed: int = 0
     total_work_seconds: float = 0.0
+    # Cost tracking
+    total_input_tokens: int = 0
+    total_output_tokens: int = 0
+    total_cost_usd: float = 0.0
+    last_cost_update: datetime | None = None
 
 
 class FixPlanTask(BaseModel):
@@ -185,6 +193,15 @@ class TaskHistory(BaseModel):
     status: TaskClaimStatus
     commit_sha: str | None = None
     error_message: str | None = None
+    # Cost tracking
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_creation_tokens: int = 0
+    cache_read_tokens: int = 0
+    estimated_cost_usd: float = 0.0
+    actual_cost_usd: float | None = None
+    cost_source: str = "estimation"  # "estimation" | "api_actual" | "reconciled"
+    model_used: str | None = None
 
 
 class SystemStats(BaseModel):
@@ -200,3 +217,8 @@ class SystemStats(BaseModel):
     tasks_per_hour: float = 0.0
     eta_minutes: float | None = None
     session_start: datetime | None = None
+    # Cost tracking
+    total_cost_today_usd: float = 0.0
+    total_cost_week_usd: float = 0.0
+    avg_cost_per_task: float = 0.0
+    avg_cost_per_instance: float = 0.0

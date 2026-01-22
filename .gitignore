@@ -29,7 +29,21 @@ dist/
 
 # OS
 .DS_Store
+.AppleDouble
+.LSOverride
 Thumbs.db
 
 # Local database
 *.db
+
+# Logs
+*.log
+logs/
+
+# Environment files
+.env
+.env.local
+*.env
+
+# Claude sessions
+.claude-sessions/

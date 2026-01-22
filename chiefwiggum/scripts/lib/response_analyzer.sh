@@ -209,6 +209,8 @@ analyze_response() {
     local exit_signal=false
     local work_summary=""
     local files_modified=0
+    local completed_task_id=""
+    local completed_commit_sha=""
 
     # Read output file
     if [[ ! -f "$output_file" ]]; then
@@ -245,6 +247,20 @@ analyze_response() {
                     exit_signal="true"
                     has_completion_signal="true"
                     [[ "${VERBOSE_PROGRESS:-}" == "true" ]] && echo "DEBUG: Found RALPH_STATUS in JSON result - exit_signal=$ralph_exit_sig, status=$ralph_status" >&2
+                fi
+            fi
+
+            # Check for TASK_COMPLETE marker in JSON result/summary
+            if echo "$work_summary" | grep -q "TASK_COMPLETE:"; then
+                completed_task_id=$(echo "$work_summary" | grep "TASK_COMPLETE:" | head -1 | sed 's/.*TASK_COMPLETE:\s*//' | tr -d '[:space:]')
+                if [[ -n "$completed_task_id" ]]; then
+                    has_completion_signal="true"
+                    if echo "$work_summary" | grep -q "COMMIT:"; then
+                        completed_commit_sha=$(echo "$work_summary" | grep "COMMIT:" | head -1 | sed 's/.*COMMIT:\s*//' | tr -d '[:space:]')
+                        exit_signal="true"
+                        confidence_score=90
+                        [[ "${VERBOSE_PROGRESS:-}" == "true" ]] && echo "DEBUG: Found TASK_COMPLETE in JSON - task_id=$completed_task_id, commit=$completed_commit_sha" >&2
+                    fi
                 fi
             fi
 
@@ -285,6 +301,8 @@ analyze_response() {
                 --argjson exit_signal "$exit_signal" \
                 --arg work_summary "$work_summary" \
                 --argjson output_length "$output_length" \
+                --arg completed_task_id "$completed_task_id" \
+                --arg completed_commit_sha "$completed_commit_sha" \
                 '{
                     loop_number: $loop_number,
                     timestamp: $timestamp,
@@ -299,7 +317,9 @@ analyze_response() {
                         confidence_score: $confidence_score,
                         exit_signal: $exit_signal,
                         work_summary: $work_summary,
-                        output_length: $output_length
+                        output_length: $output_length,
+                        completed_task_id: $completed_task_id,
+                        completed_commit_sha: $completed_commit_sha
                     }
                 }' > "$analysis_result_file"
             rm -f ".json_parse_result"
@@ -336,6 +356,27 @@ analyze_response() {
             has_completion_signal=true
             exit_signal=true
             confidence_score=100
+        fi
+    # 1b. Legacy fallback: check for TASK_COMPLETE marker (backwards compatibility)
+    elif grep -q "TASK_COMPLETE:" "$output_file"; then
+        local task_id=$(grep "TASK_COMPLETE:" "$output_file" | head -1 | sed 's/.*TASK_COMPLETE:\s*//')
+        if [[ -n "$task_id" ]]; then
+            # Legacy TASK_COMPLETE found - treat as completion signal
+            # But require additional verification signals for full confidence
+            has_completion_signal=true
+            completed_task_id="$task_id"
+            # Check if there's also a COMMIT marker (indicates proper completion)
+            if grep -q "COMMIT:" "$output_file"; then
+                completed_commit_sha=$(grep "COMMIT:" "$output_file" | head -1 | sed 's/.*COMMIT:\s*//' | tr -d '[:space:]')
+                exit_signal=true
+                confidence_score=90  # High but not 100% (legacy format)
+                explicit_exit_signal_found=true
+                [[ "${VERBOSE_PROGRESS:-}" == "true" ]] && echo "DEBUG: Found legacy TASK_COMPLETE with COMMIT marker - task_id=$task_id, commit=$completed_commit_sha" >&2
+            else
+                # TASK_COMPLETE without COMMIT - moderate confidence
+                confidence_score=60
+                [[ "${VERBOSE_PROGRESS:-}" == "true" ]] && echo "DEBUG: Found legacy TASK_COMPLETE without COMMIT - task_id=$task_id" >&2
+            fi
         fi
     fi
 
@@ -430,10 +471,18 @@ analyze_response() {
     # 9. Determine exit signal based on confidence (heuristic)
     # IMPORTANT: Only apply heuristics if no explicit EXIT_SIGNAL was found in RALPH_STATUS
     # Claude's explicit intent takes precedence over natural language pattern matching
+    # STRICTER THRESHOLD: Require both completion signal AND reasonable confidence,
+    # or very high confidence alone, to avoid premature exits on heuristics
     if [[ "$explicit_exit_signal_found" != "true" ]]; then
-        if [[ $confidence_score -ge 40 || "$has_completion_signal" == "true" ]]; then
+        if [[ "$has_completion_signal" == "true" && $confidence_score -ge 60 ]]; then
+            # Completion signal with reasonable confidence
+            exit_signal=true
+        elif [[ $confidence_score -ge 80 ]]; then
+            # Very high confidence can override lack of explicit signal
             exit_signal=true
         fi
+        # Note: Previous threshold (confidence >= 40 OR has_completion_signal) was too permissive
+        # Now requires: (completion_signal AND confidence >= 60) OR (confidence >= 80)
     fi
 
     # Write analysis results to file (text parsing path) using jq for safe construction
@@ -451,6 +500,8 @@ analyze_response() {
         --argjson exit_signal "$exit_signal" \
         --arg work_summary "$work_summary" \
         --argjson output_length "$output_length" \
+        --arg completed_task_id "$completed_task_id" \
+        --arg completed_commit_sha "$completed_commit_sha" \
         '{
             loop_number: $loop_number,
             timestamp: $timestamp,
@@ -465,7 +516,9 @@ analyze_response() {
                 confidence_score: $confidence_score,
                 exit_signal: $exit_signal,
                 work_summary: $work_summary,
-                output_length: $output_length
+                output_length: $output_length,
+                completed_task_id: $completed_task_id,
+                completed_commit_sha: $completed_commit_sha
             }
         }' > "$analysis_result_file"
 
