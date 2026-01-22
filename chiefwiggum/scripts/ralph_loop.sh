@@ -100,7 +100,7 @@ CLAUDE_TOOL_FAILURE_PATTERNS=(
 # Exit detection configuration
 EXIT_SIGNALS_FILE=".exit_signals"
 MAX_CONSECUTIVE_TEST_LOOPS=3
-MAX_CONSECUTIVE_DONE_SIGNALS=2
+MAX_CONSECUTIVE_DONE_SIGNALS=4  # Increased from 2 to 4 to prevent premature exits on multi-loop tasks
 TEST_PERCENTAGE_THRESHOLD=30  # If more than 30% of recent loops are test-only, flag it
 
 # Colors for terminal output
@@ -311,7 +311,7 @@ extract_errors() {
 }
 
 # Update status JSON for external monitoring
-# Parameters: loop_count, calls_made, last_action, status, exit_reason, error_info_json
+# Parameters: loop_count, calls_made, last_action, status, exit_reason, error_info_json, progress_data_json, needs_hitl, hitl_reason
 update_status() {
     local loop_count=$1
     local calls_made=$2
@@ -319,6 +319,9 @@ update_status() {
     local status=$4
     local exit_reason=${5:-""}
     local error_info=${6:-'{"category":"none","count":0,"details":[]}'}
+    local progress_data=${7:-'null'}
+    local needs_hitl=${8:-"false"}
+    local hitl_reason=${9:-"null"}
 
     # Parse error_info JSON (with fallback for invalid JSON)
     local error_category
@@ -327,6 +330,22 @@ update_status() {
     error_category=$(echo "$error_info" | jq -r '.category // "none"' 2>/dev/null || echo "none")
     error_count=$(echo "$error_info" | jq -r '.count // 0' 2>/dev/null || echo "0")
     error_details=$(echo "$error_info" | jq -c '.details // []' 2>/dev/null || echo '[]')
+
+    # Format progress_data for JSON (handle null/empty)
+    local progress_json
+    if [[ "$progress_data" == "null" || -z "$progress_data" ]]; then
+        progress_json='{"test_results":null,"stuck_indicators":{"same_test_failures":0,"loop_count_without_progress":0}}'
+    else
+        progress_json="$progress_data"
+    fi
+
+    # Format hitl_reason for JSON (handle null/empty)
+    local hitl_reason_json
+    if [[ "$hitl_reason" == "null" || -z "$hitl_reason" ]]; then
+        hitl_reason_json="null"
+    else
+        hitl_reason_json="\"$hitl_reason\""
+    fi
 
     cat > "$STATUS_FILE" << STATUSEOF
 {
@@ -343,7 +362,10 @@ update_status() {
         "count": $error_count,
         "details": $error_details,
         "last_error_time": "$(get_iso_timestamp)"
-    }
+    },
+    "progress_data": $progress_json,
+    "needs_human_intervention": $needs_hitl,
+    "hitl_reason": $hitl_reason_json
 }
 STATUSEOF
 }
@@ -402,6 +424,71 @@ wait_for_reset() {
     echo "0" > "$CALL_COUNT_FILE"
     echo "$(date +%Y%m%d%H)" > "$TIMESTAMP_FILE"
     log_status "SUCCESS" "Rate limit reset! Ready for new calls."
+}
+
+# Extract test progress from log file using Python parser
+# Returns JSON with test results or "null" if no tests found
+extract_test_progress() {
+    local ralph_id=$1
+    local log_file="$LOG_DIR/ralph.log"
+
+    if [[ ! -f "$log_file" ]]; then
+        echo "null"
+        return 0
+    fi
+
+    # Read last 10KB of log for test results
+    local log_content=$(tail -c 10000 "$log_file" 2>/dev/null || echo "")
+
+    # Call Python to parse test progress
+    python3 -c "
+import sys
+import json
+import re
+from datetime import datetime
+
+log_content = '''$log_content'''
+
+# Common test result patterns
+patterns = [
+    (r'(\d+)\s+passed.*?(\d+)\s+failed', 'passed_failed'),
+    (r'Tests:\s*(\d+)\s+passed.*?(\d+)\s+failed.*?(\d+)\s+total', 'full'),
+    (r'(\d+)/(\d+)\s+tests?\s+passed', 'fraction'),
+    (r'(\d+)\s+examples?,\s*(\d+)\s+failures?', 'examples'),
+    (r'PASS:\s*(\d+).*?FAIL:\s*(\d+)', 'pass_fail'),
+]
+
+for pattern, ptype in patterns:
+    match = re.search(pattern, log_content, re.IGNORECASE | re.MULTILINE)
+    if match:
+        groups = match.groups()
+
+        if ptype == 'passed_failed' or ptype == 'pass_fail' or ptype == 'examples':
+            passed = int(groups[0])
+            failed = int(groups[1])
+            total = passed + failed
+        elif ptype == 'full':
+            passed = int(groups[0])
+            failed = int(groups[1])
+            total = int(groups[2])
+        elif ptype == 'fraction':
+            passed = int(groups[0])
+            total = int(groups[1])
+            failed = total - passed
+        else:
+            continue
+
+        result = {
+            'passed': passed,
+            'failed': failed,
+            'total': total,
+            'timestamp': datetime.now().isoformat()
+        }
+        print(json.dumps(result))
+        sys.exit(0)
+
+print('null')
+" 2>/dev/null || echo "null"
 }
 
 # Check if we should gracefully exit
@@ -1179,22 +1266,6 @@ EOF
         fi
         end_phase "analysis_history"
 
-        # Check for immediate exit in single-task mode
-        if [[ -n "$RALPH_ID" ]]; then
-            local no_continue=$(get_ralph_no_continue_setting "$RALPH_ID")
-
-            if [[ "$no_continue" == "true" ]]; then
-                local claude_exit_signal=$(jq -r '.analysis.exit_signal // false' .response_analysis 2>/dev/null)
-
-                if [[ "$claude_exit_signal" == "true" ]]; then
-                    log_status "SUCCESS" "🏁 Single-task mode: EXIT_SIGNAL detected, stopping after 1 task"
-                    reset_session "single_task_complete"
-                    update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "single_task_exit" "completed" "exit_signal_single_task"
-                    break
-                fi
-            fi
-        fi
-
         # Log analysis summary
         log_analysis_summary
 
@@ -1216,8 +1287,159 @@ EOF
                 log_status "INFO" "📤 Reporting task completion to ChiefWiggum..."
                 if eval "$complete_cmd" 2>&1; then
                     log_status "SUCCESS" "✅ Task $completed_task_id marked complete in database"
+
+                    # TASK CONTINUATION: Attempt to claim next task from queue
+                    log_status "INFO" "📋 Checking for next task in queue..."
+
+                    local next_claimed=$(claim_next_task_for_ralph "$RALPH_ID")
+
+                    if [[ "$next_claimed" == "true" ]]; then
+                        # Successfully claimed next task
+                        local new_task_id=$(get_current_task_id "$RALPH_ID")
+                        local new_task_title=$(get_task_title "$new_task_id")
+
+                        log_status "SUCCESS" "📋 Claimed next task from queue: $new_task_id - $new_task_title"
+
+                        # Generate new task-specific prompt
+                        log_status "INFO" "📝 Generating prompt for new task..."
+                        if generate_task_prompt_for_file "$RALPH_ID" "$new_task_id" "$PROMPT_FILE"; then
+                            log_status "SUCCESS" "✅ Prompt generated for task $new_task_id"
+
+                            # Reset session state for new task (clear context from previous task)
+                            reset_session "new_task_claimed"
+
+                            # Reset exit signals for the new task
+                            echo '{"test_only_loops": [], "done_signals": [], "completion_indicators": []}' > "$EXIT_SIGNALS_FILE"
+
+                            log_status "INFO" "🔄 Continuing loop with next task..."
+                            # Return special code to signal main loop to continue with new task
+                            return 4
+                        else
+                            log_status "ERROR" "❌ Failed to generate prompt for new task, exiting..."
+                            reset_session "prompt_generation_failed"
+                            # Return special code to signal main loop to exit
+                            return 5
+                        fi
+                    else
+                        # No more tasks in queue
+                        log_status "SUCCESS" "🎉 Queue empty - all tasks complete!"
+                        reset_session "queue_complete"
+                        update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "queue_complete" "completed" "all_tasks_done" '{"category":"none","count":0,"details":[]}' "null" "false" "null"
+                        # Return special code to signal main loop to exit gracefully
+                        return 6
+                    fi
                 else
                     log_status "WARN" "⚠️ Failed to mark task complete (may already be completed or claimed by another)"
+                fi
+            fi
+        fi
+
+        # AUTO-RECOVERY: Detect task completion from git commit if RALPH_STATUS was missed
+        # This handles cases where Claude completes work and commits, but forgets to output RALPH_STATUS block
+        if [[ -f ".response_analysis" && -n "$RALPH_ID" ]]; then
+            local completed_task_id=$(jq -r '.analysis.completed_task_id // ""' .response_analysis 2>/dev/null)
+
+            # Only attempt auto-recovery if no explicit completion was detected
+            if [[ -z "$completed_task_id" || "$completed_task_id" == "null" ]]; then
+                # Check if we have a recent commit (within last 5 minutes)
+                if command -v git &>/dev/null && git rev-parse --git-dir >/dev/null 2>&1; then
+                    local last_commit_sha=$(git log -1 --pretty=%H 2>/dev/null)
+                    local last_commit_msg=$(git log -1 --pretty=%B 2>/dev/null)
+                    local commit_age_seconds=$(git log -1 --pretty=%ct 2>/dev/null)
+                    local current_time=$(date +%s 2>/dev/null || echo "0")
+
+                    if [[ -n "$commit_age_seconds" && "$commit_age_seconds" =~ ^[0-9]+$ && "$current_time" =~ ^[0-9]+$ ]]; then
+                        local age_minutes=$(( (current_time - commit_age_seconds) / 60 ))
+
+                        # Only auto-recover for very recent commits (within 5 minutes)
+                        if [[ $age_minutes -le 5 ]]; then
+                            local auto_task_id=""
+                            local pattern_matched=""
+
+                            # Try to extract task ID from commit message using multiple patterns
+                            # Pattern 1: Task-N, Task #N, task-N
+                            if [[ "$last_commit_msg" =~ [Tt]ask[- ]?#?([0-9]+) ]]; then
+                                auto_task_id="task-${BASH_REMATCH[1]}"
+                                pattern_matched="Task-N pattern"
+                            # Pattern 2: Issue N, Issue-N
+                            elif [[ "$last_commit_msg" =~ [Ii]ssue[- ]([0-9]+) ]]; then
+                                auto_task_id="issue-${BASH_REMATCH[1]}"
+                                pattern_matched="Issue-N pattern"
+                            # Pattern 3: (T0.1), (T1.2) - Tier notation
+                            elif [[ "$last_commit_msg" =~ \(T([0-9]+)\.([0-9]+)\) ]]; then
+                                auto_task_id="T${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"
+                                pattern_matched="Tier notation"
+                            fi
+
+                            # If we extracted a task ID, verify it matches the current task and auto-complete
+                            if [[ -n "$auto_task_id" ]]; then
+                                # Get the current task ID this Ralph is working on
+                                local current_task_id=$(get_current_task_id "$RALPH_ID" 2>/dev/null)
+
+                                # Only auto-complete if the extracted task matches what Ralph is working on
+                                # This prevents accidentally completing the wrong task
+                                if [[ -n "$current_task_id" && "$auto_task_id" == "$current_task_id" ]]; then
+                                    log_status "INFO" "🔧 AUTO-RECOVERY: Detected completion from commit without RALPH_STATUS block"
+                                    log_status "INFO" "   Task ID: $auto_task_id (matched via $pattern_matched)"
+                                    log_status "INFO" "   Commit: ${last_commit_sha:0:7} - \"${last_commit_msg:0:60}...\""
+                                    log_status "INFO" "   Age: ${age_minutes}m ago"
+
+                                    # Build completion command
+                                    local auto_complete_cmd="wig complete \"$auto_task_id\" --ralph-id \"$RALPH_ID\" --commit \"$last_commit_sha\" --message \"Auto-recovered from commit (no RALPH_STATUS block)\""
+
+                                    # Attempt to mark task complete
+                                    log_status "INFO" "📤 Auto-reporting task completion to ChiefWiggum..."
+                                    if eval "$auto_complete_cmd" 2>&1; then
+                                        log_status "SUCCESS" "✅ AUTO-RECOVERY: Task $auto_task_id marked complete"
+                                        log_status "INFO" "   Note: Claude forgot to output RALPH_STATUS block but work was done"
+
+                                        # TASK CONTINUATION: Attempt to claim next task (same as normal completion path)
+                                        log_status "INFO" "📋 Checking for next task in queue..."
+                                        local next_claimed=$(claim_next_task_for_ralph "$RALPH_ID")
+
+                                        if [[ "$next_claimed" == "true" ]]; then
+                                            local new_task_id=$(get_current_task_id "$RALPH_ID")
+                                            local new_task_title=$(get_task_title "$new_task_id")
+
+                                            if [[ -n "$new_task_id" ]]; then
+                                                log_status "SUCCESS" "📋 Claimed next task: $new_task_id - $new_task_title"
+
+                                                # Generate new prompt for the next task
+                                                if generate_task_prompt_for_file "$RALPH_ID" "$new_task_id" "$PROMPT_FILE"; then
+                                                    log_status "INFO" "📝 Generated prompt for new task"
+
+                                                    # Reset exit signals for new task
+                                                    echo '{"test_only_loops": [], "done_signals": [], "completion_indicators": []}' > "$EXIT_SIGNALS_FILE"
+
+                                                    log_status "INFO" "🔄 Continuing loop with next task..."
+                                                    # Signal main loop to continue with new task
+                                                    return 4
+                                                else
+                                                    log_status "ERROR" "❌ Failed to generate prompt for new task, exiting..."
+                                                    reset_session "prompt_generation_failed"
+                                                    return 5
+                                                fi
+                                            fi
+                                        else
+                                            # No more tasks
+                                            log_status "SUCCESS" "🎉 Queue empty - all tasks complete!"
+                                            reset_session "queue_complete"
+                                            update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "queue_complete" "completed" "all_tasks_done" '{"category":"none","count":0,"details":[]}' "null" "false" "null"
+                                            return 6
+                                        fi
+                                    else
+                                        log_status "WARN" "⚠️ AUTO-RECOVERY: Failed to mark task complete (may be wrong task or already completed)"
+                                    fi
+                                else
+                                    [[ "${VERBOSE_PROGRESS:-}" == "true" ]] && log_status "DEBUG" "Auto-recovery skipped: extracted task '$auto_task_id' != current task '$current_task_id'"
+                                fi
+                            else
+                                [[ "${VERBOSE_PROGRESS:-}" == "true" ]] && log_status "DEBUG" "Auto-recovery: No task ID pattern found in commit message"
+                            fi
+                        else
+                            [[ "${VERBOSE_PROGRESS:-}" == "true" ]] && log_status "DEBUG" "Auto-recovery: Last commit too old (${age_minutes}m > 5m)"
+                        fi
+                    fi
                 fi
             fi
         fi
@@ -1324,8 +1546,14 @@ EOF
 # Cleanup function for SIGINT/SIGTERM
 cleanup() {
     log_status "INFO" "Ralph loop interrupted (signal). Cleaning up..."
+
+    # Release task claim before exiting
+    if [[ -n "$RALPH_ID" ]]; then
+        release_current_task "$RALPH_ID"
+    fi
+
     reset_session "manual_interrupt"
-    update_status "$loop_count" "$(cat "$CALL_COUNT_FILE" 2>/dev/null || echo "0")" "interrupted" "stopped"
+    update_status "$loop_count" "$(cat "$CALL_COUNT_FILE" 2>/dev/null || echo "0")" "interrupted" "stopped" "" '{"category":"none","count":0,"details":[]}' "null" "false" "null"
     exit 0
 }
 
@@ -1417,6 +1645,12 @@ main() {
         if [[ $loop_count -ge $MAX_LOOPS_SAFETY ]]; then
             log_status "ERROR" "🛑 Max loop safety limit reached ($MAX_LOOPS_SAFETY loops)"
             log_status "ERROR" "This indicates a bug - Ralph should have exited earlier"
+
+            # Release task claim before exiting
+            if [[ -n "$RALPH_ID" ]]; then
+                release_current_task "$RALPH_ID"
+            fi
+
             reset_session "max_loops_exceeded"
             break
         fi
@@ -1470,8 +1704,12 @@ main() {
                 if (( $(echo "$current_cost >= $COST_BUDGET_USD" | bc -l) )); then
                     log_status "WARN" "⚠️ Cost budget reached: \$${current_cost} / \$${COST_BUDGET_USD}"
                     log_status "INFO" "Stopping Ralph to prevent exceeding budget"
+
+                    # Release task claim before exiting
+                    release_current_task "$RALPH_ID"
+
                     reset_session "cost_budget_exceeded"
-                    update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "cost_budget_exceeded" "stopped" "cost_limit_reached"
+                    update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "cost_budget_exceeded" "stopped" "cost_limit_reached" '{"category":"none","count":0,"details":[]}' "null" "false" "null"
                     break
                 fi
             fi
@@ -1494,8 +1732,14 @@ main() {
         start_phase "circuit_check"
         if should_halt_execution; then
             end_phase "circuit_check"
+
+            # Release task claim before exiting
+            if [[ -n "$RALPH_ID" ]]; then
+                release_current_task "$RALPH_ID"
+            fi
+
             reset_session "circuit_breaker_open"
-            update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "circuit_breaker_open" "halted" "stagnation_detected"
+            update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "circuit_breaker_open" "halted" "stagnation_detected" '{"category":"none","count":0,"details":[]}' "null" "false" "null"
             log_status "ERROR" "🛑 Circuit breaker has opened - execution halted"
             break
         fi
@@ -1516,8 +1760,14 @@ main() {
         end_phase "exit_check"
         if [[ "$exit_reason" != "" ]]; then
             log_status "SUCCESS" "🏁 Graceful exit triggered: $exit_reason"
+
+            # Release task claim before exiting
+            if [[ -n "$RALPH_ID" ]]; then
+                release_current_task "$RALPH_ID"
+            fi
+
             reset_session "project_complete"
-            update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "graceful_exit" "completed" "$exit_reason"
+            update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "graceful_exit" "completed" "$exit_reason" '{"category":"none","count":0,"details":[]}' "null" "false" "null"
 
             log_status "SUCCESS" "🎉 Ralph has completed the project! Final stats:"
             log_status "INFO" "  - Total loops: $loop_count"
@@ -1530,7 +1780,7 @@ main() {
         # Update status
         start_phase "status_update"
         local calls_made=$(cat "$CALL_COUNT_FILE" 2>/dev/null || echo "0")
-        update_status "$loop_count" "$calls_made" "executing" "running"
+        update_status "$loop_count" "$calls_made" "executing" "running" "" '{"category":"none","count":0,"details":[]}' "null" "false" "null"
         end_phase "status_update"
 
         # Execute Claude Code
@@ -1543,8 +1793,62 @@ main() {
             last_error_info=$(cat ".last_error_info" 2>/dev/null || echo '{"category":"none","count":0,"details":[]}')
         fi
 
+        # Extract test progress (if available)
+        local test_progress="null"
+        if [[ -n "$RALPH_ID" ]]; then
+            test_progress=$(extract_test_progress "$RALPH_ID")
+        fi
+
+        # Build progress_data JSON
+        local progress_data_json
+        if [[ "$test_progress" != "null" ]]; then
+            # We have test results - wrap in progress_data structure
+            progress_data_json=$(jq -n \
+                --argjson test_results "$test_progress" \
+                '{
+                    test_results: $test_results,
+                    stuck_indicators: {
+                        same_test_failures: 0,
+                        loop_count_without_progress: 0
+                    }
+                }' 2>/dev/null || echo "null")
+        else
+            progress_data_json="null"
+        fi
+
+        # Detect if HITL is needed
+        local needs_hitl="false"
+        local hitl_reason="null"
+        if [[ -n "$RALPH_ID" ]]; then
+            # Call Python to detect HITL
+            local hitl_result=$(python3 -c "
+import sys
+sys.path.insert(0, '$HOME/.chiefwiggum')
+try:
+    from chiefwiggum.spawner import detect_hitl_needed
+    needs_hitl, reason = detect_hitl_needed('$RALPH_ID')
+    if needs_hitl:
+        print(f'true|{reason}')
+    else:
+        print('false|')
+except Exception as e:
+    print(f'false|error: {e}', file=sys.stderr)
+    print('false|')
+" 2>/dev/null || echo "false|")
+
+            needs_hitl=$(echo "$hitl_result" | cut -d'|' -f1)
+            local hitl_reason_raw=$(echo "$hitl_result" | cut -d'|' -f2-)
+            if [[ -n "$hitl_reason_raw" ]]; then
+                hitl_reason="\"$hitl_reason_raw\""
+            fi
+
+            if [[ "$needs_hitl" == "true" ]]; then
+                log_status "WARN" "⚠️ Human intervention needed: $hitl_reason_raw"
+            fi
+        fi
+
         if [ $exec_result -eq 0 ]; then
-            update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "completed" "success" "" "$last_error_info"
+            update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "completed" "success" "" "$last_error_info" "$progress_data_json" "$needs_hitl" "$hitl_reason"
 
             # Brief pause between successful executions
             start_phase "sleep"
@@ -1557,15 +1861,20 @@ main() {
             end_phase "log_cleanup"
         elif [ $exec_result -eq 3 ]; then
             # Circuit breaker opened
+            # Release task claim before exiting
+            if [[ -n "$RALPH_ID" ]]; then
+                release_current_task "$RALPH_ID"
+            fi
+
             reset_session "circuit_breaker_trip"
-            update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "circuit_breaker_open" "halted" "stagnation_detected" "$last_error_info"
+            update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "circuit_breaker_open" "halted" "stagnation_detected" "$last_error_info" "null" "false" "null"
             log_status "ERROR" "🛑 Circuit breaker has opened - halting loop"
             log_status "INFO" "Run 'ralph --reset-circuit' to reset the circuit breaker after addressing issues"
             break
         elif [ $exec_result -eq 2 ]; then
             # API 5-hour limit reached - handle specially
             local api_error_info='{"category":"api_error","count":1,"details":["API 5-hour usage limit reached"]}'
-            update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "api_limit" "paused" "" "$api_error_info"
+            update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "api_limit" "paused" "" "$api_error_info" "null" "true" "API 5-hour usage limit reached"
             log_status "WARN" "🛑 Claude API 5-hour limit reached!"
             
             # Ask user whether to wait or exit
@@ -1581,7 +1890,7 @@ main() {
             
             if [[ "$user_choice" == "2" ]] || [[ -z "$user_choice" ]]; then
                 log_status "INFO" "User chose to exit (or timed out). Exiting loop..."
-                update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "api_limit_exit" "stopped" "api_5hour_limit" "$api_error_info"
+                update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "api_limit_exit" "stopped" "api_5hour_limit" "$api_error_info" "null" "true" "API 5-hour usage limit - user chose to exit"
                 break
             else
                 log_status "INFO" "User chose to wait. Waiting for API limit reset..."
@@ -1600,8 +1909,24 @@ main() {
                 done
                 printf "\n"
             fi
+        elif [ $exec_result -eq 4 ]; then
+            # Task completed and next task claimed - continue loop immediately with new task
+            log_status "SUCCESS" "✅ Next task claimed successfully, continuing loop with new task"
+            update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "task_claimed" "running" "next_task_claimed" "$last_error_info" "null" "false" "null"
+            # No sleep - continue immediately to next loop iteration
+            continue
+        elif [ $exec_result -eq 5 ]; then
+            # Failed to generate prompt for new task - exit loop
+            log_status "ERROR" "❌ Failed to generate prompt for next task, exiting loop"
+            update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "prompt_generation_failed" "error" "cannot_continue" "$last_error_info" "null" "true" "Failed to generate prompt for next task"
+            break
+        elif [ $exec_result -eq 6 ]; then
+            # No more tasks in queue - exit gracefully
+            log_status "SUCCESS" "🎉 All tasks complete! Queue is empty."
+            update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "all_tasks_complete" "completed" "queue_empty" "$last_error_info" "null" "false" "null"
+            break
         else
-            update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "failed" "error" "" "$last_error_info"
+            update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "failed" "error" "" "$last_error_info" "null" "false" "null"
             log_status "WARN" "Execution failed, waiting 30 seconds before retry..."
             sleep 30
         fi
@@ -1694,6 +2019,32 @@ get_task_status() {
         jq -r ".[] | select(.task_id == \"$task_id\") | .status // \"unknown\"" 2>/dev/null
 }
 
+# Release current task claim for Ralph instance
+# This should be called on all exit paths to ensure tasks aren't left in claimed state
+release_current_task() {
+    local ralph_id=$1
+
+    if [[ -z "$ralph_id" ]]; then
+        log_status "DEBUG" "No Ralph ID provided, skipping task release"
+        return 0
+    fi
+
+    if ! command -v wig &>/dev/null; then
+        log_status "DEBUG" "wig command not available, skipping task release"
+        return 0
+    fi
+
+    log_status "INFO" "📤 Releasing task claim for Ralph $ralph_id..."
+
+    if wig release "$ralph_id" 2>/dev/null; then
+        log_status "SUCCESS" "✅ Released task claim for Ralph $ralph_id"
+        return 0
+    else
+        log_status "WARN" "⚠️ Failed to release task claim for Ralph $ralph_id (may not have been claimed)"
+        return 1
+    fi
+}
+
 # Claim next task for Ralph
 claim_next_task_for_ralph() {
     local ralph_id=$1
@@ -1707,6 +2058,88 @@ claim_next_task_for_ralph() {
     else
         echo "false"
         return 1
+    fi
+}
+
+# Get current task ID for Ralph instance
+get_current_task_id() {
+    local ralph_id=$1
+    if ! command -v wig &>/dev/null; then echo ""; return; fi
+
+    wig instances --format=json 2>/dev/null | \
+        jq -r ".[] | select(.ralph_id == \"$ralph_id\") | .current_task_id // \"\"" 2>/dev/null
+}
+
+# Get task title from database
+get_task_title() {
+    local task_id=$1
+    if ! command -v wig &>/dev/null; then echo ""; return; fi
+
+    wig tasks --format=json 2>/dev/null | \
+        jq -r ".[] | select(.task_id == \"$task_id\") | .title // \"\"" 2>/dev/null
+}
+
+# Get task description from database
+get_task_description() {
+    local task_id=$1
+    if ! command -v wig &>/dev/null; then echo ""; return; fi
+
+    wig tasks --format=json 2>/dev/null | \
+        jq -r ".[] | select(.task_id == \"$task_id\") | .description // \"\"" 2>/dev/null
+}
+
+# Generate task-specific prompt file
+# This calls back to spawner.py to generate the prompt
+generate_task_prompt_for_file() {
+    local ralph_id=$1
+    local task_id=$2
+    local prompt_file=$3
+
+    if ! command -v python3 &>/dev/null; then
+        log_status "ERROR" "python3 not found, cannot generate task prompt"
+        return 1
+    fi
+
+    # Call spawner's prompt generation function
+    python3 -c "
+import sys
+sys.path.insert(0, '$HOME/.chiefwiggum')
+try:
+    from chiefwiggum.spawner import generate_prompt_for_task
+    prompt_content = generate_prompt_for_task('$task_id')
+    with open('$prompt_file', 'w') as f:
+        f.write(prompt_content)
+    sys.exit(0)
+except Exception as e:
+    print(f'Error generating prompt: {e}', file=sys.stderr)
+    sys.exit(1)
+" 2>/dev/null
+
+    local result=$?
+    if [[ $result -eq 0 ]]; then
+        return 0
+    else
+        # Fallback: generate simple prompt manually
+        local task_title=$(get_task_title "$task_id")
+        local task_description=$(get_task_description "$task_id")
+
+        cat > "$prompt_file" << EOF
+# Task: $task_title
+
+$task_description
+
+Please complete this task. When finished, add a RALPH_STATUS block with EXIT_SIGNAL: true.
+
+## RALPH_STATUS Block Format
+
+\`\`\`
+RALPH_STATUS:
+  TASK_ID: $task_id
+  EXIT_SIGNAL: true
+  COMMIT_SHA: <git_commit_sha_if_applicable>
+\`\`\`
+EOF
+        return 0
     fi
 }
 
