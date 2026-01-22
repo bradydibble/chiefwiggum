@@ -1639,7 +1639,7 @@ def stop_ralph_daemon(ralph_id: str, force: bool = False) -> tuple[bool, str]:
         Tuple of (success, message)
     """
     running, pid = is_ralph_running(ralph_id)
-    if not running:
+    if not running or pid is None:
         return (False, f"Ralph {ralph_id} is not running")
 
     try:
@@ -1745,7 +1745,7 @@ async def count_running_ralphs() -> int:
 async def get_max_concurrent_ralphs() -> int:
     """Get the maximum number of concurrent Ralphs allowed."""
     value = await get_setting("max_concurrent_ralphs", "5")
-    return int(value)
+    return int(value or "5")
 
 
 async def set_max_concurrent_ralphs(limit: int) -> None:

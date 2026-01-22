@@ -497,7 +497,7 @@ async def update_fix_plan_on_completion(task_id: str, project: str | None = None
     """
     # Check if auto-update is enabled
     auto_update = await get_setting("update_fix_plan_on_complete", "true")
-    if auto_update.lower() != "true":
+    if auto_update and auto_update.lower() != "true":
         logger.debug(f"Auto-update disabled, skipping @fix_plan.md update for {task_id}")
         return False
 
@@ -566,7 +566,7 @@ async def verify_and_record_commit(
     """
     # Check if auto-verify is enabled
     auto_verify = await get_setting("verify_commits_on_complete", "true")
-    if auto_verify.lower() != "true":
+    if auto_verify and auto_verify.lower() != "true":
         logger.debug(f"Auto-verify disabled, skipping commit verification for {task_id}")
         return False
 
