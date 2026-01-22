@@ -11,11 +11,9 @@ Tests cover:
 import os
 import signal
 import subprocess
-import tempfile
 import time
 from datetime import datetime, timedelta
-from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 import pytest
 
@@ -29,10 +27,7 @@ from chiefwiggum.spawner import (
     write_ralph_status,
     read_ralph_status,
     is_ralph_running,
-    get_ralph_log_path,
-    get_ralph_pid_path,
     get_ralph_status_path,
-    _get_ralph_data_dir,
 )
 
 
@@ -539,7 +534,7 @@ class TestHandleStuckRalph:
 
         with patch("chiefwiggum.coordination.get_ralph_instance", mock_get_instance):
             with patch("chiefwiggum.coordination.update_instance_status", mock_update_status):
-                result = await handle_stuck_ralph(ralph_id, "Test reason")
+                _result = await handle_stuck_ralph(ralph_id, "Test reason")
 
         # Should have written status file
         status = read_ralph_status(ralph_id)

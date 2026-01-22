@@ -192,7 +192,7 @@ def update_task_completion_marker(
                     # Clean up temp file on error
                     try:
                         Path(temp_path).unlink(missing_ok=True)
-                    except:
+                    except Exception:
                         pass
                     raise e
 

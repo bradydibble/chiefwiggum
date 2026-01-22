@@ -9,7 +9,6 @@ Tests cover:
 
 import os
 from datetime import datetime, timedelta
-from unittest.mock import patch
 
 import pytest
 
@@ -28,7 +27,6 @@ from chiefwiggum import (
     heartbeat,
     init_db,
     list_active_instances,
-    list_in_progress_tasks,
     list_pending_tasks,
     mark_stale_instances_crashed,
     register_ralph_instance,
@@ -740,7 +738,7 @@ class TestAutoScaling:
 
         await sync_tasks_from_fix_plan(sample_fix_plan_file, project="test")
 
-        backlog = await analyze_category_backlog()
+        _backlog = await analyze_category_backlog()
         # High priority tasks should contribute more weight
         # The exact values depend on the fixture content
 

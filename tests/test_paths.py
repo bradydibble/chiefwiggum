@@ -15,7 +15,6 @@ from chiefwiggum.paths import (
     migrate_to_xdg,
     reset_paths_cache,
     _get_legacy_dir,
-    _get_xdg_dirs,
     _get_fallback_xdg_dirs,
     _should_use_legacy,
 )

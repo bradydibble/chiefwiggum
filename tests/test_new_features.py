@@ -1,10 +1,7 @@
 """Tests for new ChiefWiggum TUI features."""
 
-import asyncio
 import os
 import tempfile
-from datetime import datetime, timedelta
-from pathlib import Path
 
 import pytest
 

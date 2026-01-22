@@ -5,7 +5,6 @@ Models for Ralph instances, task claims, and fix plan parsing.
 
 from datetime import datetime
 from enum import Enum
-from typing import Any
 
 from pydantic import BaseModel, Field
 

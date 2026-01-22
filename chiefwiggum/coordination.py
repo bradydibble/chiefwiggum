@@ -18,7 +18,6 @@ from chiefwiggum.database import get_connection, get_setting
 from chiefwiggum.fix_plan_writer import update_task_completion_marker
 from chiefwiggum.git_verifier import verify_commit_in_repo
 from chiefwiggum.models import (
-    ClaudeModel,
     ErrorCategory,
     FixPlanTask,
     RalphConfig,

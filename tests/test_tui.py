@@ -9,17 +9,13 @@ Tests cover:
 - Status messages (user feedback)
 """
 
-import ast
 import time
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
 
-import pytest
 
 from chiefwiggum.models import (
     ClaudeModel,
     TaskCategory,
-    TaskClaimStatus,
     TaskPriority,
 )
 from chiefwiggum.tui import (
@@ -176,13 +172,6 @@ class TestModeTransitions:
 
         # The critical line is the elif that handles spawn modes in update_dashboard
         # It should include SPAWN_CATEGORY
-        spawn_modes = [
-            "TUIMode.SPAWN_PROJECT",
-            "TUIMode.SPAWN_PRIORITY",
-            "TUIMode.SPAWN_CATEGORY",
-            "TUIMode.SPAWN_MODEL",
-            "TUIMode.SPAWN_CONFIRM",
-        ]
 
         # Find the specific pattern for update_dashboard spawn modes check
         # This appears around line 1220: elif state.mode in (TUIMode.SPAWN_PROJECT, ...)

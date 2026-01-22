@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum, auto
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from rich import box
 from rich.console import Console
@@ -24,18 +24,13 @@ from rich.text import Text
 from chiefwiggum import (
     check_ralph_completions,
     get_system_stats,
-    list_active_instances,
     list_all_instances,
     list_all_tasks,
-    list_failed_tasks,
-    list_in_progress_tasks,
-    list_pending_tasks,
     list_task_history,
     mark_stale_instances_crashed,
     pause_all_instances,
     pause_instance,
     process_retry_tasks,
-    register_ralph_instance,
     release_claim,
     resume_all_instances,
     resume_instance,
@@ -46,7 +41,6 @@ from chiefwiggum import (
 from chiefwiggum.coordination import get_all_instance_progress
 from chiefwiggum.config import (
     get_api_key_source,
-    validate_api_key,
     get_api_key,
     get_auto_scaling_config,
     get_default_model,
@@ -86,11 +80,9 @@ from chiefwiggum.spawner import (
     generate_ralph_id,
     get_error_summary,
     get_process_health,
-    get_recent_errors,
     get_running_ralphs,
     read_ralph_log,
     read_ralph_status,
-    spawn_ralph_daemon,
     spawn_ralph_with_task_claim,
     stop_all_ralph_daemons,
     stop_ralph_daemon,
@@ -140,8 +132,6 @@ from chiefwiggum.icons import (
     COLOR_ALERT_WARNING,
     COLOR_OVERDUE,
     # Background colors
-    BG_SELECTED,
-    BG_STRIPE,
     BG_HEADER,
     # Border colors
     BORDER_INSTANCES,
@@ -754,7 +744,7 @@ def create_tasks_table(
         table.add_row(*row)
     elif offset > 0:
         # At end, show hint to scroll up
-        row = [""] * (num_cols - 4) + [f"[dim](j/k to scroll)[/dim]", "", "", ""]
+        row = [""] * (num_cols - 4) + ["[dim](j/k to scroll)[/dim]", "", "", ""]
         table.add_row(*row)
 
     if not tasks:
@@ -1146,17 +1136,17 @@ def create_error_detail_panel(task, state: TUIState) -> Panel:
         text.append("No failed task selected", style="dim")
         return Panel(text, title="Error Details", border_style=BORDER_ERROR)
 
-    text.append(f"Task: ", style="bold")
+    text.append("Task: ", style="bold")
     text.append(f"{task.task_title}\n\n", style="white")
 
-    text.append(f"ID: ", style="dim")
+    text.append("ID: ", style="dim")
     text.append(f"{task.task_id}\n", style="cyan")
 
-    text.append(f"Status: ", style="dim")
+    text.append("Status: ", style="dim")
     text.append(f"{task.status.value}\n", style="red bold")
 
     if task.error_category:
-        text.append(f"Error Category: ", style="dim")
+        text.append("Error Category: ", style="dim")
         category_styles = {
             ErrorCategory.TRANSIENT: "yellow",
             ErrorCategory.CODE_ERROR: "red",
@@ -1168,15 +1158,15 @@ def create_error_detail_panel(task, state: TUIState) -> Panel:
         style = category_styles.get(task.error_category, "white")
         text.append(f"{task.error_category.value}\n", style=style)
 
-    text.append(f"Retry Count: ", style="dim")
+    text.append("Retry Count: ", style="dim")
     text.append(f"{task.retry_count}/{task.max_retries}\n", style="white")
 
     if task.next_retry_at:
-        text.append(f"Next Retry: ", style="dim")
+        text.append("Next Retry: ", style="dim")
         text.append(f"{task.next_retry_at.strftime('%H:%M:%S')}\n", style="yellow")
 
     if task.error_message:
-        text.append(f"\nError Message:\n", style="bold red")
+        text.append("\nError Message:\n", style="bold red")
         # Truncate long error messages
         error_msg = task.error_message
         if len(error_msg) > 500:
@@ -1233,7 +1223,7 @@ def create_spawn_panel(state: TUIState) -> Panel:
         text.append(" = cancel\n", style="dim")
 
     elif state.mode == TUIMode.SPAWN_PRIORITY:
-        text.append(f"Project: ", style="dim")
+        text.append("Project: ", style="dim")
         text.append(f"{config.project}\n\n", style="cyan")
         text.append("Select Minimum Priority:\n", style="bold yellow")
         text.append("  1", style="yellow bold")
@@ -1246,9 +1236,9 @@ def create_spawn_panel(state: TUIState) -> Panel:
         text.append(" = All priorities\n", style="white")
 
     elif state.mode == TUIMode.SPAWN_CATEGORY:
-        text.append(f"Project: ", style="dim")
+        text.append("Project: ", style="dim")
         text.append(f"{config.project}\n", style="cyan")
-        text.append(f"Priority: ", style="dim")
+        text.append("Priority: ", style="dim")
         text.append(f"{config.priority_min.value if config.priority_min else 'All'}\n\n", style="cyan")
         text.append("Select Category (optional):\n", style="bold yellow")
         text.append("  1", style="yellow bold")
@@ -1265,15 +1255,15 @@ def create_spawn_panel(state: TUIState) -> Panel:
         text.append(" = All categories (skip)\n", style="white")
 
     elif state.mode == TUIMode.SPAWN_MODEL:
-        text.append(f"Project: ", style="dim")
+        text.append("Project: ", style="dim")
         text.append(f"{config.project}\n", style="cyan")
-        text.append(f"Priority: ", style="dim")
+        text.append("Priority: ", style="dim")
         text.append(f"{config.priority_min.value if config.priority_min else 'All'}\n", style="cyan")
         if config.categories:
-            text.append(f"Categories: ", style="dim")
+            text.append("Categories: ", style="dim")
             text.append(f"{', '.join(c.value for c in config.categories)}\n\n", style="cyan")
         else:
-            text.append(f"Categories: ", style="dim")
+            text.append("Categories: ", style="dim")
             text.append("All\n\n", style="cyan")
         text.append("Select Model:\n", style="bold yellow")
         text.append("  1", style="yellow bold")
@@ -1284,9 +1274,9 @@ def create_spawn_panel(state: TUIState) -> Panel:
         text.append(" = Haiku\n", style="white")
 
     elif state.mode == TUIMode.SPAWN_SESSION:
-        text.append(f"Project: ", style="dim")
+        text.append("Project: ", style="dim")
         text.append(f"{config.project}\n", style="cyan")
-        text.append(f"Model: ", style="dim")
+        text.append("Model: ", style="dim")
         text.append(f"{config.model.value}\n\n", style="cyan")
         text.append("Session Settings:\n", style="bold yellow")
         # Session continuity toggle
@@ -1308,20 +1298,20 @@ def create_spawn_panel(state: TUIState) -> Panel:
 
     elif state.mode == TUIMode.SPAWN_CONFIRM:
         text.append("Configuration Summary:\n\n", style="bold yellow")
-        text.append(f"  Project: ", style="dim")
+        text.append("  Project: ", style="dim")
         text.append(f"{config.project}\n", style="cyan")
-        text.append(f"  Priority: ", style="dim")
+        text.append("  Priority: ", style="dim")
         text.append(f"{config.priority_min.value if config.priority_min else 'All'}\n", style="cyan")
         if config.categories:
-            text.append(f"  Categories: ", style="dim")
+            text.append("  Categories: ", style="dim")
             text.append(f"{', '.join(c.value for c in config.categories)}\n", style="cyan")
-        text.append(f"  Model: ", style="dim")
+        text.append("  Model: ", style="dim")
         text.append(f"{config.model.value}\n", style="cyan")
         # Session settings summary
         continuity_str = "Continue" if config.session_continuity else "Fresh"
-        text.append(f"  Session: ", style="dim")
+        text.append("  Session: ", style="dim")
         text.append(f"{continuity_str}, expires in {config.session_expiry_hours}h\n", style="cyan")
-        text.append(f"  Fix Plan: ", style="dim")
+        text.append("  Fix Plan: ", style="dim")
         text.append(f"{config.fix_plan_path}\n\n", style="cyan")
         text.append("  Enter", style="green bold")
         text.append(" = Spawn\n", style="white")
@@ -1500,13 +1490,13 @@ def create_settings_panel(state: TUIState) -> Panel:
         text.append("Auto-Scaling Settings\n\n", style="bold cyan")
         config = get_auto_scaling_config()
         text.append("Toggle settings with number keys:\n\n", style="dim")
-        text.append(f"  1. Auto-Spawn Enabled: ", style="dim")
+        text.append("  1. Auto-Spawn Enabled: ", style="dim")
         text.append(f"{'Yes' if config['auto_spawn_enabled'] else 'No'}\n", style="green" if config['auto_spawn_enabled'] else "red")
-        text.append(f"  2. Spawn Threshold:    ", style="dim")
+        text.append("  2. Spawn Threshold:    ", style="dim")
         text.append(f"{config['auto_spawn_threshold']} pending tasks\n", style="white")
-        text.append(f"  3. Auto-Cleanup:       ", style="dim")
+        text.append("  3. Auto-Cleanup:       ", style="dim")
         text.append(f"{'Yes' if config['auto_cleanup_enabled'] else 'No'}\n", style="green" if config['auto_cleanup_enabled'] else "red")
-        text.append(f"  4. Idle Timeout:       ", style="dim")
+        text.append("  4. Idle Timeout:       ", style="dim")
         text.append(f"{config['auto_cleanup_idle_minutes']} minutes\n", style="white")
         text.append("\n")
         text.append("1-4", style="yellow bold")
@@ -1521,18 +1511,18 @@ def create_settings_panel(state: TUIState) -> Panel:
         text.append("Configure settings passed to ralph_loop.sh:\n\n", style="dim")
         # Session continuity
         continuity = loop_settings.get("session_continuity", True)
-        text.append(f"  1. Session Continuity: ", style="dim")
+        text.append("  1. Session Continuity: ", style="dim")
         text.append(f"{'Yes (continue)' if continuity else 'No (fresh start)'}\n",
                    style="green" if continuity else "red")
         # Session expiry
-        text.append(f"  2. Session Expiry:     ", style="dim")
+        text.append("  2. Session Expiry:     ", style="dim")
         text.append(f"{loop_settings.get('session_expiry_hours', 24)} hours\n", style="white")
         # Output format
         output_fmt = loop_settings.get("output_format", "json")
-        text.append(f"  3. Output Format:      ", style="dim")
+        text.append("  3. Output Format:      ", style="dim")
         text.append(f"{output_fmt}\n", style="white")
         # Max calls per hour
-        text.append(f"  4. Max Calls/Hour:     ", style="dim")
+        text.append("  4. Max Calls/Hour:     ", style="dim")
         text.append(f"{loop_settings.get('max_calls_per_hour', 100)}\n", style="white")
         text.append("\n")
         text.append("1-4", style="yellow bold")
@@ -1543,17 +1533,6 @@ def create_settings_panel(state: TUIState) -> Panel:
 
     # Main settings view with sections
     text.append("Settings & Configuration\n\n", style="bold cyan")
-
-    # Settings items with cursor navigation
-    settings_items = [
-        ("API Key", 0),
-        ("Max Concurrent Ralphs", 1),
-        ("Default Model", 2),
-        ("Default Timeout", 3),
-        ("Ralph Permissions", 4),
-        ("Task Assignment Strategy", 5),
-        ("Auto-Scaling", 6),
-    ]
 
     # Section 1: API Configuration
     text.append("API Configuration\n", style="bold yellow")
@@ -1624,11 +1603,11 @@ def create_settings_panel(state: TUIState) -> Panel:
 
     # Section 6: Current View State (read-only)
     text.append("\nView State (auto-saved)\n", style="bold yellow")
-    text.append(f"    Tasks:     ", style="dim")
+    text.append("    Tasks:     ", style="dim")
     text.append(f"{'All' if state.show_all_tasks else 'Active only'}\n", style="white")
-    text.append(f"    Instances: ", style="dim")
+    text.append("    Instances: ", style="dim")
     text.append(f"{'All' if state.show_all_instances else 'Active only'}\n", style="white")
-    text.append(f"    Focus:     ", style="dim")
+    text.append("    Focus:     ", style="dim")
     text.append(f"{state.view_focus.name}\n", style="white")
 
     text.append("\n")
@@ -1752,7 +1731,7 @@ def create_task_detail_panel(task, state: TUIState) -> Panel:
             # Show timeout warning if close to limit
             default_timeout = 30 * 60  # 30 min default
             if elapsed > default_timeout * 0.8:
-                text.append(f" (approaching timeout)", style="red")
+                text.append(" (approaching timeout)", style="red")
             text.append("\n")
         else:
             text.append(f"{elapsed_str}\n", style="white")
@@ -2412,7 +2391,6 @@ def create_instance_logs_content(state: TUIState) -> Text:
 
 def create_instance_detail_panel(instance, state: TUIState, current_task=None, skip_health_checks: bool = False) -> Panel:
     """Create main instance detail panel with tabs."""
-    from rich.console import Group
 
     # Tab bar
     tab_bar = create_instance_tab_bar(state.instance_detail_tab)
@@ -2447,9 +2425,9 @@ def create_confirm_panel(action: str, count: int) -> Panel:
     """Create confirmation panel for bulk operations."""
     text = Text()
     text.append(f"Confirm: {action}\n\n", style="bold red")
-    text.append(f"This will affect ", style="white")
+    text.append("This will affect ", style="white")
     text.append(f"{count}", style="yellow bold")
-    text.append(f" Ralph instance(s).\n\n", style="white")
+    text.append(" Ralph instance(s).\n\n", style="white")
     text.append("  y", style="green bold")
     text.append(" = Confirm\n", style="white")
     text.append("  n, Esc", style="yellow bold")
@@ -2472,18 +2450,18 @@ def create_reconcile_panel(reconcile_result: dict | None) -> Panel:
 
     # Summary statistics
     text.append("Summary:\n", style="bold white")
-    text.append(f"  • Scanned: ", style="white")
+    text.append("  • Scanned: ", style="white")
     text.append(f"{reconcile_result['scanned']}\n", style="cyan bold")
 
-    text.append(f"  • Updated: ", style="white")
+    text.append("  • Updated: ", style="white")
     text.append(f"{reconcile_result['updated']}", style="green bold")
-    text.append(f" tasks marked complete in @fix_plan.md\n", style="white")
+    text.append(" tasks marked complete in @fix_plan.md\n", style="white")
 
-    text.append(f"  • Skipped: ", style="white")
+    text.append("  • Skipped: ", style="white")
     text.append(f"{reconcile_result['skipped']}", style="yellow")
-    text.append(f" (already marked)\n", style="white")
+    text.append(" (already marked)\n", style="white")
 
-    text.append(f"  • Failed: ", style="white")
+    text.append("  • Failed: ", style="white")
     text.append(f"{reconcile_result['failed']}\n", style="red bold")
 
     # Show details (first 10)
@@ -2549,7 +2527,7 @@ async def create_cleanup_panel() -> Panel:
             text.append(f" ({ralph.project or 'no project'})\n", style="dim")
         if len(idle_ralphs) > 10:
             text.append(f"  ... and {len(idle_ralphs) - 10} more\n", style="dim")
-        text.append(f"\nTotal: ", style="white")
+        text.append("\nTotal: ", style="white")
         text.append(f"{len(idle_ralphs)}", style="yellow bold")
         text.append(" idle Ralph(s)\n", style="white")
     else:
@@ -2978,7 +2956,7 @@ async def update_dashboard(layout: Layout, state: TUIState) -> None:
             else:
                 text.append(f"  ETA:         {stats.eta_minutes/60:.1f} hours\n", style="yellow")
         else:
-            text.append(f"  ETA:         Unknown\n", style="dim")
+            text.append("  ETA:         Unknown\n", style="dim")
 
         text.append("\nInstances\n", style="bold yellow")
         text.append(f"  Active:      {stats.active_instances}\n", style="green")
@@ -3129,7 +3107,6 @@ async def update_dashboard(layout: Layout, state: TUIState) -> None:
 
         # Normal view - handle view focus
         show_task_numbers = state.mode == TUIMode.RELEASE
-        expanded = state.view_focus != ViewFocus.BOTH
 
         if state.view_focus == ViewFocus.TASKS:
             # Tasks only - full width (must unsplit first)
@@ -3954,7 +3931,6 @@ async def handle_bulk_task_action(key: str, state: TUIState) -> None:
 
 async def handle_instance_detail(key: str, state: TUIState) -> None:
     """Handle instance detail mode navigation and actions."""
-    from chiefwiggum.spawner import read_ralph_status
 
     # Get current instance
     if not state.instances or state.selected_instance_idx >= len(state.instances):

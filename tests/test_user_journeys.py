@@ -16,7 +16,7 @@ Test classes:
 import asyncio
 from datetime import datetime
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -729,7 +729,6 @@ class TestCommandBarDisplay:
 
     def test_command_bar_shows_critical_keys_in_source(self):
         """Command bar source includes critical keys like 'n' for New."""
-        from pathlib import Path
 
         tui_path = Path(__file__).parent.parent / "chiefwiggum" / "tui.py"
         source = tui_path.read_text()
@@ -753,7 +752,6 @@ class TestStatusMessageTimeout:
 
     def test_status_message_timeout_is_8_seconds(self):
         """Status message timeout should be 8 seconds (not 5)."""
-        from pathlib import Path
 
         tui_path = Path(__file__).parent.parent / "chiefwiggum" / "tui.py"
         source = tui_path.read_text()
@@ -900,7 +898,7 @@ class TestProjectScopedSyncJourney:
         state.project_filter = None
 
         # If cwd is not under claudecode, should return None
-        project = get_current_project(state)
+        _project = get_current_project(state)
         # May be None or a valid project depending on test environment
 
 
@@ -923,7 +921,6 @@ class TestSettingsJourneyExpanded:
 
     def test_settings_edit_model(self):
         """User can edit default model setting."""
-        from chiefwiggum.tui import create_settings_panel
 
         state = TUIState()
         state.mode = TUIMode.SETTINGS_EDIT_MODEL
@@ -937,7 +934,6 @@ class TestSettingsJourneyExpanded:
 
     def test_settings_edit_permissions(self):
         """User can edit ralph permissions."""
-        from chiefwiggum.tui import create_settings_panel
 
         state = TUIState()
         state.mode = TUIMode.SETTINGS_EDIT_PERMISSIONS
@@ -951,7 +947,6 @@ class TestSettingsJourneyExpanded:
 
     def test_settings_edit_strategy(self):
         """User can edit task assignment strategy."""
-        from chiefwiggum.tui import create_settings_panel
 
         state = TUIState()
         state.mode = TUIMode.SETTINGS_EDIT_STRATEGY
@@ -964,7 +959,6 @@ class TestSettingsJourneyExpanded:
 
     def test_settings_edit_auto_spawn(self):
         """User can edit auto-scaling settings."""
-        from chiefwiggum.tui import create_settings_panel
 
         state = TUIState()
         state.mode = TUIMode.SETTINGS_EDIT_AUTO_SPAWN

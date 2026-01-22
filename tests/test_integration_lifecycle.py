@@ -12,14 +12,11 @@ These tests require:
 Run with: pytest tests/test_integration_lifecycle.py -v --run-integration
 """
 
-import asyncio
 import os
-import signal
 import subprocess
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
-from unittest.mock import patch, MagicMock
 
 import pytest
 
@@ -269,8 +266,6 @@ class TestZombieRecovery:
         """Stuck detection properly identifies unresponsive instances."""
         from chiefwiggum.spawner import (
             is_ralph_stuck,
-            write_ralph_status,
-            get_ralph_log_path,
         )
         import json
 
@@ -324,7 +319,7 @@ class TestTaskClaimingIntegration:
             register_ralph_instance,
             TaskClaimStatus,
         )
-        from chiefwiggum.spawner import handle_stuck_ralph, write_ralph_status
+        from chiefwiggum.spawner import handle_stuck_ralph
         from chiefwiggum.coordination import _update_instance_task
 
         ralph_id = "test-stuck-release"
@@ -376,7 +371,6 @@ class TestHealthMonitoringIntegration:
             get_process_health,
             write_ralph_status,
         )
-        import subprocess
 
         ralph_id = "test-activity-real"
 
@@ -425,7 +419,6 @@ class TestHealthMonitoringIntegration:
             write_ralph_status,
         )
         from chiefwiggum import register_ralph_instance
-        import subprocess
 
         ralph_id = "test-full-health"
 

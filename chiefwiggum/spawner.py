@@ -3,22 +3,19 @@
 Spawn and manage Ralph (Claude Code) instances as background daemons.
 """
 
-import asyncio
 import logging
 import os
 import shutil
 import signal
 import socket
 import subprocess
-import sys
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any
 
 from chiefwiggum.config import get_ralph_loop_settings
 from chiefwiggum.database import get_setting, set_setting
-from chiefwiggum.models import ClaudeModel, RalphConfig, TargetingConfig, TaskCategory, TaskPriority, TaskClaim
+from chiefwiggum.models import RalphConfig, TargetingConfig, TaskClaim
 from chiefwiggum.paths import get_paths
 from chiefwiggum.scripts import get_ralph_loop_path
 
@@ -893,14 +890,14 @@ def is_ralph_stuck(ralph_id: str, timeout_minutes: int = 30) -> tuple[bool, str]
 
     # Check 1: Process state issues
     if activity["process_state"] == "zombie":
-        return True, f"Process is ZOMBIE (defunct)"
+        return True, "Process is ZOMBIE (defunct)"
 
     if activity["process_state"] == "stopped":
-        return True, f"Process is STOPPED/suspended"
+        return True, "Process is STOPPED/suspended"
 
     if activity["process_state"] == "dead":
         # Dead process is definitely stuck (PID file exists but process is dead)
-        return True, f"Process is DEAD (not running)"
+        return True, "Process is DEAD (not running)"
 
     # If process state is unknown but we have a PID file, check health
     if activity["process_state"] == "unknown":
@@ -1452,7 +1449,7 @@ async def spawn_ralph_with_task_claim(
         return (False, f"Fix plan not found: {fix_plan_path}", None)
 
     # Step 1: Sync tasks from fix_plan to database
-    logger.info(f"[SPAWN_WITH_TASK] Step 1: Syncing tasks from fix_plan")
+    logger.info("[SPAWN_WITH_TASK] Step 1: Syncing tasks from fix_plan")
     try:
         synced_count = await sync_tasks_from_fix_plan(fix_plan_path, project)
         logger.info(f"[SPAWN_WITH_TASK] Synced {synced_count} tasks")
@@ -1483,14 +1480,14 @@ async def spawn_ralph_with_task_claim(
     )
 
     # Step 3: Generate task-specific prompt
-    logger.info(f"[SPAWN_WITH_TASK] Step 3: Generating task-specific prompt")
+    logger.info("[SPAWN_WITH_TASK] Step 3: Generating task-specific prompt")
     prompt_content = generate_task_prompt(task, fix_plan_path)
     prompt_path = get_task_prompt_path(ralph_id, task_id)
     prompt_path.write_text(prompt_content)
     logger.info(f"[SPAWN_WITH_TASK] Prompt written to: {prompt_path}")
 
     # Step 4: Register Ralph in database with config and task info
-    logger.info(f"[SPAWN_WITH_TASK] Step 4: Registering Ralph in database")
+    logger.info("[SPAWN_WITH_TASK] Step 4: Registering Ralph in database")
     try:
         await register_ralph_instance_with_config(
             ralph_id=ralph_id,
@@ -1500,13 +1497,13 @@ async def spawn_ralph_with_task_claim(
             prompt_path=str(prompt_path),
         )
         await _update_instance_task(ralph_id, task_id)
-        logger.info(f"[SPAWN_WITH_TASK] Ralph registered successfully")
+        logger.info("[SPAWN_WITH_TASK] Ralph registered successfully")
     except Exception as e:
         logger.warning(f"[SPAWN_WITH_TASK] Failed to register Ralph in database: {e}")
         # Continue anyway - spawning is more important
 
     # Step 5: Spawn Ralph with the task-specific prompt
-    logger.info(f"[SPAWN_WITH_TASK] Step 5: Spawning Ralph daemon")
+    logger.info("[SPAWN_WITH_TASK] Step 5: Spawning Ralph daemon")
     working_dir = working_dir or fix_plan_path.parent
     success, message = spawn_ralph_daemon(
         ralph_id=ralph_id,
