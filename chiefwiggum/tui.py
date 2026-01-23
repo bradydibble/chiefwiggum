@@ -149,6 +149,25 @@ from chiefwiggum.icons import (
     STYLE_TABLE_ROW_EVEN,
 )
 
+import hashlib
+import json
+
+
+def compute_data_hash(data: Any) -> str:
+    """Compute stable hash for dirty-bit detection."""
+    if hasattr(data, '__dict__'):
+        serializable = {k: str(v) for k, v in data.__dict__.items()}
+    elif isinstance(data, list):
+        serializable = [
+            {k: str(v) for k, v in item.__dict__.items()}
+            if hasattr(item, '__dict__') else str(item)
+            for item in data
+        ]
+    else:
+        serializable = str(data)
+
+    return hashlib.md5(json.dumps(serializable, sort_keys=True).encode()).hexdigest()
+
 
 def discover_fix_plan_projects(project: str | None = None) -> list[tuple[str, Path]]:
     """Discover projects by scanning for @fix_plan.md files.
@@ -341,6 +360,8 @@ class RenderState:
     previous_tasks_hash: str = ""
     previous_alerts_hash: str = ""
     previous_stats_hash: str = ""
+    previous_header_hash: str = ""
+    previous_command_bar_hash: str = ""
 
 
 @dataclass
@@ -437,6 +458,8 @@ class TUIState:
     reconcile_result: Optional[dict] = None  # Results from reconcile_completed_tasks()
     # Dirty-bit rendering state
     render_state: RenderState = field(default_factory=RenderState)
+    # Layout structure cache
+    cached_layout_structure: Optional[str] = None
 
 
 def _get_error_indicator(ralph_id: str) -> str:
@@ -1898,120 +1921,238 @@ def create_instance_dashboard_content(instance, state: TUIState, current_task, p
         text.append("  (suspended)", style="yellow")
     elif process_health["healthy"]:
         text.append(f"  {ICON_DONE}", style="green")
-    text.append("\n")
+    text.append("\n\n")
 
-    # Process Health section (skip for dead instances)
-    if not skip_health_checks:
-        text.append("\nProcess Health\n", style="bold yellow")
-        text.append("  Process: ", style="dim")
-        if process_health["healthy"]:
-            text.append(f"{process_health['state']}", style="green")
-        elif process_health["state"] == "zombie":
-            text.append("ZOMBIE (defunct)", style="red bold")
-        elif process_health["state"] == "dead":
-            text.append("NOT RUNNING", style="red")
-        else:
-            text.append(f"{process_health['state']}", style="yellow")
+    # Read status file for progress_data and HITL info
+    status = read_ralph_status(instance.ralph_id)
 
-        if process_health["pid"]:
-            text.append(f" (PID: {process_health['pid']})", style="dim")
-        if process_health["elapsed"]:
-            text.append(f" [{process_health['elapsed']}]", style="dim")
+    # === SECTION 1: HITL ALERT (highest priority) ===
+    needs_hitl = status.get("needs_human_intervention", False) if status else False
+    hitl_reason = status.get("hitl_reason") if status else None
+
+    if needs_hitl and hitl_reason:
+        text.append("━━━ NEEDS ATTENTION ━━━\n", style="bold red on yellow")
+        text.append("🚨 ", style="red bold")
+        text.append(f"{hitl_reason}\n", style="yellow bold")
+        text.append("Action required - check logs and fix issue\n", style="dim")
         text.append("\n")
 
-        # Status file staleness
-        text.append("  Status File: ", style="dim")
-        if status_staleness["stale"]:
-            text.append(f"{status_staleness['message']}", style="yellow")
-        elif status_staleness["exists"]:
-            text.append(f"{status_staleness['message']}", style="green")
-        else:
-            text.append("No status file", style="red")
+    # === SECTION 2: ERROR STATUS (show errors prominently) ===
+    error_summary = get_error_summary(instance.ralph_id)
+    if error_summary["total_errors"] > 0:
+        text.append("━━━ ERRORS DETECTED ━━━\n", style="bold red")
+
+        # Error icons mapping
+        error_icons = {
+            "permission": (ICON_ERROR_PERMISSION, "magenta"),
+            "api_error": (ICON_ERROR_API, "red"),
+            "tool_failure": (ICON_ERROR_TOOL, "yellow"),
+        }
+
+        # Show counts by category with larger text
+        for category, count in error_summary["by_category"].items():
+            icon, color = error_icons.get(category, (ICON_ERROR_GENERAL, "orange1"))
+            text.append(f"  {icon} {category.upper()}: {count} error(s)\n", style=f"{color} bold")
+
+        # Show last error time
+        if error_summary["last_error_time"]:
+            text.append(f"  Last: {error_summary['last_error_time']}\n", style="dim")
+
+        if error_summary["has_critical"]:
+            text.append("  ⚠ Critical - requires immediate attention\n", style="yellow bold")
+
+        text.append("  (Tab 3 for full details)\n", style="dim")
         text.append("\n")
 
+    # === DIAGNOSTIC INFO (only show if there are issues) ===
     # Check if stuck and show diagnosis (skip for dead instances)
     if skip_health_checks:
         is_stuck = False
         stuck_reason = ""
         activity = {"log_age_seconds": None, "is_responsive": False}
+        has_issues = True  # Dead instances always have issues
     else:
         from chiefwiggum.spawner import is_ralph_stuck, get_ralph_activity
         timeout_mins = instance.config.timeout_minutes if instance.config else 30
         is_stuck, stuck_reason = is_ralph_stuck(instance.ralph_id, timeout_mins)
         activity = get_ralph_activity(instance.ralph_id)
 
-    # Log activity indicator (only show for alive instances or if data exists)
-    if not skip_health_checks:
-        text.append("  Log Activity: ", style="dim")
-        if activity["log_age_seconds"] is not None:
-            age = activity["log_age_seconds"]
-            if age < 60:
-                text.append(f"Updated {age:.0f}s ago", style="green")
-            elif age < 300:
-                text.append(f"Updated {age/60:.1f}m ago", style="cyan")
-            else:
-                text.append(f"⚠ No updates for {age/60:.1f}m", style="yellow bold")
-        else:
-            text.append("No log file", style="dim")
-        text.append("\n")
+        # Determine if there are any health issues
+        has_issues = (
+            is_stuck or
+            not activity["is_responsive"] or
+            not process_health["healthy"] or
+            status_staleness.get("stale", False) or
+            (activity.get("log_age_seconds", 0) > 300)
+        )
 
-        # Diagnosis
-        text.append("  Diagnosis: ", style="dim")
+    # Only show diagnostic section if there are issues
+    if not skip_health_checks and has_issues:
+        text.append("━━━ DIAGNOSTICS ━━━\n", style="bold yellow")
+
+        # Show diagnosis first (most important)
         if is_stuck:
-            text.append(f"⚠ STUCK - {stuck_reason}", style="red bold")
-            text.append(" (press K to kill)", style="dim")
+            text.append(f"  🔴 STUCK: {stuck_reason}\n", style="red bold")
+            text.append("  Action: Press K to kill\n", style="dim")
         elif not activity["is_responsive"]:
-            text.append("⚠ Unresponsive", style="yellow")
+            text.append("  🟡 Unresponsive (no log activity)\n", style="yellow")
         elif not process_health["healthy"]:
-            text.append(f"⚠ Process issue: {process_health['state']}", style="yellow")
-        else:
-            text.append("OK", style="green")
+            state = process_health["state"]
+            if state == "zombie":
+                text.append("  🔴 Process is ZOMBIE (defunct)\n", style="red bold")
+            elif state == "dead":
+                text.append("  🔴 Process NOT RUNNING\n", style="red bold")
+            else:
+                text.append(f"  🟡 Process issue: {state}\n", style="yellow")
+
+        # Show log activity if stale
+        if activity.get("log_age_seconds") is not None:
+            age = activity["log_age_seconds"]
+            if age > 300:
+                text.append(f"  ⚠ No log updates for {age/60:.1f}m\n", style="yellow")
+
+        # Show process details if not healthy
+        if not process_health["healthy"] and process_health.get("pid"):
+            text.append(f"  PID: {process_health['pid']}", style="dim")
+            if process_health.get("elapsed"):
+                text.append(f" (running {process_health['elapsed']})", style="dim")
+            text.append("\n")
+
+        # Show status file staleness if an issue
+        if status_staleness.get("stale", False):
+            text.append(f"  Status file: {status_staleness['message']}\n", style="yellow")
+
         text.append("\n")
 
-    # Current Task + Time on Task with Progress Bar
-    text.append("\nCurrent Task: ", style="dim")
+    # === SECTION 3: CURRENT TASK & PROGRESS (improved display) ===
+    text.append("━━━ CURRENT TASK ━━━\n", style="bold cyan")
     if instance.current_task_id and current_task:
-        text.append(f"{current_task.task_title[:40]}\n", style="white")
+        text.append(f"  {current_task.task_title[:50]}\n", style="white bold")
+
         # Calculate time on task
         if current_task.started_at:
             elapsed = (datetime.now() - current_task.started_at).total_seconds()
+            timeout_minutes = instance.config.timeout_minutes if instance.config else 30
+            timeout_seconds = timeout_minutes * 60
+
+            # Format elapsed and remaining time
             if elapsed < 60:
                 elapsed_str = f"{int(elapsed)}s"
             elif elapsed < 3600:
                 elapsed_str = f"{int(elapsed // 60)}m {int(elapsed % 60)}s"
             else:
                 elapsed_str = f"{int(elapsed // 3600)}h {int((elapsed % 3600) // 60)}m"
-            # Warning if time > timeout/2 (default 15min)
-            timeout_minutes = instance.config.timeout_minutes if instance.config else 30
-            timeout_seconds = timeout_minutes * 60
-            warning_threshold = timeout_seconds / 2
 
-            # Progress bar
+            remaining = max(0, timeout_seconds - elapsed)
+            if remaining < 60:
+                remaining_str = f"{int(remaining)}s"
+            elif remaining < 3600:
+                remaining_str = f"{int(remaining // 60)}m"
+            else:
+                remaining_str = f"{int(remaining // 3600)}h {int((remaining % 3600) // 60)}m"
+
+            # Progress bar (larger, more prominent)
             progress = min(elapsed / timeout_seconds, 1.0)
-            bar_width = 10
+            bar_width = 20  # Doubled from 10
             filled = int(progress * bar_width)
             bar_style = "green" if progress < 0.5 else ("yellow" if progress < 0.75 else "red")
-            text.append("Time Elapsed: ", style="dim")
+
+            # Single-line time display with progress bar
+            text.append("  Time: ", style="dim")
+            text.append(f"{elapsed_str} / {timeout_minutes}m ", style="cyan bold")
             text.append("\u2588" * filled, style=bar_style)  # █ filled
             text.append("\u2591" * (bar_width - filled), style="dim")  # ░ empty
-            text.append(f" {int(progress * 100)}%\n", style=bar_style)
+            text.append(f" {int(progress * 100)}%", style=bar_style)
 
-            text.append("Time on Task: ", style="dim")
-            if elapsed > warning_threshold:
-                text.append(f"{ICON_STALE} {elapsed_str}", style="yellow bold")
-            else:
-                text.append(f"{elapsed_str}", style="cyan")
+            if remaining < 300:  # Less than 5 minutes remaining
+                text.append(f"  ({remaining_str} left)", style="yellow bold")
+
+            text.append("\n")
+
+            # Loop count + last update on same line
+            real_loop_count = status.get("loop_count", instance.loop_count) if status else instance.loop_count
+            text.append(f"  Loop: #{real_loop_count}  ", style="cyan")
+
+            # Last update time
+            if status and status.get("updated_at"):
+                try:
+                    from datetime import datetime as dt_parser
+                    updated_at = dt_parser.fromisoformat(status["updated_at"])
+                    update_age = (datetime.now() - updated_at).total_seconds()
+                    if update_age < 60:
+                        update_str = f"{int(update_age)}s ago"
+                        update_style = "green"
+                    elif update_age < 300:
+                        update_str = f"{int(update_age/60)}m ago"
+                        update_style = "cyan"
+                    else:
+                        update_str = f"{int(update_age/60)}m ago"
+                        update_style = "yellow"
+                    text.append(f"Last update: {update_str}", style=update_style)
+                except (ValueError, AttributeError):
+                    pass
+
             text.append("\n")
     else:
-        text.append("Idle\n", style="dim")
+        text.append("  Idle - waiting for task\n", style="dim")
 
-    # Loop Count - read from status file for real-time display
-    text.append("Loop Count: ", style="dim")
-    status = read_ralph_status(instance.ralph_id)
-    real_loop_count = status.get("loop_count", instance.loop_count) if status else instance.loop_count
-    text.append(f"#{real_loop_count}\n", style="cyan")
+    # === SECTION 4: PROGRESS DATA (test results) ===
+    if status and status.get("progress_data"):
+        progress_data = status["progress_data"]
+        test_results = progress_data.get("test_results")
 
-    # Token Usage - read from token tracking files
+        if test_results and test_results.get("total", 0) > 0:
+            text.append("━━━ TEST PROGRESS ━━━\n", style="bold magenta")
+
+            passed = test_results.get("passed", 0)
+            failed = test_results.get("failed", 0)
+            total = test_results.get("total", 0)
+
+            # Calculate pass percentage
+            pass_pct = (passed / total * 100) if total > 0 else 0
+
+            # Progress bar for tests
+            test_bar_width = 20
+            test_filled = int(pass_pct / 100 * test_bar_width)
+            test_bar_style = "green" if pass_pct >= 80 else ("yellow" if pass_pct >= 50 else "red")
+
+            text.append(f"  Tests: {passed}/{total} passing  ", style="white bold")
+            text.append("\u2588" * test_filled, style=test_bar_style)
+            text.append("\u2591" * (test_bar_width - test_filled), style="dim")
+            text.append(f" {int(pass_pct)}%\n", style=test_bar_style)
+
+            if failed > 0:
+                text.append(f"  ⚠ {failed} test(s) failing", style="yellow bold")
+
+                # Check stuck indicators
+                stuck_indicators = progress_data.get("stuck_indicators", {})
+                same_failures = stuck_indicators.get("same_test_failures", 0)
+                if same_failures >= 3:
+                    text.append(f" (stuck {same_failures}x)", style="red bold")
+
+                text.append("\n")
+
+            # Show timestamp
+            if test_results.get("timestamp"):
+                try:
+                    from datetime import datetime as dt_parser
+                    test_time = dt_parser.fromisoformat(test_results["timestamp"])
+                    test_age = (datetime.now() - test_time).total_seconds()
+                    if test_age < 60:
+                        time_str = f"{int(test_age)}s ago"
+                    elif test_age < 3600:
+                        time_str = f"{int(test_age/60)}m ago"
+                    else:
+                        time_str = f"{int(test_age/3600)}h ago"
+                    text.append(f"  Last test run: {time_str}\n", style="dim")
+                except (ValueError, AttributeError):
+                    pass
+
+            text.append("\n")
+
+    text.append("\n")
+
+    # === TOKEN USAGE (only show if critical - 60%+ or error reading) ===
     if instance.project:
         project_dir = Path.home() / "claudecode" / instance.project
         token_usage_file = project_dir / ".token_usage"
@@ -2023,82 +2164,54 @@ def create_instance_dashboard_content(instance, state: TUIState, current_task, p
                 pct = token_pct_file.read_text().strip()
                 pct_int = int(pct)
 
-                # Color code by percentage
-                if pct_int >= 80:
-                    token_color = "red"
-                elif pct_int >= 60:
-                    token_color = "yellow"
-                else:
-                    token_color = "green"
+                # Only show if usage is >= 60% (yellow/red zone)
+                if pct_int >= 60:
+                    text.append("━━━ TOKEN USAGE ━━━\n", style="bold yellow")
 
-                text.append("Tokens: ", style="dim")
-                text.append(f"~{tokens} ({pct}%)\n", style=token_color)
+                    # Color code by percentage
+                    if pct_int >= 80:
+                        token_color = "red"
+                        warning = " ⚠ HIGH - session reset soon"
+                    elif pct_int >= 60:
+                        token_color = "yellow"
+                        warning = ""
+                    else:
+                        token_color = "green"
+                        warning = ""
+
+                    text.append(f"  ~{tokens} tokens ({pct}%){warning}\n", style=token_color)
+                    text.append("\n")
             except (ValueError, IOError):
                 pass  # Silently skip if files are unreadable
 
-    # Activity message from status file (read fresh on every render)
+    # === SECTION 5: ACTIVITY & HEALTH ===
+    text.append("━━━ ACTIVITY ━━━\n", style="bold yellow")
+
+    # Activity message from status file
     if status and status.get("message"):
-        text.append("Activity: ", style="dim")
-        text.append(f"{status['message'][:50]}\n", style="white")
+        text.append(f"  {status['message'][:60]}\n", style="white")
+    else:
+        text.append("  No recent activity\n", style="dim")
 
-    text.append("\n")
-
-    # Health Indicators
-    text.append("Health\n", style="bold yellow")
+    # Success rate on same line as tasks
     total_tasks = instance.tasks_completed + instance.tasks_failed
     if total_tasks > 0:
         success_rate = (instance.tasks_completed / total_tasks) * 100
-        text.append("  Success Rate: ", style="dim")
         rate_style = "green" if success_rate >= 80 else ("yellow" if success_rate >= 50 else "red")
-        text.append(f"{success_rate:.0f}% ({instance.tasks_completed}/{total_tasks})\n", style=rate_style)
+        text.append(f"  Tasks: {instance.tasks_completed} completed, {instance.tasks_failed} failed  ", style="dim")
+        text.append(f"({success_rate:.0f}% success)\n", style=rate_style)
     else:
-        text.append("  Success Rate: ", style="dim")
-        text.append("N/A\n", style="dim")
-
-    # Tasks/hour
-    if instance.started_at:
-        hours_running = max(0.1, (datetime.now() - instance.started_at).total_seconds() / 3600)
-        tasks_per_hour = instance.tasks_completed / hours_running
-        text.append("  Tasks/Hour: ", style="dim")
-        text.append(f"{tasks_per_hour:.1f}\n", style="cyan")
+        text.append("  Tasks: None completed yet\n", style="dim")
 
     # Failure streak warning
     if state.instance_failure_streak >= 3:
-        text.append("  Streak: ", style="dim")
-        text.append(f"⚠ {state.instance_failure_streak} consecutive failures\n", style="red bold")
-    elif state.instance_failure_streak > 0:
-        text.append("  Streak: ", style="dim")
-        text.append(f"{state.instance_failure_streak} failure(s)\n", style="yellow")
+        text.append(f"  ⚠ {state.instance_failure_streak} consecutive failures\n", style="red bold")
 
-    # Error Status section - show Claude Code-specific errors
-    error_summary = get_error_summary(instance.ralph_id)
-    if error_summary["total_errors"] > 0:
-        text.append("\nError Status", style="bold red")
-        if error_summary["has_critical"]:
-            text.append(" ⚠ needs attention", style="yellow bold")
-        text.append("\n")
-
-        # Error icons mapping
-        error_icons = {
-            "permission": (ICON_ERROR_PERMISSION, "magenta"),
-            "api_error": (ICON_ERROR_API, "red"),
-            "tool_failure": (ICON_ERROR_TOOL, "yellow"),
-        }
-
-        # Show counts by category on one line
-        text.append("  ", style="dim")
-        for category, count in error_summary["by_category"].items():
-            icon, color = error_icons.get(category, (ICON_ERROR_GENERAL, "orange1"))
-            text.append(f"{icon} {category}:{count}  ", style=color)
-        text.append("\n")
-
-        # Show last error time
-        if error_summary["last_error_time"]:
-            text.append("  Last error: ", style="dim")
-            text.append(f"{error_summary['last_error_time']}\n", style="dim")
-
-        # Show hint to view errors tab
-        text.append("  (Tab 3 for details)\n", style="dim")
+    # Tasks/hour
+    if instance.started_at and total_tasks > 0:
+        hours_running = max(0.1, (datetime.now() - instance.started_at).total_seconds() / 3600)
+        tasks_per_hour = instance.tasks_completed / hours_running
+        text.append(f"  Rate: {tasks_per_hour:.1f} tasks/hour\n", style="cyan")
 
     text.append("\n")
 
@@ -2837,6 +2950,11 @@ async def update_dashboard(layout: Layout, state: TUIState) -> None:
     # Get progress data for all running instances
     progress_data = get_all_instance_progress()
 
+    # Compute base data hashes for dirty-bit detection
+    instances_base_hash = compute_data_hash(all_instances)
+    tasks_base_hash = compute_data_hash(all_tasks)
+    alerts_hash = compute_data_hash(state.alerts)
+
     # Get display data based on filters (use state.instances which respects flag)
     instances = state.instances
 
@@ -2874,8 +2992,21 @@ async def update_dashboard(layout: Layout, state: TUIState) -> None:
     # Store tasks for bulk mode and detail view
     state.all_tasks_cache = tasks
 
-    # Update header with branding and spinner
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    # Compute display hashes including all state that affects rendering
+    instances_display_hash = f"{instances_base_hash}:{state.show_all_instances}:{state.project_filter}:{state.selected_instance_idx}"
+    tasks_display_hash = f"{tasks_base_hash}:{state.show_all_tasks}:{state.project_filter}:{state.sort_order}:{state.task_scroll_offset}:{state.selected_task_idx}:{state.bulk_mode_active}:{len(state.selected_task_ids)}"
+
+    # Check if display state actually changed
+    instances_changed = instances_display_hash != state.render_state.previous_instances_hash
+    tasks_changed = tasks_display_hash != state.render_state.previous_tasks_hash
+    alerts_changed = alerts_hash != state.render_state.previous_alerts_hash
+
+    # Update stored hashes
+    state.render_state.previous_instances_hash = instances_display_hash
+    state.render_state.previous_tasks_hash = tasks_display_hash
+    state.render_state.previous_alerts_hash = alerts_hash
+
+    # Update header with branding (only when state changes)
     running_count = len(get_running_ralphs())
 
     # Count actively working instances for contextual spinner
@@ -2884,58 +3015,121 @@ async def update_dashboard(layout: Layout, state: TUIState) -> None:
         if i.status == RalphInstanceStatus.ACTIVE and i.current_task_id
     )
 
-    # Build header text with branding and version (with subtle background)
-    from chiefwiggum._version import __version__
-    header_text = Text()
-    header_text.append(" ", style=f"on {BG_HEADER}")
-    header_text.append(" CHIEF", style=f"bold {COLOR_ACCENT} on {BG_HEADER}")
-    header_text.append("WIGGUM ", style=f"bold white on {BG_HEADER}")
-    header_text.append(f"v{__version__} ", style=f"{COLOR_MUTED} on {BG_HEADER}")
-    header_text.append(f"   {now}  ", style=f"dim on {BG_HEADER}")
+    # Compute header hash (excluding timestamp to reduce flicker)
+    header_state = f"{running_count}:{active_working}"
 
-    # Daemon count with icon and contextual spinner
-    if running_count > 0:
-        # Use bars spinner when actively working, braille otherwise
-        if active_working > 0:
-            spinner_idx = int(time.time() * 6) % len(SPINNER_BARS)
-            header_text.append(f" {SPINNER_BARS[spinner_idx]} ", style=f"bold {COLOR_SUCCESS} on {BG_HEADER}")
+    if header_state != state.render_state.previous_header_hash:
+        # Build header text with branding and version (with subtle background)
+        from chiefwiggum._version import __version__
+        header_text = Text()
+        header_text.append(" ", style=f"on {BG_HEADER}")
+        header_text.append(" CHIEF", style=f"bold {COLOR_ACCENT} on {BG_HEADER}")
+        header_text.append("WIGGUM ", style=f"bold white on {BG_HEADER}")
+        header_text.append(f"v{__version__} ", style=f"{COLOR_MUTED} on {BG_HEADER}")
+
+        # Daemon count with icon and static status indicator
+        if running_count > 0:
+            # Use static icon based on activity
+            if active_working > 0:
+                header_text.append(" ⚡ ", style=f"bold {COLOR_SUCCESS} on {BG_HEADER}")
+            else:
+                header_text.append(" ● ", style=f"grey50 on {BG_HEADER}")
+            header_text.append(f"{ICON_DAEMON} {running_count}", style=f"bold {COLOR_SUCCESS} on {BG_HEADER}")
         else:
-            spinner_idx = int(time.time() * 4) % len(SPINNER)
-            header_text.append(f" {SPINNER[spinner_idx]} ", style=f"grey50 on {BG_HEADER}")
-        header_text.append(f"{ICON_DAEMON} {running_count}", style=f"bold {COLOR_SUCCESS} on {BG_HEADER}")
-    else:
-        header_text.append(f"{ICON_DAEMON} 0", style=f"dim on {BG_HEADER}")
-    header_text.append(" daemons ", style=f"dim on {BG_HEADER}")
+            header_text.append(f"{ICON_DAEMON} 0", style=f"dim on {BG_HEADER}")
+        header_text.append(" daemons ", style=f"dim on {BG_HEADER}")
 
-    header = Panel(
-        header_text,
-        style=COLOR_ACCENT,
-        box=box.ROUNDED,
-    )
-    layout["header"].update(header)
+        header = Panel(
+            header_text,
+            style=COLOR_ACCENT,
+            box=box.ROUNDED,
+        )
+        layout["header"].update(header)
+        state.render_state.previous_header_hash = header_state
 
-    # Update stats (reuse all_tasks fetched at start)
-    layout["stats"].update(create_stats_panel(state.all_instances, all_tasks, state))
+    # Update stats (reuse all_tasks fetched at start) - only if data changed
+    # Compute stats hash
+    stats_summary = f"{running_count}:{len(state.all_instances)}:{len(all_tasks)}"
+    stats_hash = compute_data_hash(stats_summary)
 
-    # Update alerts panel if it exists in layout and there are alerts
-    alerts_panel = create_alerts_panel(state)
-    try:
-        if alerts_panel:
-            layout["alerts"].update(alerts_panel)
-        else:
-            # No alerts - show an empty panel
-            layout["alerts"].update(Panel("", height=3, border_style="dim"))
-    except KeyError:
-        pass  # Layout doesn't have alerts section
+    if stats_hash != state.render_state.previous_stats_hash:
+        layout["stats"].update(create_stats_panel(state.all_instances, all_tasks, state))
+        state.render_state.previous_stats_hash = stats_hash
 
-    # Check for overlay modes - must unsplit first to clear child layouts
+    # Update alerts panel if it exists in layout and there are alerts - only if changed
+    if alerts_changed:
+        alerts_panel = create_alerts_panel(state)
+        try:
+            if alerts_panel:
+                layout["alerts"].update(alerts_panel)
+            else:
+                # No alerts - show an empty panel
+                layout["alerts"].update(Panel("", height=3, border_style="dim"))
+        except KeyError:
+            pass  # Layout doesn't have alerts section
+
+    # Determine required layout structure based on mode
     if state.mode == TUIMode.HELP:
+        required_structure = "help"
+    elif state.mode == TUIMode.STATS:
+        required_structure = "stats"
+    elif state.mode == TUIMode.ERROR_DETAIL:
+        required_structure = "error_detail"
+    elif state.mode in (TUIMode.SPAWN_PROJECT, TUIMode.SPAWN_PRIORITY, TUIMode.SPAWN_CATEGORY, TUIMode.SPAWN_MODEL, TUIMode.SPAWN_SESSION, TUIMode.SPAWN_CONFIRM):
+        required_structure = "spawn"
+    elif state.mode == TUIMode.LOG_VIEW:
+        required_structure = "log_view"
+    elif state.mode == TUIMode.HISTORY:
+        required_structure = "history"
+    elif state.mode == TUIMode.CONFIRM_BULK_STOP:
+        required_structure = "confirm_bulk_stop"
+    elif state.mode == TUIMode.CONFIRM_BULK_PAUSE:
+        required_structure = "confirm_bulk_pause"
+    elif state.mode == TUIMode.RECONCILE:
+        required_structure = "reconcile"
+    elif state.mode == TUIMode.CLEANUP_CONFIRM:
+        required_structure = "cleanup"
+    elif state.mode in (TUIMode.SETTINGS, TUIMode.SETTINGS_EDIT_API_KEY, TUIMode.SETTINGS_EDIT_MAX_RALPHS,
+                        TUIMode.SETTINGS_EDIT_MODEL, TUIMode.SETTINGS_EDIT_TIMEOUT,
+                        TUIMode.SETTINGS_EDIT_PERMISSIONS, TUIMode.SETTINGS_EDIT_STRATEGY,
+                        TUIMode.SETTINGS_EDIT_AUTO_SPAWN, TUIMode.SETTINGS_EDIT_RALPH_LOOP):
+        required_structure = "settings"
+    elif state.mode == TUIMode.SEARCH:
+        required_structure = "search"
+    elif state.mode == TUIMode.TASK_DETAIL:
+        required_structure = "task_detail"
+    elif state.mode == TUIMode.BULK_ACTION:
+        required_structure = "bulk_action"
+    elif state.mode == TUIMode.LOG_STREAM:
+        required_structure = "log_stream"
+    elif state.mode == TUIMode.INSTANCE_DETAIL:
+        required_structure = "instance_detail"
+    elif state.mode == TUIMode.INSTANCE_ERROR_DETAIL:
+        required_structure = "instance_error_detail"
+    elif state.view_focus == ViewFocus.TASKS:
+        required_structure = "tasks_only"
+    elif state.view_focus == ViewFocus.INSTANCES:
+        required_structure = "instances_only"
+    else:
+        required_structure = "split"
+
+    # Only rebuild layout structure if it changed
+    if state.cached_layout_structure != required_structure:
         layout["main"].unsplit()
+        # Create split structure immediately if needed
+        if required_structure == "split":
+            layout["main"].split_row(
+                Layout(name="instances"),
+                Layout(name="tasks"),
+            )
+        state.cached_layout_structure = required_structure
+
+    # Check for overlay modes
+    if state.mode == TUIMode.HELP:
         # Calculate visible lines (main area ~height - header - stats - command_bar - padding)
         visible_lines = max(10, state.console_width // 4)  # Rough estimate based on width
         layout["main"].update(create_help_panel(state.help_scroll_offset, visible_lines))
     elif state.mode == TUIMode.STATS:
-        layout["main"].unsplit()
         # Create detailed stats panel
         stats = await get_system_stats()
         text = Text()
@@ -2972,63 +3166,50 @@ async def update_dashboard(layout: Layout, state: TUIState) -> None:
         layout["main"].update(Panel(text, title="Statistics", border_style=BORDER_OVERLAY, box=box.DOUBLE, padding=(1, 2)))
 
     elif state.mode == TUIMode.ERROR_DETAIL:
-        layout["main"].unsplit()
         task = state.failed_tasks[state.selected_task_idx] if state.failed_tasks else None
         layout["main"].update(create_error_detail_panel(task, state))
 
     elif state.mode in (TUIMode.SPAWN_PROJECT, TUIMode.SPAWN_PRIORITY, TUIMode.SPAWN_CATEGORY, TUIMode.SPAWN_MODEL, TUIMode.SPAWN_SESSION, TUIMode.SPAWN_CONFIRM):
-        layout["main"].unsplit()
         layout["main"].update(create_spawn_panel(state))
 
     elif state.mode == TUIMode.LOG_VIEW:
-        layout["main"].unsplit()
         layout["main"].update(create_log_view_panel(state))
 
     elif state.mode == TUIMode.HISTORY:
-        layout["main"].unsplit()
         # Load history data
         state.history_tasks = await list_task_history(project=state.project_filter, limit=50)
         layout["main"].update(create_history_panel(state))
 
     elif state.mode == TUIMode.CONFIRM_BULK_STOP:
-        layout["main"].unsplit()
         count = len(state.instances)
         layout["main"].update(create_confirm_panel("STOP ALL Ralphs", count))
 
     elif state.mode == TUIMode.CONFIRM_BULK_PAUSE:
-        layout["main"].unsplit()
         count = len([i for i in state.instances if i.status == RalphInstanceStatus.ACTIVE])
         layout["main"].update(create_confirm_panel("PAUSE ALL Ralphs", count))
 
     elif state.mode == TUIMode.RECONCILE:
-        layout["main"].unsplit()
         layout["main"].update(create_reconcile_panel(state.reconcile_result))
 
     elif state.mode == TUIMode.CLEANUP_CONFIRM:
-        layout["main"].unsplit()
         layout["main"].update(await create_cleanup_panel())
 
     elif state.mode in (TUIMode.SETTINGS, TUIMode.SETTINGS_EDIT_API_KEY, TUIMode.SETTINGS_EDIT_MAX_RALPHS,
                         TUIMode.SETTINGS_EDIT_MODEL, TUIMode.SETTINGS_EDIT_TIMEOUT,
                         TUIMode.SETTINGS_EDIT_PERMISSIONS, TUIMode.SETTINGS_EDIT_STRATEGY,
                         TUIMode.SETTINGS_EDIT_AUTO_SPAWN, TUIMode.SETTINGS_EDIT_RALPH_LOOP):
-        layout["main"].unsplit()
         layout["main"].update(create_settings_panel(state))
 
     elif state.mode == TUIMode.SEARCH:
-        layout["main"].unsplit()
         layout["main"].update(create_search_panel(state))
 
     elif state.mode == TUIMode.TASK_DETAIL:
-        layout["main"].unsplit()
         layout["main"].update(create_task_detail_panel(state.selected_task, state))
 
     elif state.mode == TUIMode.BULK_ACTION:
-        layout["main"].unsplit()
         layout["main"].update(create_bulk_action_panel(state))
 
     elif state.mode == TUIMode.LOG_STREAM:
-        layout["main"].unsplit()
         # Refresh log content for streaming
         if state.instances and state.selected_instance_idx < len(state.instances):
             ralph_id = state.instances[state.selected_instance_idx].ralph_id
@@ -3036,7 +3217,6 @@ async def update_dashboard(layout: Layout, state: TUIState) -> None:
         layout["main"].update(create_log_stream_panel(state))
 
     elif state.mode == TUIMode.INSTANCE_DETAIL:
-        layout["main"].unsplit()
         # Load instance detail data only when first entering or explicitly refreshed
         if state.instances and state.selected_instance_idx < len(state.instances):
             instance = state.instances[state.selected_instance_idx]
@@ -3090,7 +3270,6 @@ async def update_dashboard(layout: Layout, state: TUIState) -> None:
             state.mode = TUIMode.NORMAL
 
     elif state.mode == TUIMode.INSTANCE_ERROR_DETAIL:
-        layout["main"].unsplit()
         layout["main"].update(create_instance_error_detail_overlay(state))
 
     else:
@@ -3109,8 +3288,7 @@ async def update_dashboard(layout: Layout, state: TUIState) -> None:
         show_task_numbers = state.mode == TUIMode.RELEASE
 
         if state.view_focus == ViewFocus.TASKS:
-            # Tasks only - full width (must unsplit first)
-            layout["main"].unsplit()
+            # Tasks only - full width
             layout["main"].update(
                 Panel(
                     create_tasks_table(
@@ -3127,18 +3305,20 @@ async def update_dashboard(layout: Layout, state: TUIState) -> None:
                 )
             )
         elif state.view_focus == ViewFocus.INSTANCES:
-            # Instances only - full width (must unsplit first)
-            layout["main"].unsplit()
+            # Instances only - full width
             layout["main"].update(
                 Panel(create_instances_table(instances, state.show_all_instances, selected_idx=state.selected_instance_idx, progress_data=progress_data), border_style=BORDER_INSTANCES)
             )
         else:
             # Both - split view (default)
-            layout["main"].split_row(
-                Layout(name="instances"),
-                Layout(name="tasks"),
+            # Split structure already created by layout caching logic above
+            # Always update split view panels (main content area)
+            # The dirty checking is more effective for header/stats/alerts which update less frequently
+            layout["main"]["instances"].update(
+                Panel(create_instances_table(instances, state.show_all_instances,
+                      selected_idx=state.selected_instance_idx, progress_data=progress_data),
+                      border_style=BORDER_INSTANCES)
             )
-            layout["main"]["instances"].update(Panel(create_instances_table(instances, state.show_all_instances, selected_idx=state.selected_instance_idx, progress_data=progress_data), border_style=BORDER_INSTANCES))
             layout["main"]["tasks"].update(
                 Panel(
                     create_tasks_table(
@@ -3154,8 +3334,12 @@ async def update_dashboard(layout: Layout, state: TUIState) -> None:
                 )
             )
 
-    # Update command bar
-    layout["command_bar"].update(create_command_bar(state, state.console_width))
+    # Update command bar (only when relevant state changes)
+    command_bar_state = f"{state.mode}:{state.status_message}:{state.view_focus}"
+
+    if command_bar_state != state.render_state.previous_command_bar_hash:
+        layout["command_bar"].update(create_command_bar(state, state.console_width))
+        state.render_state.previous_command_bar_hash = command_bar_state
 
 
 def handle_normal_mode(key: str, state: TUIState, tasks_count: int = 0) -> bool:
@@ -4405,7 +4589,7 @@ def run_tui(debug: bool = False):
     try:
         keyboard.start()
 
-        with Live(layout, console=console, refresh_per_second=10, screen=True) as live:
+        with Live(layout, console=console, refresh_per_second=4, screen=True) as live:
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
 
@@ -4430,7 +4614,6 @@ def run_tui(debug: bool = False):
                         break
                     # Refresh display after command
                     loop.run_until_complete(update_dashboard(layout, state))
-                    live.refresh()
 
                 # Refresh data every 2 seconds
                 current_time = time.time()
@@ -4438,11 +4621,10 @@ def run_tui(debug: bool = False):
                     # Update console width for responsive layout (handles terminal resize)
                     state.console_width = console.width
                     loop.run_until_complete(update_dashboard(layout, state))
-                    live.refresh()
                     last_data_refresh = current_time
 
-                # Small sleep to prevent busy-waiting
-                time.sleep(0.05)
+                # Small sleep to prevent busy-waiting (10 Hz, matches keyboard listener)
+                time.sleep(0.1)
 
             # Check if there are running daemons on exit
             running = get_running_ralphs()
