@@ -394,7 +394,7 @@ analyze_response() {
 
             if [[ $age_minutes -le 5 ]]; then
                 # Pattern 1: Task-N, Task #N, task-N (with optional - or # and space)
-                if [[ "$last_commit_msg" =~ [Tt]ask-([0-9]+) ]] || [[ "$last_commit_msg" =~ [Tt]ask\ \#([0-9]+) ]] || [[ "$last_commit_msg" =~ [Tt]ask\ ([0-9]+) ]]; then
+                if [[ "$last_commit_msg" =~ [Tt]ask-([0-9]+) ]] || [[ "$last_commit_msg" =~ [Tt]ask\ #([0-9]+) ]] || [[ "$last_commit_msg" =~ [Tt]ask\ ([0-9]+) ]]; then
                     local task_num="${BASH_REMATCH[1]}"
                     completed_task_id="task-${task_num}"
                     completed_commit_sha="$last_commit_sha"
