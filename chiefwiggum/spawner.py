@@ -798,7 +798,7 @@ def detect_hitl_needed(ralph_id: str) -> tuple[bool, str | None]:
 def check_task_completion(ralph_id: str) -> tuple[str | None, str | None, str | None]:
     """Check if Ralph has signaled task completion.
 
-    Scans Ralph's log for TASK_COMPLETE or TASK_FAILED markers.
+    Scans Ralph's log for TASK_COMPLETE, TASK_FAILED markers, or RALPH_STATUS blocks.
 
     Returns:
         Tuple of (completed_task_id, failure_reason, commit_sha) - all None if no completion
@@ -815,8 +815,35 @@ def check_task_completion(ralph_id: str) -> tuple[str | None, str | None, str | 
             f.seek(max(0, size - 50000))  # Read last 50KB
             content = f.read()
 
-        # Check for completion marker
+        # Check for new RALPH_STATUS block format (preferred)
         import re
+        status_block_match = re.search(
+            r"---RALPH_STATUS---.*?---END_RALPH_STATUS---",
+            content,
+            re.DOTALL
+        )
+        if status_block_match:
+            block = status_block_match.group(0)
+
+            # Extract individual fields from the block
+            status_match = re.search(r"STATUS:\s*(\w+)", block)
+            task_id_match = re.search(r"TASK_ID:\s*(\S+)", block)
+            commit_match = re.search(r"COMMIT:\s*([a-fA-F0-9]{7,40})", block)
+
+            if status_match and task_id_match:
+                status = status_match.group(1)
+                task_id = task_id_match.group(1)
+                commit_sha = commit_match.group(1) if commit_match else None
+
+                if status == "COMPLETE":
+                    return (task_id, None, commit_sha)
+                elif status == "FAILED":
+                    # Try to extract failure reason from the block
+                    reason_match = re.search(r"REASON:\s*(.+)", block)
+                    reason = reason_match.group(1).strip() if reason_match else "Task failed"
+                    return (task_id, reason, None)
+
+        # Fallback: Check for old-style completion marker
         complete_match = re.search(r"TASK_COMPLETE:\s*(\S+)", content)
         if complete_match:
             task_id = complete_match.group(1)
@@ -825,7 +852,7 @@ def check_task_completion(ralph_id: str) -> tuple[str | None, str | None, str | 
             commit_sha = commit_match.group(1) if commit_match else None
             return (task_id, None, commit_sha)
 
-        # Check for failure marker
+        # Fallback: Check for old-style failure marker
         fail_match = re.search(r"TASK_FAILED:\s*(\S+)\s*\nREASON:\s*(.+)", content)
         if fail_match:
             return (fail_match.group(1), fail_match.group(2), None)
