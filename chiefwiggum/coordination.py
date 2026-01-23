@@ -485,6 +485,35 @@ async def complete_task(
         await conn.close()
 
 
+async def archive_task(task_id: str) -> bool:
+    """Mark a completed task as archived (no longer in @fix_plan.md).
+
+    This is used for tasks that were completed but removed from @fix_plan.md.
+    Archived tasks are excluded from reconciliation to prevent failures.
+
+    Args:
+        task_id: ID of the task to archive
+
+    Returns:
+        True if task was archived, False if not found or not completed
+    """
+    conn = await get_connection()
+    try:
+        now = datetime.now()
+        cursor = await conn.execute(
+            """UPDATE task_claims
+               SET status = ?,
+                   updated_at = ?
+               WHERE task_id = ?
+                 AND status = 'completed'""",
+            (TaskClaimStatus.ARCHIVED.value, now, task_id)
+        )
+        await conn.commit()
+        return cursor.rowcount > 0
+    finally:
+        await conn.close()
+
+
 async def update_fix_plan_on_completion(task_id: str, project: str | None = None) -> bool:
     """Update @fix_plan.md when a task completes in the database.
 
@@ -2208,7 +2237,8 @@ async def get_system_stats() -> SystemStats:
                    SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as pending,
                    SUM(CASE WHEN status = 'in_progress' THEN 1 ELSE 0 END) as in_progress,
                    SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed,
-                   SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed
+                   SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed,
+                   SUM(CASE WHEN status = 'archived' THEN 1 ELSE 0 END) as archived
                FROM task_claims"""
         )
         task_row = await cursor.fetchone()
@@ -2250,6 +2280,7 @@ async def get_system_stats() -> SystemStats:
             in_progress_tasks=task_row[2] or 0,
             completed_tasks=task_row[3] or 0,
             failed_tasks=task_row[4] or 0,
+            archived_tasks=task_row[5] or 0,
             active_instances=inst_row[0] or 0,
             idle_instances=inst_row[1] or 0,
             tasks_per_hour=tasks_per_hour,
@@ -3198,7 +3229,7 @@ async def reconcile_completed_tasks(
     }
 
     try:
-        # Query all completed tasks
+        # Query all completed tasks (archived tasks have status='archived', not included here)
         conn = await get_connection()
         try:
             query = "SELECT * FROM task_claims WHERE status = 'completed'"

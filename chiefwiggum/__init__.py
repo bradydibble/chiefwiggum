@@ -19,6 +19,7 @@ from chiefwiggum.coordination import (
     # Task operations
     claim_task,
     complete_task,
+    archive_task,
     extend_claim,
     fail_task,
     release_claim,
@@ -99,6 +100,7 @@ __all__ = [
     # Task operations
     "claim_task",
     "complete_task",
+    "archive_task",
     "extend_claim",
     "fail_task",
     "release_claim",

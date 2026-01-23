@@ -27,6 +27,7 @@ class TaskClaimStatus(str, Enum):
     FAILED = "failed"
     RELEASED = "released"
     RETRY_PENDING = "retry_pending"  # Waiting for auto-retry
+    ARCHIVED = "archived"  # Completed tasks no longer in @fix_plan.md
 
 
 class RalphInstanceStatus(str, Enum):
@@ -211,6 +212,7 @@ class SystemStats(BaseModel):
     in_progress_tasks: int = 0
     completed_tasks: int = 0
     failed_tasks: int = 0
+    archived_tasks: int = 0  # Completed tasks no longer in @fix_plan.md
     active_instances: int = 0
     idle_instances: int = 0
     tasks_per_hour: float = 0.0

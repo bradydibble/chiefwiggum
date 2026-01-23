@@ -12,6 +12,7 @@ import click
 
 from chiefwiggum import (
     __version__,
+    archive_task,
     claim_task,
     complete_task,
     export_task_history_csv,
@@ -116,6 +117,7 @@ def status(project: str | None, show_all: bool):
                 "failed": "red",
                 "released": "dim",
                 "retry_pending": "magenta",
+                "archived": "dim",
             }.get(task.status.value, "white")
 
             table.add_row(
@@ -186,6 +188,7 @@ def list_tasks(project: str | None, show_all: bool, output_format: str):
             "failed": "red",
             "released": "dim",
             "retry_pending": "magenta",
+            "archived": "dim",
         }.get(task.status.value, "white")
 
         table.add_row(
@@ -369,6 +372,35 @@ def mark_complete_command(task_id: str, commit: str | None, ralph_id: str | None
         console.print("  - Task doesn't exist")
         console.print("  - Task is not in 'in_progress' status")
         console.print("  - Task is not claimed by the specified Ralph")
+        console.print("\n[dim]Check task status with: wig list --all[/dim]")
+
+
+@main.command("archive-task")
+@click.argument("task_id")
+def archive_task_command(task_id: str):
+    """Archive a completed task that's no longer in @fix_plan.md.
+
+    Use this command to mark completed tasks as archived when they've been
+    removed from @fix_plan.md. Archived tasks won't appear in reconciliation
+    and won't cause reconciliation failures.
+
+    Examples:
+        wig archive-task task-21-google-drive-integration
+        wig archive-task task-35-pf-1-timezone-to-pacific
+    """
+    from rich.console import Console
+
+    console = Console()
+    run_async(init_db())
+
+    success = run_async(archive_task(task_id))
+
+    if success:
+        console.print(f"[green]✅ Task {task_id} archived[/green]")
+        console.print("[dim]Task will no longer appear in reconciliation[/dim]")
+    else:
+        console.print(f"[red]❌ Failed to archive task {task_id}[/red]")
+        console.print("[dim]Task must exist and be in 'completed' status[/dim]")
         console.print("\n[dim]Check task status with: wig list --all[/dim]")
 
 

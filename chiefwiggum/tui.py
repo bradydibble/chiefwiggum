@@ -3141,6 +3141,8 @@ async def update_dashboard(layout: Layout, state: TUIState) -> None:
         text.append(f"  In Progress: {stats.in_progress_tasks}\n", style="blue")
         text.append(f"  Completed:   {stats.completed_tasks}\n", style="green")
         text.append(f"  Failed:      {stats.failed_tasks}\n", style="red")
+        if stats.archived_tasks > 0:
+            text.append(f"  Archived:    {stats.archived_tasks}\n", style="dim")
 
         text.append("\nPerformance\n", style="bold yellow")
         text.append(f"  Tasks/Hour:  {stats.tasks_per_hour:.1f}\n")

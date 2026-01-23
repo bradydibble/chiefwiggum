@@ -1,275 +1,96 @@
-# Ralph Loop "Dying" Bug - Implementation Summary
+# Implementation Summary: Handle Orphaned Completed Tasks
 
-## Status: ✅ COMPLETE
+## Overview
+Successfully implemented the ARCHIVED status to handle completed tasks that have been removed from @fix_plan.md. This prevents reconciliation failures for orphaned tasks.
 
-All three bugs from the investigation plan have been fixed.
+## Changes Made
 
----
+### 1. Added ARCHIVED Status to TaskClaimStatus Enum
+**File**: `chiefwiggum/models.py`
+- Added `ARCHIVED = "archived"` to the `TaskClaimStatus` enum
+- Added comment: "Completed tasks no longer in @fix_plan.md"
 
-## Bug #1: Task Continuation (CRITICAL) - ✅ FIXED
+### 2. Updated SystemStats Model
+**File**: `chiefwiggum/models.py`
+- Added `archived_tasks: int = 0` field to `SystemStats` class
+- Added comment: "Completed tasks no longer in @fix_plan.md"
 
-### Problem
-Ralphs stopped after completing ONE task instead of automatically claiming the next task from the queue.
+### 3. Updated get_system_stats Function
+**File**: `chiefwiggum/coordination.py`
+- Modified SQL query to count archived tasks
+- Added `SUM(CASE WHEN status = 'archived' THEN 1 ELSE 0 END) as archived` to query
+- Updated SystemStats constructor to include `archived_tasks=task_row[5] or 0`
 
-### Root Cause
-The task continuation logic at lines 1291-1328 in `ralph_loop.sh` used `continue` and `break` statements inside the `execute_claude_code()` function. These statements don't work across function boundaries - they only affect loops in the current function, not the calling function's loop.
+### 4. Updated Reconciliation Function
+**File**: `chiefwiggum/coordination.py`
+- Updated comment in `reconcile_completed_tasks()` to clarify that archived tasks are excluded
+- Comment now reads: "Query all completed tasks (archived tasks have status='archived', not included here)"
+- No SQL changes needed - archived tasks naturally excluded by status filter
 
-### Solution Implemented
+### 5. Created archive_task Function
+**File**: `chiefwiggum/coordination.py`
+- New async function: `archive_task(task_id: str) -> bool`
+- Marks completed tasks as archived
+- Only archives tasks with status='completed'
+- Returns True if successful, False otherwise
 
-#### Changes to ralph_loop.sh:
+### 6. Exported archive_task Function
+**File**: `chiefwiggum/__init__.py`
+- Added `archive_task` to imports from coordination
+- Added `archive_task` to `__all__` list for public API
 
-1. **Line 1316**: Changed `continue` to `return 4`
-   - Signals main loop: "task complete, next task claimed, continue loop"
+### 7. Added archive-task CLI Command
+**File**: `chiefwiggum/cli.py`
+- New command: `wig archive-task <task_id>`
+- Archives a completed task that's no longer in @fix_plan.md
+- Provides helpful success/failure messages
+- Includes usage examples in help text
 
-2. **Line 1320**: Changed `break` to `return 5`
-   - Signals main loop: "failed to generate prompt, exit loop"
+### 8. Updated CLI Status Display
+**File**: `chiefwiggum/cli.py`
+- Added "archived": "dim" to status_style mappings (2 locations)
+- Archived tasks now display in dim color in CLI output
 
-3. **Line 1327**: Changed `break` to `return 6`
-   - Signals main loop: "no more tasks, exit gracefully"
+### 9. Updated TUI Statistics Display
+**File**: `chiefwiggum/tui.py`
+- Added archived count to statistics panel
+- Only shows if `stats.archived_tasks > 0`
+- Displays as: `"  Archived:    {stats.archived_tasks}\n"` in dim style
 
-4. **Lines 1802-1820**: Added handling for new return codes in main loop:
-   ```bash
-   elif [ $exec_result -eq 4 ]; then
-       # Task completed and next task claimed - continue loop immediately
-       continue
-   elif [ $exec_result -eq 5 ]; then
-       # Failed to generate prompt - exit loop
-       break
-   elif [ $exec_result -eq 6 ]; then
-       # No more tasks - exit gracefully
-       break
-   ```
+### 10. Created Archive Script
+**File**: `archive_orphaned_tasks.py`
+- Standalone script to archive the 21 orphaned tasks
+- Lists all task IDs that need archiving
+- Provides summary of archived/failed counts
+- Successfully archived all 21 tasks
 
-#### Changes to spawner.py:
+## Verification Results
 
-5. **Lines 338-389**: Added `generate_prompt_for_task()` function
-   - Wrapper function callable from bash scripts
-   - Takes task_id string, fetches TaskClaim from database
-   - Calls existing `generate_task_prompt()` to generate prompt
-   - Handles async database access internally
-
-### Expected Behavior After Fix
-
-1. Ralph completes Task #1 ✓
-2. Ralph marks task complete in database ✓
-3. Ralph attempts to claim next task from queue ✓
-4. If task claimed:
-   - Generate new prompt for Task #2 ✓
-   - Reset session state ✓
-   - Continue loop with Task #2 ✓
-5. If no more tasks:
-   - Log "Queue empty - all tasks complete!" ✓
-   - Exit gracefully ✓
-
----
-
-## Bug #2: Premature Exit - ✅ ALREADY FIXED
-
-### Problem
-`MAX_CONSECUTIVE_DONE_SIGNALS=2` was too low, causing Ralphs to exit after just 2 loops when Claude signaled completion, even if the task wasn't actually finished.
-
-### Status
-Already fixed in the codebase at line 103:
-```bash
-MAX_CONSECUTIVE_DONE_SIGNALS=4  # Increased from 2 to 4 to prevent premature exits
+### Task Statistics (After Implementation)
+```
+Task Statistics:
+  Total:       108
+  Pending:     27
+  In Progress: 1
+  Completed:   59
+  Failed:      0
+  Archived:    21
 ```
 
-### Reasoning
-- Prevents premature exits on tasks requiring multiple iterations
-- Allows Claude to signal progress/milestones without triggering exit
-- Reduces false "Ralph died" incidents
-- Still provides safety against infinite loops (combined with MAX_LOOPS)
-
----
-
-## Bug #3: Task Release - ✅ ALREADY FIXED
-
-### Problem
-When Ralphs exited gracefully, tasks weren't properly released back to the database, leaving them in "claimed" state.
-
-### Status
-Already fixed in the codebase. The `release_current_task()` function (lines 1896-1918) is called on all exit paths:
-
-1. **Line 1440**: Cleanup handler (SIGINT/SIGTERM) ✓
-2. **Line 1538**: Max loops exceeded ✓
-3. **Line 1597**: Cost budget exceeded ✓
-4. **Line 1625**: Circuit breaker opened ✓
-5. **Line 1653**: Graceful exit ✓
-6. **Line 1754**: Circuit breaker trip (duplicate path) ✓
-
----
-
-## Verification Checklist
-
-### Manual Testing
-
-- [ ] **Test Case 1: Multiple Tasks in Queue**
-  1. Add 3+ tasks to the queue via ChiefWiggum
-  2. Start a single Ralph instance
-  3. Verify: Ralph completes Task #1, automatically claims Task #2
-  4. Verify: Ralph completes Task #2, automatically claims Task #3
-  5. Verify: Ralph completes all tasks, then exits gracefully
-  6. Check logs for "Claimed next task from queue" messages
-  7. Verify: All tasks marked complete in database
-
-- [ ] **Test Case 2: Queue Empties After First Task**
-  1. Add only 1 task to queue
-  2. Start Ralph
-  3. Verify: Ralph completes task
-  4. Verify: Ralph checks for next task, finds none
-  5. Verify: Ralph logs "Queue empty - all tasks complete!" and exits
-  6. Verify: Task marked complete in database
-
-- [ ] **Test Case 3: Prompt Generation Works**
-  1. Start Ralph with 2+ tasks
-  2. After first task completes, check PROMPT_FILE
-  3. Verify: Prompt file updated with new task details
-  4. Monitor second loop iteration
-  5. Verify: Claude receives correct context for second task
-
-### Database Verification
-
-After each test, verify task status:
-```bash
-# Check if task is still claimed
-wig status <ralph_id>
-
-# Or query database directly
-wig tasks --format=json | jq '.[] | select(.task_id == "TASK_ID") | .status'
-```
-
-### Log Verification
-
-Check logs for these messages indicating successful operation:
-
-1. Task completion:
-   ```
-   [SUCCESS] ✅ Task TASK_ID marked complete in database
-   ```
-
-2. Task claiming:
-   ```
-   [INFO] 📋 Checking for next task in queue...
-   [SUCCESS] 📋 Claimed next task from queue: TASK_ID - TASK_TITLE
-   ```
-
-3. Prompt generation:
-   ```
-   [INFO] 📝 Generating prompt for new task...
-   [SUCCESS] ✅ Prompt generated for task TASK_ID
-   ```
-
-4. Loop continuation:
-   ```
-   [INFO] 🔄 Continuing loop with next task...
-   [SUCCESS] ✅ Next task claimed successfully, continuing loop with new task
-   ```
-
-5. Queue empty:
-   ```
-   [SUCCESS] 🎉 Queue empty - all tasks complete!
-   [SUCCESS] 🎉 All tasks complete! Queue is empty.
-   ```
-
----
+### Archived Tasks
+Successfully archived 21 tasks:
+- task-21 through task-30 (10 old feature tasks)
+- task-35 through task-45 (11 old PF tasks)
 
 ## Files Modified
 
-1. **chiefwiggum/scripts/ralph_loop.sh**
-   - Fixed task continuation logic (return codes instead of continue/break)
-   - Added handling for new return codes in main loop
+1. `chiefwiggum/models.py` - Added ARCHIVED status, added archived_tasks field to SystemStats
+2. `chiefwiggum/coordination.py` - Added archive_task function, updated get_system_stats
+3. `chiefwiggum/__init__.py` - Exported archive_task function
+4. `chiefwiggum/cli.py` - Added archive-task command, updated status displays
+5. `chiefwiggum/tui.py` - Added archived count to statistics panel
 
-2. **chiefwiggum/spawner.py**
-   - Added `generate_prompt_for_task()` function for bash script compatibility
+## Files Created
 
----
-
-## Architecture Notes
-
-### Task Continuation Flow
-
-```
-execute_claude_code() [ralph_loop.sh:1062-1432]
-  └─> Detects task completion (line 1277)
-      └─> Marks complete via wig (line 1288)
-          └─> Attempts claim_next_task_for_ralph() (line 1294)
-              ├─> Success: return 4 → main loop continues
-              ├─> Prompt fail: return 5 → main loop exits
-              └─> No tasks: return 6 → main loop exits gracefully
-
-main() [ralph_loop.sh:1482-1809]
-  └─> while true loop (line 1527)
-      └─> execute_claude_code() (line 1675)
-          └─> Check exec_result (lines 1740-1820)
-              ├─> 0: Success, continue loop
-              ├─> 2: API limit, ask user
-              ├─> 3: Circuit breaker, exit
-              ├─> 4: Next task claimed, continue immediately
-              ├─> 5: Prompt generation failed, exit
-              ├─> 6: All tasks done, exit gracefully
-              └─> else: Failed, retry after 30s
-```
-
-### Key Functions
-
-- `claim_next_task_for_ralph()` (line 1921): Claims next task from queue
-- `get_current_task_id()` (line 1937): Gets task ID for Ralph instance
-- `get_task_title()` (line 1946): Gets task title from database
-- `generate_task_prompt_for_file()` (line 1965): Generates prompt, calls spawner.py
-- `release_current_task()` (line 1896): Releases task claim
-- `generate_prompt_for_task()` (spawner.py:338): Python function for prompt generation
-
----
-
-## Expected User Impact
-
-### Before Fix
-- Ralph processes only ONE task then stops
-- Queue never gets processed beyond first task
-- User must manually restart Ralph for each task
-- "Keep chugging through tasks" workflow doesn't work
-- Appears as if Ralph "died" after one task
-
-### After Fix
-- Ralph automatically processes ALL tasks in queue
-- Seamless task-to-task transitions
-- Only exits when queue is empty
-- Proper "worker" behavior as intended
-- Clear log messages for each state transition
-
----
-
-## Rollback Instructions
-
-If issues arise, revert changes:
-
-```bash
-git checkout HEAD -- chiefwiggum/scripts/ralph_loop.sh
-git checkout HEAD -- chiefwiggum/spawner.py
-```
-
-Then manually release any stuck tasks:
-```bash
-wig release <ralph_id>
-```
-
----
-
-## Next Steps
-
-1. Test the implementation with the verification checklist above
-2. Monitor Ralph logs during multi-task execution
-3. Verify database task states remain consistent
-4. Consider adding metrics for:
-   - Average tasks per Ralph session
-   - Task claiming success rate
-   - Time between task transitions
-
----
-
-## Additional Notes
-
-- The `MAX_CONSECUTIVE_DONE_SIGNALS=4` threshold may need tuning based on observed behavior
-- Consider making this threshold configurable per task type or priority
-- The task continuation logic is now properly isolated via return codes, making it easier to debug and maintain
-- Prompt generation is delegated to spawner.py for consistency with initial task spawning
+1. `archive_orphaned_tasks.py` - Script to archive the 21 orphaned tasks
+2. `IMPLEMENTATION_SUMMARY.md` - This summary document
