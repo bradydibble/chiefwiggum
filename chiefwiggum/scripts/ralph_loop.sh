@@ -252,6 +252,7 @@ extract_errors() {
     # Check for permission errors (highest priority)
     for pattern in "${CLAUDE_PERMISSION_PATTERNS[@]}"; do
         local matches=$(grep -ciE "$pattern" "$output_file" 2>/dev/null || echo "0")
+        matches=$(echo "$matches" | tr -d '\n' | tr -d ' ')  # Strip newlines and spaces
         if [[ $matches -gt 0 ]]; then
             error_category="permission"
             error_count=$((error_count + matches))
@@ -267,6 +268,7 @@ extract_errors() {
     if [[ "$error_category" == "none" || "$error_category" == "permission" ]]; then
         for pattern in "${CLAUDE_API_PATTERNS[@]}"; do
             local matches=$(grep -ciE "$pattern" "$output_file" 2>/dev/null || echo "0")
+            matches=$(echo "$matches" | tr -d '\n' | tr -d ' ')  # Strip newlines and spaces
             if [[ $matches -gt 0 ]]; then
                 if [[ "$error_category" == "none" ]]; then
                     error_category="api_error"
@@ -284,6 +286,7 @@ extract_errors() {
     if [[ "$error_category" == "none" ]]; then
         for pattern in "${CLAUDE_TOOL_FAILURE_PATTERNS[@]}"; do
             local matches=$(grep -ciE "$pattern" "$output_file" 2>/dev/null || echo "0")
+            matches=$(echo "$matches" | tr -d '\n' | tr -d ' ')  # Strip newlines and spaces
             if [[ $matches -gt 0 ]]; then
                 error_category="tool_failure"
                 error_count=$((error_count + matches))
@@ -1357,12 +1360,12 @@ EOF
                             local pattern_matched=""
 
                             # Try to extract task ID from commit message using multiple patterns
-                            # Pattern 1: Task-N, Task #N, task-N
-                            if [[ "$last_commit_msg" =~ [Tt]ask[- ]?#?([0-9]+) ]]; then
+                            # Pattern 1: Task-N, Task #N, task-N (with optional - or # and space)
+                            if [[ "$last_commit_msg" =~ [Tt]ask-([0-9]+) ]] || [[ "$last_commit_msg" =~ [Tt]ask\ \#([0-9]+) ]] || [[ "$last_commit_msg" =~ [Tt]ask\ ([0-9]+) ]]; then
                                 auto_task_id="task-${BASH_REMATCH[1]}"
                                 pattern_matched="Task-N pattern"
                             # Pattern 2: Issue N, Issue-N
-                            elif [[ "$last_commit_msg" =~ [Ii]ssue[- ]([0-9]+) ]]; then
+                            elif [[ "$last_commit_msg" =~ [Ii]ssue-([0-9]+) ]] || [[ "$last_commit_msg" =~ [Ii]ssue\ ([0-9]+) ]]; then
                                 auto_task_id="issue-${BASH_REMATCH[1]}"
                                 pattern_matched="Issue-N pattern"
                             # Pattern 3: (T0.1), (T1.2) - Tier notation
