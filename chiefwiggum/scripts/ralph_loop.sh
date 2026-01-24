@@ -538,15 +538,31 @@ should_exit_gracefully() {
     # but Claude explicitly indicates work is still in progress via RALPH_STATUS block.
     # The exit_signal in .response_analysis represents Claude's explicit intent.
     local claude_exit_signal="false"
+    local completed_task_id=""
     if [[ -f ".response_analysis" ]]; then
         claude_exit_signal=$(jq -r '.analysis.exit_signal // false' ".response_analysis" 2>/dev/null || echo "false")
+        completed_task_id=$(jq -r '.analysis.completed_task_id // ""' ".response_analysis" 2>/dev/null || echo "")
     fi
 
+    # CRITICAL FIX: Distinguish between task completion vs project completion
+    # If there's a completed_task_id, this is a TASK completion in ChiefWiggum mode,
+    # not a PROJECT completion. Let the task completion handler deal with it.
+    # Only trigger project_complete exit if EXIT_SIGNAL=true WITHOUT a task_id.
     if [[ $recent_completion_indicators -ge 5 ]] || \
        ([[ $recent_completion_indicators -ge 2 ]] && [[ "$claude_exit_signal" == "true" ]]); then
-        log_status "WARN" "Exit condition: Strong completion indicators ($recent_completion_indicators) with EXIT_SIGNAL=$claude_exit_signal" >&2
-        echo "project_complete"
-        return 0
+
+        # Check if this is a task completion (ChiefWiggum mode)
+        if [[ -n "$completed_task_id" && "$completed_task_id" != "null" ]]; then
+            log_status "INFO" "DEBUG: Task completion detected (task_id=$completed_task_id), EXIT_SIGNAL will be handled by task completion handler" >&2
+            log_status "INFO" "DEBUG: Not triggering project_complete exit - letting task handler claim next task" >&2
+            # Return empty (don't exit) - let the task completion handler take over
+            return 1
+        else
+            # No task_id - this is a standalone project completion
+            log_status "WARN" "Exit condition: Strong completion indicators ($recent_completion_indicators) with EXIT_SIGNAL=$claude_exit_signal (no task_id - project completion)" >&2
+            echo "project_complete"
+            return 0
+        fi
     elif [[ $recent_completion_indicators -ge 2 ]]; then
         log_status "INFO" "DEBUG: Completion indicators ($recent_completion_indicators) present but EXIT_SIGNAL=false, continuing..." >&2
     fi
@@ -1288,24 +1304,60 @@ EOF
 
                 # Call wig complete to record in database
                 log_status "INFO" "📤 Reporting task completion to ChiefWiggum..."
-                if eval "$complete_cmd" 2>&1; then
+                local complete_output
+                complete_output=$(eval "$complete_cmd" 2>&1)
+                local complete_status=$?
+
+                if [[ $complete_status -eq 0 ]]; then
                     log_status "SUCCESS" "✅ Task $completed_task_id marked complete in database"
+                    log_status "DEBUG" "Complete command output: $complete_output"
 
                     # TASK CONTINUATION: Attempt to claim next task from queue
                     log_status "INFO" "📋 Checking for next task in queue..."
 
-                    local next_claimed=$(claim_next_task_for_ralph "$RALPH_ID")
+                    local claim_result
+                    claim_result=$(claim_next_task_for_ralph "$RALPH_ID")
+                    local claim_success=$(echo "$claim_result" | jq -r '.success')
+                    local queue_empty=$(echo "$claim_result" | jq -r '.queue_empty')
 
-                    if [[ "$next_claimed" == "true" ]]; then
+                    if [[ "$claim_success" == "true" ]]; then
                         # Successfully claimed next task
-                        local new_task_id=$(get_current_task_id "$RALPH_ID")
-                        local new_task_title=$(get_task_title "$new_task_id")
+                        local new_task_id=$(echo "$claim_result" | jq -r '.task_id')
 
+                        # CHECKPOINT 1: Validate task ID from JSON response
+                        log_status "INFO" "🔍 CHECKPOINT 1: Validating claimed task ID: $new_task_id"
+                        if ! validate_task_id "$new_task_id"; then
+                            log_status "ERROR" "❌ CHECKPOINT 1 FAILED: Invalid task ID after claim"
+                            log_status "ERROR" "Releasing claim and exiting..."
+                            release_current_task "$RALPH_ID" || true
+                            reset_session "invalid_task_after_claim"
+                            return 5
+                        fi
+                        log_status "SUCCESS" "✅ CHECKPOINT 1 PASSED: Task ID is valid"
+
+                        # CHECKPOINT 2: Get task info with retry to handle DB sync delays
+                        log_status "INFO" "🔍 CHECKPOINT 2: Retrieving task info with retry logic"
+                        local task_info
+                        task_info=$(get_task_info_with_retry "$RALPH_ID")
+                        local task_info_success=$(echo "$task_info" | jq -r '.success')
+
+                        if [[ "$task_info_success" != "true" ]]; then
+                            log_status "ERROR" "❌ CHECKPOINT 2 FAILED: Could not retrieve task info after retries"
+                            log_status "ERROR" "Releasing claim and exiting..."
+                            release_current_task "$RALPH_ID" || true
+                            reset_session "task_info_retrieval_failed"
+                            return 5
+                        fi
+
+                        local new_task_title=$(echo "$task_info" | jq -r '.title')
+                        log_status "SUCCESS" "✅ CHECKPOINT 2 PASSED: Retrieved task info"
                         log_status "SUCCESS" "📋 Claimed next task from queue: $new_task_id - $new_task_title"
 
-                        # Generate new task-specific prompt
+                        # CHECKPOINT 3: Generate prompt with validation
+                        log_status "INFO" "🔍 CHECKPOINT 3: Generating task prompt"
                         log_status "INFO" "📝 Generating prompt for new task..."
                         if generate_task_prompt_for_file "$RALPH_ID" "$new_task_id" "$PROMPT_FILE"; then
+                            log_status "SUCCESS" "✅ CHECKPOINT 3 PASSED: Prompt generated successfully"
                             log_status "SUCCESS" "✅ Prompt generated for task $new_task_id"
 
                             # Reset session state for new task (clear context from previous task)
@@ -1318,18 +1370,26 @@ EOF
                             # Return special code to signal main loop to continue with new task
                             return 4
                         else
-                            log_status "ERROR" "❌ Failed to generate prompt for new task, exiting..."
+                            log_status "ERROR" "❌ CHECKPOINT 3 FAILED: Prompt generation failed"
+                            log_status "ERROR" "Releasing claim and exiting..."
+                            release_current_task "$RALPH_ID" || true
                             reset_session "prompt_generation_failed"
                             # Return special code to signal main loop to exit
                             return 5
                         fi
-                    else
+                    elif [[ "$queue_empty" == "true" ]]; then
                         # No more tasks in queue
                         log_status "SUCCESS" "🎉 Queue empty - all tasks complete!"
                         reset_session "queue_complete"
                         update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "queue_complete" "completed" "all_tasks_done" '{"category":"none","count":0,"details":[]}' "null" "false" "null"
                         # Return special code to signal main loop to exit gracefully
                         return 6
+                    else
+                        # Claim failed for other reasons
+                        local claim_reason=$(echo "$claim_result" | jq -r '.reason')
+                        log_status "ERROR" "❌ Failed to claim next task: $claim_reason"
+                        reset_session "claim_failed"
+                        return 5
                     fi
                 else
                     log_status "WARN" "⚠️ Failed to mark task complete (may already be completed or claimed by another)"
@@ -1552,7 +1612,7 @@ cleanup() {
 
     # Release task claim before exiting
     if [[ -n "$RALPH_ID" ]]; then
-        release_current_task "$RALPH_ID"
+        release_current_task "$RALPH_ID" || true
     fi
 
     reset_session "manual_interrupt"
@@ -1651,7 +1711,7 @@ main() {
 
             # Release task claim before exiting
             if [[ -n "$RALPH_ID" ]]; then
-                release_current_task "$RALPH_ID"
+                release_current_task "$RALPH_ID" || true
             fi
 
             reset_session "max_loops_exceeded"
@@ -1700,7 +1760,7 @@ main() {
         start_phase "cost_budget_check"
         if [[ -n "$COST_BUDGET_USD" && -n "$RALPH_ID" ]]; then
             # Read accumulated cost from status
-            local status_file="$HOME/.chiefwiggum/status/${RALPH_ID}.json"
+            local status_file="$HOME/.chiefwiggum/ralphs/status/${RALPH_ID}.json"
             if [[ -f "$status_file" ]]; then
                 local current_cost=$(jq -r '.cost_info.accumulated_cost // 0' "$status_file")
 
@@ -1709,7 +1769,7 @@ main() {
                     log_status "INFO" "Stopping Ralph to prevent exceeding budget"
 
                     # Release task claim before exiting
-                    release_current_task "$RALPH_ID"
+                    release_current_task "$RALPH_ID" || true
 
                     reset_session "cost_budget_exceeded"
                     update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "cost_budget_exceeded" "stopped" "cost_limit_reached" '{"category":"none","count":0,"details":[]}' "null" "false" "null"
@@ -1738,7 +1798,7 @@ main() {
 
             # Release task claim before exiting
             if [[ -n "$RALPH_ID" ]]; then
-                release_current_task "$RALPH_ID"
+                release_current_task "$RALPH_ID" || true
             fi
 
             reset_session "circuit_breaker_open"
@@ -1766,7 +1826,7 @@ main() {
 
             # Release task claim before exiting
             if [[ -n "$RALPH_ID" ]]; then
-                release_current_task "$RALPH_ID"
+                release_current_task "$RALPH_ID" || true
             fi
 
             reset_session "project_complete"
@@ -1866,7 +1926,7 @@ except Exception as e:
             # Circuit breaker opened
             # Release task claim before exiting
             if [[ -n "$RALPH_ID" ]]; then
-                release_current_task "$RALPH_ID"
+                release_current_task "$RALPH_ID" || true
             fi
 
             reset_session "circuit_breaker_trip"
@@ -1921,6 +1981,28 @@ except Exception as e:
         elif [ $exec_result -eq 5 ]; then
             # Failed to generate prompt for new task - exit loop
             log_status "ERROR" "❌ Failed to generate prompt for next task, exiting loop"
+            log_status "ERROR" "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            log_status "ERROR" "DIAGNOSTIC INFORMATION:"
+            log_status "ERROR" "- This error occurs when task claiming or prompt generation fails"
+            log_status "ERROR" "- Common causes:"
+            log_status "ERROR" "  1. Race condition: Task claimed but DB not synced"
+            log_status "ERROR" "  2. Invalid task ID passed to prompt generation"
+            log_status "ERROR" "  3. Task not found in database"
+            log_status "ERROR" "  4. Python spawner.py threw an exception"
+            log_status "ERROR" "- Check logs above for validation checkpoint failures"
+            log_status "ERROR" "- Task claim should have been released automatically"
+            log_status "ERROR" "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+            # Attempt to release any stale task claim before exiting
+            if [[ -n "$RALPH_ID" ]]; then
+                log_status "INFO" "Attempting to release any stale task claim..."
+                if release_current_task "$RALPH_ID"; then
+                    log_status "SUCCESS" "Released stale task claim"
+                else
+                    log_status "WARN" "Could not release task claim (may not have been claimed)"
+                fi
+            fi
+
             update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "prompt_generation_failed" "error" "cannot_continue" "$last_error_info" "null" "true" "Failed to generate prompt for next task"
             break
         elif [ $exec_result -eq 6 ]; then
@@ -2049,19 +2131,86 @@ release_current_task() {
 }
 
 # Claim next task for Ralph
+# Returns JSON: {"success": bool, "task_id": string, "verified": bool, "reason": string, "queue_empty": bool}
 claim_next_task_for_ralph() {
     local ralph_id=$1
-    if ! command -v wig &>/dev/null; then echo "false"; return; fi
 
-    wig release "$ralph_id" 2>/dev/null || true
-
-    if wig claim "$ralph_id" 2>/dev/null; then
-        echo "true"
-        return 0
-    else
-        echo "false"
+    # Validation
+    if [[ -z "$ralph_id" ]]; then
+        echo '{"success":false,"task_id":"","verified":false,"reason":"invalid_ralph_id","queue_empty":false}'
         return 1
     fi
+
+    if ! command -v wig &>/dev/null; then
+        echo '{"success":false,"task_id":"","verified":false,"reason":"wig_not_found","queue_empty":false}'
+        return 1
+    fi
+
+    # Release any existing task first
+    wig release "$ralph_id" 2>&1 || true
+
+    # Retry claim operation (3 attempts with exponential backoff)
+    local max_claim_attempts=3
+    local claim_backoff=2
+
+    for claim_attempt in $(seq 1 $max_claim_attempts); do
+        log_status "DEBUG" "Claim attempt $claim_attempt/$max_claim_attempts for Ralph $ralph_id"
+
+        # Capture both stdout and stderr
+        local claim_output
+        claim_output=$(wig claim "$ralph_id" 2>&1)
+        local claim_status=$?
+
+        if [[ $claim_status -eq 0 ]]; then
+            log_status "DEBUG" "Claim succeeded, verifying task assignment..."
+
+            # Verify task was assigned (5 attempts with exponential backoff)
+            local max_verify_attempts=5
+            local verify_delay=1
+
+            for verify_attempt in $(seq 1 $max_verify_attempts); do
+                sleep $verify_delay
+
+                # Get task info from database
+                local task_info
+                task_info=$(wig instances --format=json 2>&1 | jq -r ".[] | select(.ralph_id == \"$ralph_id\") | .current_task_id // \"\"" 2>&1)
+
+                if [[ -n "$task_info" && "$task_info" != "null" && "$task_info" != "" ]]; then
+                    log_status "SUCCESS" "Task assignment verified: $task_info"
+                    echo "{\"success\":true,\"task_id\":\"$task_info\",\"verified\":true,\"reason\":\"claimed_and_verified\",\"queue_empty\":false}"
+                    return 0
+                fi
+
+                log_status "DEBUG" "Verification attempt $verify_attempt/$max_verify_attempts failed, retrying..."
+                # Exponential backoff: 1s, 2s, 4s, 8s, 16s
+                verify_delay=$((verify_delay * 2))
+            done
+
+            # Claim succeeded but no task assigned after all retries - queue likely empty
+            log_status "WARN" "Claim succeeded but no task assigned after verification retries"
+            echo '{"success":false,"task_id":"","verified":false,"reason":"no_task_after_claim","queue_empty":true}'
+            return 1
+        else
+            # Check if error indicates no tasks available
+            if echo "$claim_output" | grep -qi "no tasks available\|queue empty\|no available tasks"; then
+                log_status "INFO" "Queue is empty (no tasks available)"
+                echo '{"success":false,"task_id":"","verified":false,"reason":"queue_empty","queue_empty":true}'
+                return 1
+            fi
+
+            # Retry with exponential backoff
+            if [[ $claim_attempt -lt $max_claim_attempts ]]; then
+                log_status "WARN" "Claim attempt $claim_attempt failed: $claim_output (retrying in ${claim_backoff}s)"
+                sleep $claim_backoff
+                claim_backoff=$((claim_backoff * 2))
+            fi
+        fi
+    done
+
+    # All claim attempts failed
+    log_status "ERROR" "Failed to claim task after $max_claim_attempts attempts"
+    echo '{"success":false,"task_id":"","verified":false,"reason":"claim_failed","queue_empty":false}'
+    return 1
 }
 
 # Get current task ID for Ralph instance
@@ -2071,6 +2220,74 @@ get_current_task_id() {
 
     wig instances --format=json 2>/dev/null | \
         jq -r ".[] | select(.ralph_id == \"$ralph_id\") | .current_task_id // \"\"" 2>/dev/null
+}
+
+# Get task info with retry to handle DB sync delays
+# Returns JSON: {"task_id": string, "title": string, "success": bool}
+get_task_info_with_retry() {
+    local ralph_id=$1
+    local max_attempts=5
+    local delay=1
+
+    if [[ -z "$ralph_id" ]]; then
+        echo '{"task_id":"","title":"","success":false}'
+        return 1
+    fi
+
+    for attempt in $(seq 1 $max_attempts); do
+        sleep $delay
+
+        local task_id
+        task_id=$(wig instances --format=json 2>&1 | jq -r ".[] | select(.ralph_id == \"$ralph_id\") | .current_task_id // \"\"" 2>&1)
+
+        if [[ -n "$task_id" && "$task_id" != "null" && "$task_id" != "" ]]; then
+            local task_title
+            task_title=$(get_task_title "$task_id")
+
+            echo "{\"task_id\":\"$task_id\",\"title\":\"$task_title\",\"success\":true}"
+            return 0
+        fi
+
+        log_status "DEBUG" "Task info retry attempt $attempt/$max_attempts"
+        delay=$((delay * 2))
+    done
+
+    echo '{"task_id":"","title":"","success":false}'
+    return 1
+}
+
+# Validate that task_id is valid and exists in database
+validate_task_id() {
+    local task_id=$1
+
+    # Check if task_id is non-empty
+    if [[ -z "$task_id" ]]; then
+        log_status "ERROR" "Task ID validation failed: empty task_id"
+        return 1
+    fi
+
+    # Check if task_id is not "null" string
+    if [[ "$task_id" == "null" ]]; then
+        log_status "ERROR" "Task ID validation failed: task_id is 'null'"
+        return 1
+    fi
+
+    # Check if task exists in database
+    if ! command -v wig &>/dev/null; then
+        log_status "ERROR" "Task ID validation failed: wig command not found"
+        return 1
+    fi
+
+    local task_exists
+    task_exists=$(wig tasks --format=json 2>&1 | jq -r ".[] | select(.task_id == \"$task_id\") | .task_id // \"\"" 2>&1)
+
+    if [[ -z "$task_exists" || "$task_exists" == "null" ]]; then
+        log_status "ERROR" "Task ID validation failed: task $task_id not found in database"
+        return 1
+    fi
+
+    log_status "DEBUG" "Task ID validation passed: $task_id"
+    return 0
 }
 
 # Get task title from database
@@ -2098,13 +2315,33 @@ generate_task_prompt_for_file() {
     local task_id=$2
     local prompt_file=$3
 
+    # Parameter validation
+    if [[ -z "$ralph_id" ]]; then
+        log_status "ERROR" "generate_task_prompt_for_file: ralph_id parameter is empty"
+        return 1
+    fi
+
+    if [[ -z "$task_id" || "$task_id" == "null" ]]; then
+        log_status "ERROR" "generate_task_prompt_for_file: task_id parameter is invalid: '$task_id'"
+        return 1
+    fi
+
+    if [[ -z "$prompt_file" ]]; then
+        log_status "ERROR" "generate_task_prompt_for_file: prompt_file parameter is empty"
+        return 1
+    fi
+
     if ! command -v python3 &>/dev/null; then
         log_status "ERROR" "python3 not found, cannot generate task prompt"
         return 1
     fi
 
-    # Call spawner's prompt generation function
-    python3 -c "
+    log_status "DEBUG" "Generating prompt for task_id='$task_id', ralph_id='$ralph_id', output='$prompt_file'"
+
+    # Call spawner's prompt generation function (capture stderr for debugging)
+    local python_output
+    local python_error
+    python_output=$(python3 -c "
 import sys
 sys.path.insert(0, '$HOME/.chiefwiggum')
 try:
@@ -2116,13 +2353,30 @@ try:
 except Exception as e:
     print(f'Error generating prompt: {e}', file=sys.stderr)
     sys.exit(1)
-" 2>/dev/null
-
+" 2>&1)
     local result=$?
+
     if [[ $result -eq 0 ]]; then
+        # Verify output file was created and is non-empty
+        if [[ ! -f "$prompt_file" ]]; then
+            log_status "ERROR" "Prompt file not created: $prompt_file"
+            return 1
+        fi
+
+        if [[ ! -s "$prompt_file" ]]; then
+            log_status "ERROR" "Prompt file is empty: $prompt_file"
+            return 1
+        fi
+
+        log_status "DEBUG" "Prompt file generated successfully: $(wc -l < "$prompt_file") lines"
         return 0
     else
+        # Log detailed error information
+        log_status "ERROR" "Python prompt generation failed with exit code $result"
+        log_status "ERROR" "Python output/error: $python_output"
+
         # Fallback: generate simple prompt manually
+        log_status "WARN" "Falling back to manual prompt generation"
         local task_title=$(get_task_title "$task_id")
         local task_description=$(get_task_description "$task_id")
 
