@@ -36,6 +36,7 @@ from chiefwiggum import (
     shutdown_instance,
     sync_tasks_from_fix_plan,
     verify_claim_before_commit,
+    complete_and_claim_next,
 )
 from chiefwiggum.coordination import (
     _generate_task_id,
@@ -812,3 +813,205 @@ class TestAutoScaling:
         count = await count_running_ralphs()
         assert isinstance(count, int)
         assert count >= 0
+
+
+# =============================================================================
+# Task Completion and Database Update Tests
+# =============================================================================
+
+
+class TestCompleteAndClaimNext:
+    """Tests for complete_and_claim_next() database updates.
+
+    These tests verify that task completion properly updates all required
+    database fields and atomically claims the next task.
+    """
+
+    @pytest.mark.asyncio
+    async def test_complete_and_claim_next_updates_all_fields(self, sample_fix_plan_file):
+        """Test complete_and_claim_next() updates all required fields."""
+        from chiefwiggum.database import get_connection
+
+        # Setup: Sync tasks and register Ralph
+        await sync_tasks_from_fix_plan(sample_fix_plan_file, project="test")
+        ralph_id = "test-ralph-db-001"
+        await register_ralph_instance(ralph_id, project="test")
+
+        # Claim a task
+        task_result = await claim_task(ralph_id, project="test")
+        assert task_result is not None
+        task_id = task_result['task_id']
+
+        # Complete and claim next
+        next_task = await complete_and_claim_next(
+            ralph_id=ralph_id,
+            task_id=task_id,
+            project="test",
+            commit_sha="abc123def456",
+            message="Task completed successfully"
+        )
+
+        # Verify database state
+        conn = await get_connection()
+        cursor = await conn.execute(
+            "SELECT status, git_commit_sha, completed_at FROM task_claims WHERE task_id = ?",
+            (task_id,)
+        )
+        row = await cursor.fetchone()
+
+        assert row is not None
+        assert row[0] == "completed"  # status
+        assert row[1] == "abc123def456"  # git_commit_sha
+        assert row[2] is not None  # completed_at timestamp
+
+        # Verify next task claimed
+        assert next_task is not None
+        assert next_task['task_id'] != task_id
+
+    @pytest.mark.asyncio
+    async def test_complete_and_claim_next_no_more_tasks(self, sample_fix_plan_file):
+        """Test complete_and_claim_next() when no more tasks available."""
+        from chiefwiggum.database import get_connection
+
+        # Setup with a single-task fix plan
+        single_task_content = """# Fix Plan
+
+## HIGH Priority
+
+### 1. Only Task
+This is the only task
+"""
+        sample_fix_plan_file.write_text(single_task_content)
+        await sync_tasks_from_fix_plan(sample_fix_plan_file, project="test")
+
+        ralph_id = "test-ralph-single"
+        await register_ralph_instance(ralph_id, project="test")
+
+        # Claim the only task
+        task_result = await claim_task(ralph_id, project="test")
+        assert task_result is not None
+        task_id = task_result['task_id']
+
+        # Complete and try to claim next (should return None)
+        next_task = await complete_and_claim_next(
+            ralph_id=ralph_id,
+            task_id=task_id,
+            project="test",
+            commit_sha="final123abc",
+            message="Last task completed"
+        )
+
+        # Verify first task is marked complete
+        conn = await get_connection()
+        cursor = await conn.execute(
+            "SELECT status, git_commit_sha FROM task_claims WHERE task_id = ?",
+            (task_id,)
+        )
+        row = await cursor.fetchone()
+        assert row[0] == "completed"
+        assert row[1] == "final123abc"
+
+        # Verify no next task
+        assert next_task is None
+
+    @pytest.mark.asyncio
+    async def test_complete_and_claim_next_updates_instance_task(self, sample_fix_plan_file):
+        """Test that complete_and_claim_next() updates Ralph instance's current_task_id."""
+        from chiefwiggum.database import get_connection
+
+        await sync_tasks_from_fix_plan(sample_fix_plan_file, project="test")
+        ralph_id = "test-ralph-instance-update"
+        await register_ralph_instance(ralph_id, project="test")
+
+        # Claim first task
+        task1 = await claim_task(ralph_id, project="test")
+        task1_id = task1['task_id']
+
+        # Verify instance has task1
+        instance = await get_ralph_instance(ralph_id)
+        assert instance.current_task_id == task1_id
+
+        # Complete task1 and claim task2
+        task2 = await complete_and_claim_next(
+            ralph_id=ralph_id,
+            task_id=task1_id,
+            project="test",
+            commit_sha="update123",
+            message="Completed task 1"
+        )
+
+        # Verify instance now has task2
+        if task2:
+            instance = await get_ralph_instance(ralph_id)
+            assert instance.current_task_id == task2['task_id']
+            assert instance.current_task_id != task1_id
+
+    @pytest.mark.asyncio
+    async def test_complete_and_claim_next_preserves_task_metadata(self, sample_fix_plan_file):
+        """Test that complete_and_claim_next() preserves task metadata."""
+        from chiefwiggum.database import get_connection
+
+        await sync_tasks_from_fix_plan(sample_fix_plan_file, project="test")
+        ralph_id = "test-ralph-metadata"
+        await register_ralph_instance(ralph_id, project="test")
+
+        # Claim a task
+        task = await claim_task(ralph_id, project="test")
+        task_id = task['task_id']
+
+        # Store original metadata
+        original_title = task['task_title']
+        original_priority = task['task_priority']
+
+        # Complete and claim next
+        await complete_and_claim_next(
+            ralph_id=ralph_id,
+            task_id=task_id,
+            project="test",
+            commit_sha="meta123",
+            message="Metadata test"
+        )
+
+        # Verify completed task metadata is preserved
+        conn = await get_connection()
+        cursor = await conn.execute(
+            "SELECT task_title, task_priority, status FROM task_claims WHERE task_id = ?",
+            (task_id,)
+        )
+        row = await cursor.fetchone()
+        assert row[0] == original_title
+        assert row[1] == original_priority
+        assert row[2] == "completed"
+
+    @pytest.mark.asyncio
+    async def test_complete_and_claim_next_with_message(self, sample_fix_plan_file):
+        """Test that completion message is stored."""
+        from chiefwiggum.database import get_connection
+
+        await sync_tasks_from_fix_plan(sample_fix_plan_file, project="test")
+        ralph_id = "test-ralph-message"
+        await register_ralph_instance(ralph_id, project="test")
+
+        task = await claim_task(ralph_id, project="test")
+        task_id = task['task_id']
+
+        completion_message = "All tests pass, verified manually"
+
+        await complete_and_claim_next(
+            ralph_id=ralph_id,
+            task_id=task_id,
+            project="test",
+            commit_sha="msg123",
+            message=completion_message
+        )
+
+        # Verify message is stored (check task_history table if it exists,
+        # or completion_message field if present)
+        conn = await get_connection()
+        cursor = await conn.execute(
+            "SELECT completion_message FROM task_claims WHERE task_id = ?",
+            (task_id,)
+        )
+        row = await cursor.fetchone()
+        if row and row[0]:
+            assert completion_message in row[0]

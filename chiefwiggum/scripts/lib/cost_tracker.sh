@@ -77,10 +77,14 @@ extract_usage_from_json() {
 accumulate_cost_in_status() {
     local ralph_id="$1"
     local cost_json="$2"
-    local status_dir="$HOME/.chiefwiggum/status"
+    local status_dir="$HOME/.chiefwiggum/ralphs/status"
     local status_file="$status_dir/${ralph_id}.json"
 
     if [[ ! -f "$status_file" ]]; then
+        # Debug: status file not found
+        if [[ -n "${VERBOSE_PROGRESS:-}" && "$VERBOSE_PROGRESS" == "true" ]]; then
+            echo "[DEBUG] Cost tracking: Status file not found at $status_file" >&2
+        fi
         return 0
     fi
 
@@ -107,7 +111,7 @@ accumulate_cost_in_status() {
 
     # Update status file with new accumulated cost
     local temp_file="${status_file}.tmp"
-    jq --argjson cost_data "$cost_json" \
+    if jq --argjson cost_data "$cost_json" \
        --arg total "$total_cost" \
        --argjson total_input "$total_input" \
        --argjson total_output "$total_output" \
@@ -121,5 +125,16 @@ accumulate_cost_in_status() {
            cache_read_tokens: $total_cache_read,
            last_update: (now | todate)
        }' \
-       "$status_file" > "$temp_file" && mv "$temp_file" "$status_file"
+       "$status_file" > "$temp_file" && mv "$temp_file" "$status_file"; then
+        # Debug: cost accumulated successfully
+        if [[ -n "${VERBOSE_PROGRESS:-}" && "$VERBOSE_PROGRESS" == "true" ]]; then
+            echo "[DEBUG] Cost tracking: Accumulated \$$total_cost to $status_file" >&2
+        fi
+    else
+        # Debug: cost accumulation failed
+        if [[ -n "${VERBOSE_PROGRESS:-}" && "$VERBOSE_PROGRESS" == "true" ]]; then
+            echo "[DEBUG] Cost tracking: Failed to accumulate cost to $status_file" >&2
+        fi
+        rm -f "$temp_file"
+    fi
 }

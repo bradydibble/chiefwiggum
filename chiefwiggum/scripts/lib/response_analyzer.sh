@@ -21,6 +21,37 @@ TEST_ONLY_PATTERNS=("npm test" "bats" "pytest" "jest" "cargo test" "go test" "ru
 NO_WORK_PATTERNS=("nothing to do" "no changes" "already implemented" "up to date")
 
 # =============================================================================
+# VARIABLE VALIDATION FOR JQ --argjson
+# =============================================================================
+
+# Validate and sanitize variables for jq --argjson usage
+# Ensures all values are valid JSON primitives to prevent jq crashes
+# Usage: validated=$(validate_for_argjson "var_name" "$var_value" "number|boolean")
+validate_for_argjson() {
+    local var_name=$1
+    local var_value=$2
+    local var_type=$3  # "number" or "boolean"
+
+    if [[ "$var_type" == "number" ]]; then
+        # Ensure it's a valid integer, default to 0
+        if [[ ! "$var_value" =~ ^[0-9]+$ ]]; then
+            echo "0"
+            return
+        fi
+        echo "$var_value"
+    elif [[ "$var_type" == "boolean" ]]; then
+        # Ensure it's valid JSON boolean
+        if [[ "$var_value" == "true" ]]; then
+            echo "true"
+        elif [[ "$var_value" == "false" ]]; then
+            echo "false"
+        else
+            echo "false"  # Default to false for safety
+        fi
+    fi
+}
+
+# =============================================================================
 # JSON OUTPUT FORMAT DETECTION AND PARSING
 # =============================================================================
 
@@ -286,8 +317,22 @@ analyze_response() {
                 fi
             fi
 
+            # Validate all variables before passing to jq --argjson
+            loop_number=$(validate_for_argjson "loop_number" "$loop_number" "number")
+            files_modified=$(validate_for_argjson "files_modified" "$files_modified" "number")
+            confidence_score=$(validate_for_argjson "confidence_score" "$confidence_score" "number")
+            output_length=$(validate_for_argjson "output_length" "$output_length" "number")
+            has_completion_signal=$(validate_for_argjson "has_completion_signal" "$has_completion_signal" "boolean")
+            is_test_only=$(validate_for_argjson "is_test_only" "$is_test_only" "boolean")
+            is_stuck=$(validate_for_argjson "is_stuck" "$is_stuck" "boolean")
+            has_progress=$(validate_for_argjson "has_progress" "$has_progress" "boolean")
+            exit_signal=$(validate_for_argjson "exit_signal" "$exit_signal" "boolean")
+
+            # Debug logging if validation changed any values
+            [[ "${VERBOSE_PROGRESS:-}" == "true" ]] && echo "DEBUG: Validated variables - loop=$loop_number, files=$files_modified, conf=$confidence_score" >&2
+
             # Write analysis results for JSON path using jq for safe construction
-            jq -n \
+            if ! jq -n \
                 --argjson loop_number "$loop_number" \
                 --arg timestamp "$(get_iso_timestamp)" \
                 --arg output_file "$output_file" \
@@ -321,7 +366,22 @@ analyze_response() {
                         completed_task_id: $completed_task_id,
                         completed_commit_sha: $completed_commit_sha
                     }
-                }' > "$analysis_result_file"
+                }' > "$analysis_result_file" 2>/tmp/jq_error_$$.log; then
+                rm -f /tmp/jq_error_$$.log
+            else
+                echo "ERROR: jq failed to create analysis result. Variables:" >&2
+                echo "  loop_number='$loop_number'" >&2
+                echo "  files_modified='$files_modified'" >&2
+                echo "  confidence_score='$confidence_score'" >&2
+                echo "  exit_signal='$exit_signal'" >&2
+                cat /tmp/jq_error_$$.log >&2
+                rm -f /tmp/jq_error_$$.log
+
+                # Create minimal valid output to prevent complete failure
+                echo '{"loop_number":0,"analysis":{"has_completion_signal":false,"exit_signal":false}}' > "$analysis_result_file"
+                rm -f ".json_parse_result"
+                return 1
+            fi
             rm -f ".json_parse_result"
             return 0
         fi
@@ -527,8 +587,22 @@ analyze_response() {
         # Now requires: (completion_signal AND confidence >= 60) OR (confidence >= 80)
     fi
 
+    # Validate all variables before passing to jq --argjson (text parsing path)
+    loop_number=$(validate_for_argjson "loop_number" "$loop_number" "number")
+    files_modified=$(validate_for_argjson "files_modified" "$files_modified" "number")
+    confidence_score=$(validate_for_argjson "confidence_score" "$confidence_score" "number")
+    output_length=$(validate_for_argjson "output_length" "$output_length" "number")
+    has_completion_signal=$(validate_for_argjson "has_completion_signal" "$has_completion_signal" "boolean")
+    is_test_only=$(validate_for_argjson "is_test_only" "$is_test_only" "boolean")
+    is_stuck=$(validate_for_argjson "is_stuck" "$is_stuck" "boolean")
+    has_progress=$(validate_for_argjson "has_progress" "$has_progress" "boolean")
+    exit_signal=$(validate_for_argjson "exit_signal" "$exit_signal" "boolean")
+
+    # Debug logging if validation changed any values
+    [[ "${VERBOSE_PROGRESS:-}" == "true" ]] && echo "DEBUG: Validated variables (text path) - loop=$loop_number, files=$files_modified, conf=$confidence_score" >&2
+
     # Write analysis results to file (text parsing path) using jq for safe construction
-    jq -n \
+    if ! jq -n \
         --argjson loop_number "$loop_number" \
         --arg timestamp "$(get_iso_timestamp)" \
         --arg output_file "$output_file" \
@@ -562,7 +636,21 @@ analyze_response() {
                 completed_task_id: $completed_task_id,
                 completed_commit_sha: $completed_commit_sha
             }
-        }' > "$analysis_result_file"
+        }' > "$analysis_result_file" 2>/tmp/jq_error_text_$$.log; then
+        rm -f /tmp/jq_error_text_$$.log
+    else
+        echo "ERROR: jq failed to create analysis result (text path). Variables:" >&2
+        echo "  loop_number='$loop_number'" >&2
+        echo "  files_modified='$files_modified'" >&2
+        echo "  confidence_score='$confidence_score'" >&2
+        echo "  exit_signal='$exit_signal'" >&2
+        cat /tmp/jq_error_text_$$.log >&2
+        rm -f /tmp/jq_error_text_$$.log
+
+        # Create minimal valid output to prevent complete failure
+        echo '{"loop_number":0,"analysis":{"has_completion_signal":false,"exit_signal":false}}' > "$analysis_result_file"
+        return 1
+    fi
 
     # Always return 0 (success) - callers should check the JSON result file
     # Returning non-zero would cause issues with set -e and test frameworks
@@ -800,6 +888,7 @@ should_resume_session() {
 }
 
 # Export functions for use in ralph_loop.sh
+export -f validate_for_argjson
 export -f detect_output_format
 export -f parse_json_response
 export -f analyze_response

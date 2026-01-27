@@ -425,13 +425,20 @@ def release(task_id: str, ralph_id: str):
 @main.command()
 @click.argument("fix_plan", type=click.Path(exists=True))
 @click.option("--project", "-p", help="Project name (auto-detected from path if not provided)")
-def sync(fix_plan: str, project: str | None):
-    """Sync tasks from a @fix_plan.md file."""
+@click.option("--with-grading", is_flag=True, help="Generate and grade task-specific prompts (NEW)")
+def sync(fix_plan: str, project: str | None, with_grading: bool):
+    """Sync tasks from a @fix_plan.md file.
+
+    By default, syncs to the legacy task_claims table.
+    Use --with-grading to also generate and grade task-specific prompts.
+    """
     from rich.console import Console
+    from rich.table import Table
 
     console = Console()
     run_async(init_db())
 
+    # Always sync to old system for backward compatibility
     count = run_async(sync_tasks_from_fix_plan(fix_plan, project=project))
 
     if project is None:
@@ -439,6 +446,33 @@ def sync(fix_plan: str, project: str | None):
 
     console.print(f"[green]Synced {count} tasks[/green] from {fix_plan}")
     console.print(f"[dim]Project: {project}[/dim]")
+
+    # Optionally sync to new graded task queue
+    if with_grading:
+        from chiefwiggum.coordination import sync_tasks_with_grading
+
+        console.print("\n[cyan]Generating and grading task-specific prompts...[/cyan]")
+        counts = run_async(sync_tasks_with_grading(fix_plan, project=project))
+
+        # Display grade distribution
+        table = Table(title="Task Grades")
+        table.add_column("Grade", style="cyan")
+        table.add_column("Count", justify="right", style="green")
+        table.add_column("Spawnable", style="yellow")
+
+        grade_data = [
+            ("A (90-100)", counts['grade_a'], "✓ Auto-spawn"),
+            ("B (70-89)", counts['grade_b'], "✓ Auto-spawn"),
+            ("C (50-69)", counts['grade_c'], "⚠ Review required"),
+            ("F (<50)", counts['grade_f'], "✗ Blocked"),
+        ]
+
+        for grade, count, spawnable in grade_data:
+            table.add_row(grade, str(count), spawnable)
+
+        console.print(table)
+        console.print(f"\n[green]Total tasks graded: {counts['total']}[/green]")
+        console.print("[dim]Use 'wig tui' to view task queue with grades[/dim]")
 
 
 @main.command()
@@ -745,6 +779,255 @@ def show_paths():
     if paths.using_legacy:
         console.print("\n[yellow]Note: Using legacy ~/.chiefwiggum/ paths[/yellow]")
         console.print("[dim]Run 'chiefwiggum migrate' to move to XDG-compliant locations[/dim]")
+
+
+@main.command()
+def verify():
+    """Verify ChiefWiggum installation and dependencies."""
+    import importlib.util
+    import shutil
+    import sys
+
+    from rich.console import Console
+
+    console = Console()
+    console.print("🔍 Verifying ChiefWiggum installation...\n")
+
+    checks = []
+
+    # Check version
+    try:
+        checks.append(("Version", f"✅ {__version__}", True))
+    except Exception as e:
+        checks.append(("Version", f"❌ Failed: {e}", False))
+
+    # Check core modules
+    modules = ["coordination", "database", "spawner", "worktree_manager", "git_merge"]
+    for mod in modules:
+        try:
+            importlib.import_module(f"chiefwiggum.{mod}")
+            checks.append((f"Module: {mod}", "✅", True))
+        except Exception as e:
+            checks.append((f"Module: {mod}", f"❌ {e}", False))
+
+    # Check CLI tools
+    cli_tools = ["claude", "git"]
+    for tool in cli_tools:
+        if shutil.which(tool):
+            checks.append((f"CLI Tool: {tool}", "✅", True))
+        else:
+            checks.append((f"CLI Tool: {tool}", "⚠️  Not found", False))
+
+    # Check shell scripts
+    script_path = Path(__file__).parent / "scripts" / "ralph_loop.sh"
+    if script_path.exists():
+        checks.append(("Ralph Loop Script", "✅", True))
+    else:
+        checks.append(("Ralph Loop Script", "❌ Not found", False))
+
+    # Check database path
+    try:
+        db_path = get_database_path()
+        checks.append(("Database Path", f"✅ {db_path}", True))
+    except Exception as e:
+        checks.append(("Database Path", f"❌ {e}", False))
+
+    # Print results
+    for name, status, success in checks:
+        console.print(f"{name:.<40} {status}")
+
+    # Summary
+    all_critical_passed = all(c[2] for c in checks if not c[0].startswith("CLI Tool"))
+    console.print()
+    if all_critical_passed:
+        console.print("✅ All critical checks passed!")
+        sys.exit(0)
+    else:
+        console.print("❌ Some checks failed. Please reinstall.")
+        sys.exit(1)
+
+
+@main.command()
+@click.option("--check", is_flag=True, help="Check for updates without installing")
+def update(check: bool):
+    """Update ChiefWiggum to the latest version.
+
+    Detects how ChiefWiggum is installed and updates accordingly:
+    - Editable install (development): git pull + reinstall
+    - pipx install: pipx upgrade
+    - PyPI install: pip install --upgrade
+
+    Examples:
+        wig update              # Update to latest version
+        wig update --check      # Check if update available
+    """
+    import os
+    import shutil
+    import subprocess
+    import sys
+
+    from rich.console import Console
+
+    console = Console()
+
+    # Detect installation type
+    package_path = Path(__file__).parent.parent
+    is_editable = (package_path / ".git").exists()
+    is_pipx = "pipx" in sys.prefix or "pipx" in str(Path(sys.executable).parent)
+
+    if check:
+        # Just check for updates
+        console.print("🔍 Checking for updates...")
+
+        if is_editable:
+            # Check git for updates
+            try:
+                os.chdir(package_path)
+                subprocess.run(["git", "fetch"], check=True, capture_output=True)
+                result = subprocess.run(
+                    ["git", "rev-list", "--count", "HEAD..origin/main"],
+                    capture_output=True,
+                    text=True,
+                    check=True
+                )
+                commits_behind = int(result.stdout.strip())
+
+                if commits_behind > 0:
+                    console.print(f"[yellow]Updates available:[/yellow] {commits_behind} commit(s) behind origin/main")
+                    console.print("Run [cyan]wig update[/cyan] to update")
+                else:
+                    console.print("[green]Already up to date[/green]")
+            except Exception as e:
+                console.print(f"[red]Error checking for updates:[/red] {e}")
+        else:
+            console.print("[dim]Update checking not available for this installation type[/dim]")
+            console.print("Run [cyan]wig update[/cyan] to upgrade to latest version")
+        return
+
+    # Perform update
+    console.print("🔄 Updating ChiefWiggum...\n")
+
+    if is_editable:
+        console.print("[cyan]Detected:[/cyan] Editable install (development mode)")
+        console.print()
+
+        # Check for uncommitted changes
+        has_uncommitted = False
+        try:
+            os.chdir(package_path)
+            result = subprocess.run(
+                ["git", "status", "--porcelain"],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            has_uncommitted = bool(result.stdout.strip())
+        except Exception:
+            pass
+
+        if has_uncommitted:
+            console.print("[yellow]⚠ You have uncommitted local changes[/yellow]")
+            console.print()
+            console.print("Update options:")
+            console.print("  1. [cyan]--check[/cyan] - Just reinstall dependencies (recommended)")
+            console.print("  2. Stash changes first: [cyan]git stash && wig update && git stash pop[/cyan]")
+            console.print("  3. Commit changes first: [cyan]git add . && git commit[/cyan]")
+            console.print()
+            console.print("[dim]For editable installs, code changes are live immediately.[/dim]")
+            console.print("[dim]Only reinstall is needed if dependencies changed.[/dim]")
+            console.print()
+
+            # Just reinstall dependencies without git pull
+            console.print("📦 Reinstalling to pick up any dependency changes...")
+            try:
+                subprocess.run(
+                    [sys.executable, "-m", "pip", "install", "-e", ".[dev]"],
+                    check=True,
+                    capture_output=True
+                )
+                console.print("[green]✓[/green] Reinstall complete\n")
+                console.print("[green]✅ Dependencies updated![/green]")
+                console.print("[dim]Your local code changes are preserved.[/dim]")
+                sys.exit(0)
+            except subprocess.CalledProcessError as e:
+                console.print(f"[red]✗ Reinstall failed:[/red] {e}")
+                console.print("[dim]Try running manually: pip install -e '.[dev]'[/dim]")
+                sys.exit(1)
+
+        # No uncommitted changes - proceed with full update
+        console.print("📥 Pulling latest changes from git...")
+        try:
+            subprocess.run(["git", "pull"], check=True)
+            console.print("[green]✓[/green] Git pull complete\n")
+        except subprocess.CalledProcessError as e:
+            console.print(f"[red]✗ Git pull failed:[/red] {e}")
+            console.print("[dim]Try running manually: git pull[/dim]")
+            sys.exit(1)
+        except FileNotFoundError:
+            console.print("[red]✗ Git not found[/red]")
+            sys.exit(1)
+
+        # Reinstall to pick up any dependency changes
+        console.print("📦 Reinstalling...")
+        try:
+            subprocess.run(
+                [sys.executable, "-m", "pip", "install", "-e", ".[dev]"],
+                check=True,
+                capture_output=True
+            )
+            console.print("[green]✓[/green] Reinstall complete\n")
+        except subprocess.CalledProcessError as e:
+            console.print(f"[red]✗ Reinstall failed:[/red] {e}")
+            console.print("[dim]Try running manually: pip install -e '.[dev]'[/dim]")
+            sys.exit(1)
+
+        # Verify
+        console.print("🔍 Verifying installation...")
+        try:
+            import importlib
+            import chiefwiggum
+            importlib.reload(chiefwiggum)
+            console.print(f"[green]✓[/green] Updated to version {chiefwiggum.__version__}\n")
+        except Exception as e:
+            console.print(f"[yellow]⚠[/yellow] Could not verify version: {e}\n")
+
+        console.print("[green]✅ Update complete![/green]")
+
+    elif is_pipx:
+        console.print("[cyan]Detected:[/cyan] pipx installation")
+        console.print()
+
+        if not shutil.which("pipx"):
+            console.print("[red]✗ pipx not found[/red]")
+            console.print("Install pipx first: brew install pipx")
+            sys.exit(1)
+
+        console.print("📦 Running pipx upgrade...")
+        try:
+            subprocess.run(["pipx", "upgrade", "chiefwiggum"], check=True)
+            console.print("\n[green]✅ Update complete![/green]")
+        except subprocess.CalledProcessError as e:
+            console.print(f"\n[red]✗ Update failed:[/red] {e}")
+            console.print("[dim]Try running manually: pipx upgrade chiefwiggum[/dim]")
+            sys.exit(1)
+
+    else:
+        console.print("[cyan]Detected:[/cyan] Standard pip installation")
+        console.print()
+
+        console.print("📦 Running pip upgrade...")
+        try:
+            subprocess.run(
+                [sys.executable, "-m", "pip", "install", "--upgrade", "chiefwiggum"],
+                check=True
+            )
+            console.print("\n[green]✅ Update complete![/green]")
+        except subprocess.CalledProcessError as e:
+            console.print(f"\n[red]✗ Update failed:[/red] {e}")
+            console.print("[dim]Try running manually: pip install --upgrade chiefwiggum[/dim]")
+            sys.exit(1)
+
+    console.print("\n[dim]Run 'wig verify' to verify the installation[/dim]")
 
 
 if __name__ == "__main__":

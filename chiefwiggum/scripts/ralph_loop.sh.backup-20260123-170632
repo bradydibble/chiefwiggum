@@ -38,9 +38,6 @@ CLAUDE_USE_CONTINUE=true                 # Enable session continuity
 CLAUDE_SESSION_FILE=".claude_session_id" # Session ID persistence file
 CLAUDE_MIN_VERSION="2.0.76"              # Minimum required Claude CLI version
 
-# Ralph Loop Alignment (Phase 3)
-SINGLE_TASK_MODE=false                   # If true, exit after completing one task (no auto-claim next)
-
 # Session management configuration (Phase 1.2)
 # Note: SESSION_EXPIRATION_SECONDS is defined in lib/response_analyzer.sh (86400 = 24 hours)
 RALPH_SESSION_FILE=".ralph_session"              # Ralph-specific session tracking (lifecycle)
@@ -308,22 +305,12 @@ extract_errors() {
         details_json=$(echo -e "$matched_patterns" | head -3 | jq -R -s 'split("\n") | map(select(length > 0)) | .[0:3]' 2>/dev/null || echo '[]')
     fi
 
-    # Validate error_count before passing to jq --argjson
-    error_count=$(validate_for_argjson "error_count" "$error_count" "number")
-
-    # Return JSON result with error handling
-    if ! jq -n \
+    # Return JSON result
+    jq -n \
         --arg category "$error_category" \
         --argjson count "$error_count" \
         --argjson details "$details_json" \
-        '{category: $category, count: $count, details: $details}' 2>/tmp/jq_error_detect_$$.log; then
-        echo "ERROR: jq failed in detect_errors. error_count='$error_count'" >&2
-        cat /tmp/jq_error_detect_$$.log >&2
-        rm -f /tmp/jq_error_detect_$$.log
-        # Return minimal valid JSON
-        echo '{"category":"unknown","count":0,"details":[]}'
-    fi
-    rm -f /tmp/jq_error_detect_$$.log
+        '{category: $category, count: $count, details: $details}'
 }
 
 # Update status JSON for external monitoring
@@ -1325,14 +1312,7 @@ EOF
                     log_status "SUCCESS" "✅ Task $completed_task_id marked complete in database"
                     log_status "DEBUG" "Complete command output: $complete_output"
 
-                    # TASK CONTINUATION: Attempt to claim next task from queue (unless single-task mode)
-                    if [[ "$SINGLE_TASK_MODE" == "true" ]]; then
-                        log_status "INFO" "🎯 Single-task mode: Exiting after task completion (no auto-claim)"
-                        reset_session "single_task_complete"
-                        update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "single_task_complete" "completed" "task_done" '{"category":"none","count":0,"details":[]}' "null" "false" "null"
-                        return 6
-                    fi
-
+                    # TASK CONTINUATION: Attempt to claim next task from queue
                     log_status "INFO" "📋 Checking for next task in queue..."
 
                     local claim_result
@@ -1349,7 +1329,7 @@ EOF
                         if ! validate_task_id "$new_task_id"; then
                             log_status "ERROR" "❌ CHECKPOINT 1 FAILED: Invalid task ID after claim"
                             log_status "ERROR" "Releasing claim and exiting..."
-                            release_current_task "$RALPH_ID" || true
+                            release_current_task "$RALPH_ID"
                             reset_session "invalid_task_after_claim"
                             return 5
                         fi
@@ -1364,7 +1344,7 @@ EOF
                         if [[ "$task_info_success" != "true" ]]; then
                             log_status "ERROR" "❌ CHECKPOINT 2 FAILED: Could not retrieve task info after retries"
                             log_status "ERROR" "Releasing claim and exiting..."
-                            release_current_task "$RALPH_ID" || true
+                            release_current_task "$RALPH_ID"
                             reset_session "task_info_retrieval_failed"
                             return 5
                         fi
@@ -1392,7 +1372,7 @@ EOF
                         else
                             log_status "ERROR" "❌ CHECKPOINT 3 FAILED: Prompt generation failed"
                             log_status "ERROR" "Releasing claim and exiting..."
-                            release_current_task "$RALPH_ID" || true
+                            release_current_task "$RALPH_ID"
                             reset_session "prompt_generation_failed"
                             # Return special code to signal main loop to exit
                             return 5
@@ -1476,14 +1456,7 @@ EOF
                                         log_status "SUCCESS" "✅ AUTO-RECOVERY: Task $auto_task_id marked complete"
                                         log_status "INFO" "   Note: Claude forgot to output RALPH_STATUS block but work was done"
 
-                                        # TASK CONTINUATION: Attempt to claim next task (unless single-task mode)
-                                        if [[ "$SINGLE_TASK_MODE" == "true" ]]; then
-                                            log_status "INFO" "🎯 Single-task mode: Exiting after task completion (no auto-claim)"
-                                            reset_session "single_task_complete"
-                                            update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "single_task_complete" "completed" "task_done" '{"category":"none","count":0,"details":[]}' "null" "false" "null"
-                                            return 6
-                                        fi
-
+                                        # TASK CONTINUATION: Attempt to claim next task (same as normal completion path)
                                         log_status "INFO" "📋 Checking for next task in queue..."
                                         local next_claimed=$(claim_next_task_for_ralph "$RALPH_ID")
 
@@ -1651,9 +1624,8 @@ cleanup() {
 # This runs on ANY exit, including set -e failures
 on_exit() {
     local exit_code=$?
-
     if [[ $exit_code -ne 0 ]]; then
-        log_status "ERROR" "💀 Ralph loop exiting with code $exit_code"
+        log_status "ERROR" "💀 Ralph loop exiting unexpectedly with code $exit_code"
         log_status "ERROR" "   Last loop: #$loop_count"
         log_status "ERROR" "   Ralph ID: ${RALPH_ID:-unknown}"
         log_status "ERROR" "   Working dir: $(pwd)"
@@ -1671,28 +1643,6 @@ on_exit() {
         # Log bash execution context
         log_status "ERROR" "   BASH_COMMAND: ${BASH_COMMAND:-unknown}"
         log_status "ERROR" "   BASH_LINENO: ${BASH_LINENO[*]:-unknown}"
-
-        # CRITICAL: Write status before exit to prevent race conditions
-        # Spawner will trust this status instead of overwriting with "crashed"
-        local loop_val=${loop_count:-0}
-        local calls_val=$(cat "$CALL_COUNT_FILE" 2>/dev/null || echo "0")
-
-        # Determine crash category based on exit code
-        local crash_message="Script error"
-        if [[ $exit_code -eq 2 ]]; then
-            crash_message="Script error (command failed)"
-        elif [[ $exit_code -eq 130 ]]; then
-            crash_message="Interrupted (SIGINT)"
-        elif [[ $exit_code -eq 143 ]]; then
-            crash_message="Terminated (SIGTERM)"
-        fi
-
-        update_status "$loop_val" "$calls_val" "unexpected_exit" "crashed" \
-            "exit_code_$exit_code" \
-            '{"category":"script_error","count":1,"details":[]}' \
-            "null" "false" "$crash_message"
-
-        log_status "INFO" "Status file updated with exit code $exit_code"
     fi
 }
 
@@ -1707,7 +1657,7 @@ loop_count=0
 main() {
     # Set fallback for STATUS_FILE if not provided via --status-file
     # This allows standalone usage (local status.json) while ChiefWiggum
-    # passes the centralized ~/.chiefwiggum/ralphs/status/{ralph_id}.json path
+    # passes the centralized ~/.chiefwiggum/status/{ralph_id}.json path
     if [[ -z "$STATUS_FILE" ]]; then
         STATUS_FILE="status.json"
     fi
@@ -1761,7 +1711,7 @@ main() {
 
             # Release task claim before exiting
             if [[ -n "$RALPH_ID" ]]; then
-                release_current_task "$RALPH_ID" || true
+                release_current_task "$RALPH_ID"
             fi
 
             reset_session "max_loops_exceeded"
@@ -1776,16 +1726,8 @@ main() {
                 local task_status=$(get_task_status "$current_task_id")
 
                 if [[ "$task_status" == "completed" ]]; then
-                    log_status "WARN" "⚠️ Current task already completed"
+                    log_status "WARN" "⚠️ Current task already completed, claiming next task..."
 
-                    # In single-task mode, exit instead of claiming next
-                    if [[ "$SINGLE_TASK_MODE" == "true" ]]; then
-                        log_status "INFO" "🎯 Single-task mode: Exiting (task already completed)"
-                        reset_session "single_task_already_complete"
-                        break
-                    fi
-
-                    log_status "INFO" "📋 Claiming next task..."
                     local next_claimed=$(claim_next_task_for_ralph "$RALPH_ID")
 
                     if [[ "$next_claimed" == "true" ]]; then
@@ -1818,7 +1760,7 @@ main() {
         start_phase "cost_budget_check"
         if [[ -n "$COST_BUDGET_USD" && -n "$RALPH_ID" ]]; then
             # Read accumulated cost from status
-            local status_file="$HOME/.chiefwiggum/ralphs/status/${RALPH_ID}.json"
+            local status_file="$HOME/.chiefwiggum/status/${RALPH_ID}.json"
             if [[ -f "$status_file" ]]; then
                 local current_cost=$(jq -r '.cost_info.accumulated_cost // 0' "$status_file")
 
@@ -1856,7 +1798,7 @@ main() {
 
             # Release task claim before exiting
             if [[ -n "$RALPH_ID" ]]; then
-                release_current_task "$RALPH_ID" || true
+                release_current_task "$RALPH_ID"
             fi
 
             reset_session "circuit_breaker_open"
@@ -1922,30 +1864,17 @@ main() {
 
         # Build progress_data JSON
         local progress_data_json
-        if [[ "$test_progress" != "null" && -n "$test_progress" ]]; then
-            # Validate test_progress is valid JSON before using with --argjson
-            if echo "$test_progress" | jq empty 2>/dev/null; then
-                # We have test results - wrap in progress_data structure
-                if ! progress_data_json=$(jq -n \
-                    --argjson test_results "$test_progress" \
-                    '{
-                        test_results: $test_results,
-                        stuck_indicators: {
-                            same_test_failures: 0,
-                            loop_count_without_progress: 0
-                        }
-                    }' 2>/tmp/jq_error_progress_$$.log); then
-                    echo "ERROR: jq failed to build progress_data. test_progress validation failed" >&2
-                    cat /tmp/jq_error_progress_$$.log >&2
-                    rm -f /tmp/jq_error_progress_$$.log
-                    progress_data_json="null"
-                else
-                    rm -f /tmp/jq_error_progress_$$.log
-                fi
-            else
-                echo "WARN: test_progress is not valid JSON, setting to null" >&2
-                progress_data_json="null"
-            fi
+        if [[ "$test_progress" != "null" ]]; then
+            # We have test results - wrap in progress_data structure
+            progress_data_json=$(jq -n \
+                --argjson test_results "$test_progress" \
+                '{
+                    test_results: $test_results,
+                    stuck_indicators: {
+                        same_test_failures: 0,
+                        loop_count_without_progress: 0
+                    }
+                }' 2>/dev/null || echo "null")
         else
             progress_data_json="null"
         fi
@@ -1997,7 +1926,7 @@ except Exception as e:
             # Circuit breaker opened
             # Release task claim before exiting
             if [[ -n "$RALPH_ID" ]]; then
-                release_current_task "$RALPH_ID" || true
+                release_current_task "$RALPH_ID"
             fi
 
             reset_session "circuit_breaker_trip"
@@ -2622,10 +2551,6 @@ while [[ $# -gt 0 ]]; do
             ;;
         --no-continue)
             CLAUDE_USE_CONTINUE=false
-            shift
-            ;;
-        --single-task)
-            SINGLE_TASK_MODE=true
             shift
             ;;
         --session-expiry)

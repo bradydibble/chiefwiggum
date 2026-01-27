@@ -87,6 +87,18 @@ DEFAULT_CONFIG = {
         "output_format": "json",         # --output-format (json/text)
         "max_calls_per_hour": 100,       # --calls value
     },
+
+    # Worktree Settings (US: Git Worktree Isolation)
+    "worktree_settings": {
+        "enabled": True,                     # DEFAULT ON - use worktrees for isolation
+        "base_dir": ".worktrees",            # Directory name for worktrees
+        "branch_prefix": "ralph",            # Prefix for worktree branches
+        "merge_strategy": "auto",            # auto = try fast-forward, fallback to regular
+        "cleanup_on_success": True,          # Cleanup worktree after successful merge
+        "cleanup_on_conflict": True,         # Cleanup and release task on conflict
+        "require_clean_working_tree": True,  # Require clean tree before merge
+        "max_worktrees_per_project": 10,     # Max concurrent worktrees
+    },
 }
 
 

@@ -13,6 +13,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
+from chiefwiggum.cache import process_health_cache
 from chiefwiggum.config import get_ralph_loop_settings
 from chiefwiggum.database import get_setting, set_setting
 from chiefwiggum.models import RalphConfig, TargetingConfig, TaskClaim
@@ -376,10 +377,17 @@ def generate_prompt_for_task(task_id: str, fix_plan_path: str | Path | None = No
         The generated prompt string
 
     Raises:
-        ValueError: If task not found or other error
+        ValueError: If task_id is invalid or task not found
     """
     import asyncio
     from chiefwiggum.coordination import get_task_claim
+
+    # Validate task_id parameter
+    if not task_id or not task_id.strip():
+        raise ValueError("task_id parameter is empty or whitespace")
+
+    if task_id == "null":
+        raise ValueError("task_id parameter is the string 'null' - likely a race condition in task claiming")
 
     # Run the async function synchronously
     loop = asyncio.get_event_loop()
@@ -391,7 +399,11 @@ def generate_prompt_for_task(task_id: str, fix_plan_path: str | Path | None = No
     try:
         task_claim = loop.run_until_complete(get_task_claim(task_id))
         if not task_claim:
-            raise ValueError(f"Task {task_id} not found in database")
+            raise ValueError(
+                f"Task '{task_id}' not found in database. "
+                "This may indicate a race condition where the task was claimed "
+                "but the database hasn't synced yet, or the task_id is invalid."
+            )
 
         # Determine fix_plan_path
         if fix_plan_path is None:
@@ -410,9 +422,13 @@ def generate_prompt_for_task(task_id: str, fix_plan_path: str | Path | None = No
         # Generate the prompt using the existing function
         return generate_task_prompt(task_claim, fix_plan_path)
 
-    except Exception as e:
-        logger.error(f"Failed to generate prompt for task {task_id}: {e}")
+    except ValueError as e:
+        # Preserve ValueError messages (they have context about the failure)
+        logger.error(f"Validation error for task_id '{task_id}': {e}")
         raise
+    except Exception as e:
+        logger.error(f"Failed to generate prompt for task '{task_id}': {e}")
+        raise ValueError(f"Failed to generate prompt for task '{task_id}': {e}") from e
 
 
 def write_ralph_status(
@@ -442,6 +458,16 @@ def write_ralph_status(
     import json
 
     status_path = get_ralph_status_path(ralph_id)
+
+    # Preserve existing cost_info if it exists (written by ralph_loop.sh)
+    existing_cost_info = None
+    if status_path.exists():
+        try:
+            existing_data = json.loads(status_path.read_text())
+            existing_cost_info = existing_data.get("cost_info")
+        except (json.JSONDecodeError, Exception):
+            pass  # Ignore errors reading existing file
+
     status_data = {
         "ralph_id": ralph_id,
         "task_id": task_id,
@@ -477,7 +503,15 @@ def write_ralph_status(
     status_data["needs_human_intervention"] = needs_human_intervention
     status_data["hitl_reason"] = hitl_reason
 
+    # Preserve cost_info if it existed
+    if existing_cost_info is not None:
+        status_data["cost_info"] = existing_cost_info
+
     status_path.write_text(json.dumps(status_data, indent=2))
+
+    # Invalidate error indicator cache when status changes
+    from chiefwiggum.cache import error_indicator_cache
+    error_indicator_cache.invalidate(f"error:{ralph_id}")
 
 
 def read_ralph_status(ralph_id: str) -> dict | None:
@@ -495,6 +529,39 @@ def read_ralph_status(ralph_id: str) -> dict | None:
         return json.loads(status_path.read_text())
     except (json.JSONDecodeError, IOError):
         return None
+
+
+def write_ralph_status_if_not_terminal(
+    ralph_id: str,
+    task_id: str | None,
+    status: str,
+    message: str = "",
+    **kwargs
+) -> bool:
+    """Write Ralph status only if current status is not terminal.
+
+    Terminal statuses: crashed, completed, stopped
+    This prevents race conditions where spawner overwrites ralph_loop.sh's final status.
+
+    Args:
+        ralph_id: The Ralph instance ID
+        task_id: Current task being worked on
+        status: New status to write
+        message: Status message
+        **kwargs: Additional args passed to write_ralph_status()
+
+    Returns:
+        True if status was written, False if skipped (already terminal)
+    """
+    current = read_ralph_status(ralph_id)
+    if current and current.get("status") in ("crashed", "completed", "stopped"):
+        logger.debug(
+            f"Skipping status write for {ralph_id} - already terminal: {current.get('status')}"
+        )
+        return False
+
+    write_ralph_status(ralph_id, task_id, status, message=message, **kwargs)
+    return True
 
 
 # Claude Code-specific error patterns (mirrors ralph_loop.sh patterns)
@@ -985,6 +1052,44 @@ def get_process_health(ralph_id: str) -> dict:
     return result
 
 
+def get_process_health_cached(ralph_id: str) -> dict:
+    """
+    Get process health with caching to avoid repeated subprocess calls.
+
+    This is a cached wrapper around get_process_health() with 5s TTL.
+    Use this in UI rendering to avoid blocking on subprocess calls.
+
+    Args:
+        ralph_id: Ralph instance ID
+
+    Returns:
+        Health info dict (same as get_process_health)
+    """
+    cache_key = f"health:{ralph_id}"
+    cached_result = process_health_cache.get(cache_key)
+
+    if cached_result is not None:
+        return cached_result
+
+    # Cache miss - fetch fresh data
+    result = get_process_health(ralph_id)
+    process_health_cache.set(cache_key, result)
+    return result
+
+
+def invalidate_process_health_cache(ralph_id: str = None) -> None:
+    """
+    Invalidate process health cache.
+
+    Args:
+        ralph_id: Specific Ralph to invalidate, or None to clear all
+    """
+    if ralph_id:
+        process_health_cache.invalidate(f"health:{ralph_id}")
+    else:
+        process_health_cache.invalidate_pattern("health:")
+
+
 def get_status_staleness(ralph_id: str) -> dict:
     """Check how stale the status file is.
 
@@ -1256,8 +1361,8 @@ async def handle_stuck_ralph(ralph_id: str, reason: str) -> dict:
 
     # Step 2: Update instance status
     try:
-        # Write status file
-        write_ralph_status(
+        # Write status file (only if not already terminal)
+        write_ralph_status_if_not_terminal(
             ralph_id,
             task_id=None,
             status="crashed",
@@ -1374,8 +1479,8 @@ def reap_zombie_ralph(ralph_id: str) -> bool:
             except FileNotFoundError:
                 pass
 
-            # Update status file to indicate crash
-            write_ralph_status(
+            # Update status file to indicate crash (only if not already terminal)
+            write_ralph_status_if_not_terminal(
                 ralph_id,
                 task_id=None,
                 status="crashed",
@@ -1402,8 +1507,8 @@ def reap_zombie_ralph(ralph_id: str) -> bool:
         # Not our child - can't reap it
         logger.warning(f"Cannot reap zombie {ralph_id} - not our child process")
 
-        # Still mark it as crashed in status
-        write_ralph_status(
+        # Still mark it as crashed in status (only if not already terminal)
+        write_ralph_status_if_not_terminal(
             ralph_id,
             task_id=None,
             status="crashed",
@@ -1441,8 +1546,8 @@ def cleanup_dead_ralphs() -> list[str]:
                     pid_file.unlink()
                 cleaned.append(ralph_id)
 
-                # Update status
-                write_ralph_status(
+                # Update status (only if not already terminal)
+                write_ralph_status_if_not_terminal(
                     ralph_id,
                     task_id=None,
                     status="crashed",
@@ -1451,7 +1556,7 @@ def cleanup_dead_ralphs() -> list[str]:
             except FileNotFoundError:
                 # PID file already cleaned up by get_process_health
                 cleaned.append(ralph_id)
-                write_ralph_status(
+                write_ralph_status_if_not_terminal(
                     ralph_id,
                     task_id=None,
                     status="crashed",
@@ -1595,8 +1700,62 @@ def spawn_ralph_daemon(
         # Check if process is still running
         poll_result = process.poll()
         if poll_result is not None:
-            # Process exited immediately - this is bad
-            logger.error(f"[SPAWN] Ralph {ralph_id} exited immediately with code {poll_result}")
+            # Process exited - trust exit code + status file (Ralph Loop Alignment)
+            status_file = get_ralph_status_path(ralph_id)
+
+            # Exit code contract (see Plan):
+            # 0: Success - task complete
+            # 2: Script error - crashed
+            # 3: Circuit breaker - needs review
+            # 10: Cost limit - stopped
+            # 130: SIGINT - interrupted
+
+            is_graceful = False
+            exit_message = ""
+
+            if poll_result == 0:
+                # Success
+                is_graceful = True
+                exit_message = f"Ralph {ralph_id} completed successfully (exit 0)"
+                logger.info(f"[SPAWN] {exit_message}")
+
+            elif poll_result == 130:
+                # SIGINT - graceful interrupt
+                is_graceful = True
+                exit_message = f"Ralph {ralph_id} interrupted (SIGINT)"
+                logger.info(f"[SPAWN] {exit_message}")
+
+            elif poll_result in (3, 10):
+                # Circuit breaker or cost limit - graceful halt
+                is_graceful = True
+                halt_reason = "circuit breaker" if poll_result == 3 else "cost limit"
+                exit_message = f"Ralph {ralph_id} halted ({halt_reason})"
+                logger.warning(f"[SPAWN] {exit_message}")
+
+            else:
+                # Check status file for additional context
+                if status_file.exists():
+                    try:
+                        import json
+                        with open(status_file) as f:
+                            status_data = json.load(f)
+                            last_status = status_data.get("status", "")
+                            last_message = status_data.get("message", "")
+
+                            # Trust status file if it indicates completion
+                            if last_status in ("completed", "complete") or "complete" in last_message.lower():
+                                is_graceful = True
+                                exit_message = f"Ralph {ralph_id} completed (status file indicates completion)"
+                                logger.info(f"[SPAWN] {exit_message}")
+                    except Exception as e:
+                        logger.debug(f"[SPAWN] Could not check status file: {e}")
+
+            if is_graceful:
+                # Graceful exit - don't mark as crashed
+                return (True, exit_message)
+
+            # Non-graceful exit - this is a crash
+            logger.error(f"[SPAWN] Ralph {ralph_id} crashed immediately with exit code {poll_result}")
 
             # Read any error output from log
             log_file.flush()
@@ -1607,12 +1766,13 @@ def spawn_ralph_daemon(
             except Exception:
                 pass
 
-            # Clean up PID file
+            # Clean up PID file and mark as crashed
             try:
                 pid_path.unlink()
             except FileNotFoundError:
                 pass
 
+            write_ralph_status(ralph_id, None, "crashed", "Process died unexpectedly")
             return (False, f"Ralph {ralph_id} exited immediately (code: {poll_result})")
 
         # Verify it's actually running
@@ -1626,6 +1786,11 @@ def spawn_ralph_daemon(
 
         # Close log file in parent - child has its own copy of the fd
         log_file.close()
+
+        # Invalidate caches after successful spawn
+        invalidate_process_health_cache(ralph_id)
+        from chiefwiggum.cache import error_indicator_cache
+        error_indicator_cache.invalidate(f"error:{ralph_id}")
 
         return (True, f"Spawned Ralph {ralph_id} (PID: {process.pid})")
 
@@ -1791,6 +1956,159 @@ async def spawn_ralph_with_task_claim(
         return (False, message, None)
 
 
+async def spawn_ralph_for_graded_task(
+    ralph_id: str,
+    task_id: str,
+    project: str,
+    working_dir: str | Path,
+    config: RalphConfig | None = None,
+) -> tuple[bool, str]:
+    """Spawn a Ralph instance for a specific task from the graded task queue.
+
+    This is the NEW spawning method for Ralph Loop Alignment. It:
+    1. Gets the task from the graded tasks table
+    2. Uses the pre-generated, graded prompt (no generation at spawn time)
+    3. Spawns Ralph with fresh context (no --continue)
+    4. One Ralph = One Task = One Process
+
+    Args:
+        ralph_id: Unique ID for this Ralph instance
+        task_id: Task ID from the graded tasks table
+        project: Project name
+        working_dir: Working directory for Ralph
+        config: Optional Ralph configuration
+
+    Returns:
+        Tuple of (success, message)
+
+    Raises:
+        ValueError: If task not found or has no generated prompt
+    """
+    from chiefwiggum.coordination import get_graded_task
+
+    logger.info(f"[SPAWN_GRADED] Spawning {ralph_id} for task {task_id}")
+
+    # Get task from graded queue
+    task = await get_graded_task(task_id)
+    if not task:
+        logger.error(f"[SPAWN_GRADED] Task not found: {task_id}")
+        return (False, f"Task not found: {task_id}")
+
+    if not task.get("generated_prompt"):
+        logger.error(f"[SPAWN_GRADED] Task {task_id} has no generated prompt")
+        return (False, f"Task {task_id} has no generated prompt. Run 'wig sync --with-grading' first.")
+
+    # Check task status
+    status = task.get("status")
+    if status == "completed":
+        return (False, f"Task {task_id} already completed")
+    elif status == "active":
+        claimed_by = task.get("claimed_by_ralph_id")
+        return (False, f"Task {task_id} already claimed by {claimed_by}")
+    elif status == "blocked":
+        return (False, f"Task {task_id} is blocked (Grade F). Improve spec before spawning.")
+
+    # Create config with FRESH CONTEXT and SINGLE TASK enforced
+    if config is None:
+        config = RalphConfig(
+            no_continue=True,  # CRITICAL: Fresh context per Ralph Loop principle
+            single_task=True,  # CRITICAL: One Ralph = One Task
+            session_expiry_hours=24,
+            output_format="json",
+            max_calls_per_hour=100,
+        )
+    else:
+        # Override no_continue and single_task to ensure fresh context and one task per Ralph
+        config = config.model_copy(update={"no_continue": True, "single_task": True})
+
+    # Write task-specific prompt to temp file
+    prompt_path = get_task_prompt_path(ralph_id, task_id)
+    prompt_path.write_text(task["generated_prompt"])
+    logger.info(f"[SPAWN_GRADED] Prompt written to: {prompt_path}")
+
+    # Update task status to active and claim it
+    from chiefwiggum.database import get_connection
+    from datetime import datetime
+
+    conn = await get_connection()
+    try:
+        now = datetime.now()
+        await conn.execute(
+            """UPDATE tasks
+               SET status = 'active', claimed_by_ralph_id = ?, updated_at = ?
+               WHERE id = ? AND status = 'pending'""",
+            (ralph_id, now, task_id)
+        )
+        await conn.commit()
+
+        # Check if update succeeded (task might have been claimed by another Ralph)
+        cursor = await conn.execute(
+            "SELECT claimed_by_ralph_id FROM tasks WHERE id = ?",
+            (task_id,)
+        )
+        row = await cursor.fetchone()
+        if row and row[0] != ralph_id:
+            logger.warning(f"[SPAWN_GRADED] Task {task_id} was claimed by {row[0]} during spawn")
+            return (False, f"Task {task_id} was claimed by another Ralph")
+
+    finally:
+        await conn.close()
+
+    # Register Ralph instance
+    from chiefwiggum.coordination import register_ralph_instance_with_config
+
+    try:
+        await register_ralph_instance_with_config(
+            ralph_id=ralph_id,
+            project=project,
+            config=config,
+            targeting=None,
+            prompt_path=str(prompt_path),
+        )
+        logger.info(f"[SPAWN_GRADED] Ralph {ralph_id} registered")
+    except Exception as e:
+        logger.warning(f"[SPAWN_GRADED] Failed to register Ralph: {e}")
+        # Continue anyway
+
+    # Spawn Ralph daemon
+    working_dir = Path(working_dir).resolve()
+    success, message = spawn_ralph_daemon(
+        ralph_id=ralph_id,
+        project=project,
+        fix_plan_path=str(prompt_path),  # Use task-specific prompt
+        config=config,
+        targeting=None,
+        working_dir=working_dir,
+    )
+
+    if success:
+        write_ralph_status(
+            ralph_id,
+            task_id,
+            "working",
+            loop_count=1,
+            message=f"Working on: {task['title'][:40]}"
+        )
+        logger.info(f"[SPAWN_GRADED] Successfully spawned {ralph_id} for task {task_id}")
+        return (True, f"Spawned {ralph_id} on task: {task['title'][:40]}")
+    else:
+        # Release the claim since spawn failed
+        conn = await get_connection()
+        try:
+            await conn.execute(
+                """UPDATE tasks
+                   SET status = 'pending', claimed_by_ralph_id = NULL, updated_at = ?
+                   WHERE id = ?""",
+                (datetime.now(), task_id)
+            )
+            await conn.commit()
+        finally:
+            await conn.close()
+
+        logger.error(f"[SPAWN_GRADED] Failed to spawn {ralph_id}: {message}")
+        return (False, message)
+
+
 def _build_ralph_command(
     ralph_id: str,
     project: str,
@@ -1825,6 +2143,10 @@ def _build_ralph_command(
     # Session continuity (existing, but honor config default)
     if config.no_continue:
         cmd.append("--no-continue")
+
+    # Single task mode (Ralph Loop Alignment)
+    if config.single_task:
+        cmd.append("--single-task")
 
     # Session expiry (only pass if non-default)
     if config.session_expiry_hours != 24:
@@ -1885,7 +2207,7 @@ def _build_ralph_command(
     cmd.extend(["--prompt", fix_plan_path])
 
     # Pass status file path so ralph_loop.sh writes to the correct location
-    # This ensures status is written to ~/.chiefwiggum/status/{ralph_id}.json
+    # This ensures status is written to ~/.chiefwiggum/ralphs/status/{ralph_id}.json
     # instead of a per-project status.json (which causes conflicts with multiple ralphs)
     status_path = get_ralph_status_path(ralph_id)
     cmd.extend(["--status-file", str(status_path)])
@@ -1927,6 +2249,12 @@ def stop_ralph_daemon(ralph_id: str, force: bool = False) -> tuple[bool, str]:
             f.write(f"{'='*60}\n")
 
         logger.info(f"Stopped Ralph {ralph_id} (PID: {pid})")
+
+        # Invalidate caches after stopping
+        invalidate_process_health_cache(ralph_id)
+        from chiefwiggum.cache import error_indicator_cache
+        error_indicator_cache.invalidate(f"error:{ralph_id}")
+
         return (True, f"Stopped Ralph {ralph_id}")
 
     except ProcessLookupError:

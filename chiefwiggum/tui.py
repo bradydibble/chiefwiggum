@@ -38,7 +38,12 @@ from chiefwiggum import (
     stop_all_instances,
     sync_tasks_from_fix_plan,
 )
-from chiefwiggum.coordination import get_all_instance_progress
+from chiefwiggum.cache import error_indicator_cache, progress_data_cache
+from chiefwiggum.coordination import (
+    get_all_instance_progress,
+    get_all_instance_progress_cached,
+    invalidate_progress_cache,
+)
 from chiefwiggum.config import (
     get_api_key_source,
     get_api_key,
@@ -80,7 +85,9 @@ from chiefwiggum.spawner import (
     generate_ralph_id,
     get_error_summary,
     get_process_health,
+    get_process_health_cached,
     get_running_ralphs,
+    invalidate_process_health_cache,
     read_ralph_log,
     read_ralph_status,
     spawn_ralph_with_task_claim,
@@ -267,6 +274,8 @@ class TUIMode(Enum):
     SHUTDOWN = auto()
     RELEASE = auto()
     # Removed SYNC mode - 'y' now syncs immediately
+    GRADED_TASKS = auto()  # Graded task queue view (Ralph Loop Alignment)
+    TASK_DETAIL = auto()  # Task detail view showing prompt and grade reasoning
     SETTINGS = auto()  # Settings/config view
     SETTINGS_EDIT_API_KEY = auto()  # Edit API key input
     SETTINGS_EDIT_MAX_RALPHS = auto()  # Edit max concurrent ralphs
@@ -419,6 +428,9 @@ class TUIState:
     selected_task_ids: set = field(default_factory=set)
     bulk_mode_active: bool = False
     # All tasks for filtering/sorting
+    # Graded tasks (Ralph Loop Alignment)
+    graded_tasks: list = field(default_factory=list)  # Tasks from new graded queue
+    selected_graded_task_idx: int = 0  # Selected task in graded view
     all_tasks_cache: list = field(default_factory=list)
     # Text input buffer for settings edit modes
     input_buffer: str = ""
@@ -489,6 +501,44 @@ def _get_error_indicator(ralph_id: str) -> str:
     return f"[{color}]{icon}[/{color}]"
 
 
+def _get_error_indicator_cached(ralph_id: str) -> str:
+    """
+    Get error indicator with caching to avoid repeated file I/O.
+
+    This is a cached wrapper around _get_error_indicator() with 5s TTL.
+    Use this in UI rendering to avoid blocking on file reads.
+
+    Args:
+        ralph_id: Ralph instance ID
+
+    Returns:
+        Rich-formatted error indicator string
+    """
+    cache_key = f"error:{ralph_id}"
+    cached_result = error_indicator_cache.get(cache_key)
+
+    if cached_result is not None:
+        return cached_result
+
+    # Cache miss - fetch fresh data
+    result = _get_error_indicator(ralph_id)
+    error_indicator_cache.set(cache_key, result)
+    return result
+
+
+def invalidate_error_indicator_cache(ralph_id: str = None) -> None:
+    """
+    Invalidate error indicator cache.
+
+    Args:
+        ralph_id: Specific Ralph to invalidate, or None to clear all
+    """
+    if ralph_id:
+        error_indicator_cache.invalidate(f"error:{ralph_id}")
+    else:
+        error_indicator_cache.invalidate_pattern("error:")
+
+
 def create_progress_bar(percent: int, width: int = 5) -> str:
     """Create a progress bar string from percentage.
 
@@ -545,13 +595,13 @@ def create_instances_table(instances: list, show_all: bool = False, selected_idx
             elapsed_str = format_age(elapsed_seconds)
 
         # Get error indicator for this instance
-        error_indicator = _get_error_indicator(inst.ralph_id)
+        error_indicator = _get_error_indicator_cached(inst.ralph_id)
 
         # Status styling with icons (using semantic colors)
         # First, check actual process health if status shows ACTIVE
         process_is_dead = False
         if inst.status == RalphInstanceStatus.ACTIVE:
-            health = get_process_health(inst.ralph_id)
+            health = get_process_health_cached(inst.ralph_id)
             process_is_dead = not health.get("healthy", True)
 
         # Check for stalled task (no log updates in 30s while active)
@@ -773,6 +823,107 @@ def create_tasks_table(
     if not tasks:
         row = [""] * (num_cols - 4) + ["[dim]No tasks synced (press 'y' to sync)[/dim]", "", "", ""]
         table.add_row(*row)
+
+    return table
+
+
+def create_graded_tasks_table(
+    tasks: list,
+    offset: int = 0,
+    limit: int = 20,
+    selected_idx: int | None = None,
+    expanded: bool = False,
+) -> Table:
+    """Create a table showing graded tasks from the Ralph Loop Alignment queue.
+
+    Args:
+        tasks: List of task dicts from the graded tasks table
+        offset: Pagination offset
+        limit: Max tasks to show
+        selected_idx: Currently selected task index
+        expanded: Whether to expand task column width
+    """
+    from chiefwiggum.prompt_grader import get_grade_letter, get_grade_color
+
+    title = f"Graded Task Queue ({offset + 1}-{min(offset + limit, len(tasks))} of {len(tasks)})" if tasks else "Graded Task Queue (Empty)"
+    table = Table(title=title, expand=True, box=box.ROUNDED)
+
+    table.add_column("#", style="dim", no_wrap=True, width=3)
+    table.add_column("Grade", no_wrap=True, width=7, justify="center")
+    table.add_column("ID", style="cyan", no_wrap=True, width=15)
+    task_width = None if expanded else 35
+    table.add_column("Title", max_width=task_width)
+    table.add_column("Status", justify="center", width=12)
+    table.add_column("Claimed By", style="dim", width=12)
+
+    status_icons = {
+        "pending": f"[yellow]{ICON_PENDING} pending[/yellow]",
+        "active": f"[bold blue]{ICON_WORKING} active[/bold blue]",
+        "completed": f"[green]{ICON_DONE} done[/green]",
+        "blocked": f"[red]{ICON_STALL} blocked[/red]",
+        "needs_review": f"[magenta]{ICON_ALERT_WARNING} review[/magenta]",
+    }
+
+    # Show tasks from offset to offset+limit
+    visible_tasks = tasks[offset : offset + limit]
+    for idx, task in enumerate(visible_tasks, offset + 1):
+        # Get grade info
+        grade = task.get("grade")
+        grade_letter = get_grade_letter(grade) if grade is not None else "?"
+
+        # Color-code grades
+        if grade_letter == "A":
+            grade_display = f"[bold green]A {grade}[/bold green]"
+        elif grade_letter == "B":
+            grade_display = f"[yellow]B {grade}[/yellow]"
+        elif grade_letter == "C":
+            grade_display = f"[bold {COLOR_WARNING}]C {grade}[/bold {COLOR_WARNING}]"
+        elif grade_letter == "F":
+            grade_display = f"[bold red]F {grade}[/bold red]"
+        else:
+            grade_display = "[dim]? --[/dim]"
+
+        # Task info
+        task_id = task.get("id", "")
+        title = task.get("title", "")[:50]
+        status = task.get("status", "pending")
+        claimed_by = task.get("claimed_by_ralph_id", "")
+
+        # Status display
+        status_str = status_icons.get(status, status)
+
+        # Claimed by display (shortened)
+        if claimed_by:
+            parts = claimed_by.split("-")
+            claimed_display = "-".join(parts[-2:]) if len(parts) >= 2 else claimed_by
+            claimed_display = claimed_display[:12]
+        else:
+            claimed_display = "-"
+
+        # Check if this row is selected
+        is_row_selected = selected_idx is not None and (idx - 1) == selected_idx
+
+        # Build row
+        idx_display = f"{ICON_SELECTED} {idx}" if is_row_selected and idx <= 9 else str(idx)
+        row = [idx_display, grade_display, task_id[:15], title, status_str, claimed_display]
+
+        # Highlight selected row
+        if is_row_selected:
+            table.add_row(*row, style=STYLE_HIGHLIGHT)
+        else:
+            # Zebra striping
+            row_style = STYLE_TABLE_ROW_EVEN if (idx % 2 == 0) else ""
+            table.add_row(*row, style=row_style)
+
+    # Pagination hints
+    if len(tasks) > offset + limit:
+        remaining = len(tasks) - offset - limit
+        table.add_row("", "", "", f"[dim]... {remaining} more (j/k to scroll)[/dim]", "", "")
+    elif offset > 0:
+        table.add_row("", "", "", "[dim](j/k to scroll)[/dim]", "", "")
+
+    if not tasks:
+        table.add_row("", "", "", "[dim]No graded tasks (run 'wig sync --with-grading')[/dim]", "", "")
 
     return table
 
@@ -1026,6 +1177,7 @@ def get_help_lines() -> list[tuple[str, str]]:
     lines.append(("  h, ?   Show this help", ""))
     lines.append(("  j/k    Scroll down/up (in Help: scroll help)", ""))
     lines.append(("  z      Cycle view (split/tasks only/instances only)", ""))
+    lines.append(("  g      Graded task queue (Ralph Loop Alignment)", ""))
     lines.append(("  p      Filter by project", ""))
     lines.append(("  c      Cycle category filter", ""))
     lines.append(("  a      Toggle all tasks / pending only", ""))
@@ -1694,47 +1846,141 @@ def create_task_detail_panel(task, state: TUIState) -> Panel:
         TaskClaimStatus.RELEASED: (ICON_RELEASED, "dim"),
         TaskClaimStatus.RETRY_PENDING: (ICON_RETRY, "magenta"),
     }
-    icon, icon_style = status_icons.get(task.status, (ICON_PENDING, "white"))
+
+    # Handle both TaskClaim objects and graded task dicts/SimpleNamespace
+    task_status = getattr(task, "status", None)
+    if task_status and hasattr(task_status, "value"):
+        # TaskClaimStatus enum
+        icon, icon_style = status_icons.get(task_status, (ICON_PENDING, "white"))
+    else:
+        # String status (graded tasks)
+        status_str = getattr(task, "status", "pending")
+        status_map = {
+            "pending": (ICON_PENDING, "yellow"),
+            "active": (ICON_WORKING, "blue"),
+            "completed": (ICON_DONE, "green"),
+            "blocked": (ICON_STALL, "red"),
+            "needs_review": (ICON_ALERT_WARNING, "magenta"),
+        }
+        icon, icon_style = status_map.get(status_str, (ICON_PENDING, "white"))
+
     text.append(f"{icon} ", style=icon_style)
-    text.append(f"{task.task_title}\n", style="bold white")
-    text.append(f"ID: {task.task_id}\n\n", style="dim cyan")
+
+    # Get task title and ID (works for both types)
+    title = getattr(task, "task_title", getattr(task, "title", "Untitled"))
+    task_id = getattr(task, "task_id", getattr(task, "id", "unknown"))
+
+    text.append(f"{title}\n", style="bold white")
+    text.append(f"ID: {task_id}\n\n", style="dim cyan")
 
     # Status with attempt count for failed tasks
-    status_styles = {
-        TaskClaimStatus.PENDING: "yellow",
-        TaskClaimStatus.IN_PROGRESS: "blue",
-        TaskClaimStatus.COMPLETED: "green",
-        TaskClaimStatus.FAILED: "red",
-        TaskClaimStatus.RELEASED: "dim",
-        TaskClaimStatus.RETRY_PENDING: "magenta",
-    }
     text.append("Status: ", style="dim")
-    status_display = f"{task.status.value}"
-    if task.status == TaskClaimStatus.FAILED and task.retry_count > 0:
-        status_display += f" (attempt {task.retry_count + 1} of {task.max_retries})"
-    text.append(f"{status_display}\n", style=status_styles.get(task.status, "white"))
 
-    priority_styles = {"HIGH": "red", "MEDIUM": "yellow", "LOWER": "blue", "POLISH": "dim"}
-    text.append("Priority: ", style="dim")
-    text.append(f"{task.task_priority.value}\n", style=priority_styles.get(task.task_priority.value, "white"))
+    # Handle both enum and string status
+    if hasattr(task_status, "value"):
+        status_display = task_status.value
+        status_styles = {
+            TaskClaimStatus.PENDING: "yellow",
+            TaskClaimStatus.IN_PROGRESS: "blue",
+            TaskClaimStatus.COMPLETED: "green",
+            TaskClaimStatus.FAILED: "red",
+            TaskClaimStatus.RELEASED: "dim",
+            TaskClaimStatus.RETRY_PENDING: "magenta",
+        }
+        style = status_styles.get(task_status, "white")
+
+        if task_status == TaskClaimStatus.FAILED and hasattr(task, "retry_count") and task.retry_count > 0:
+            status_display += f" (attempt {task.retry_count + 1} of {task.max_retries})"
+    else:
+        # String status
+        status_display = getattr(task, "status", "unknown")
+        status_styles = {
+            "pending": "yellow",
+            "active": "blue",
+            "completed": "green",
+            "blocked": "red",
+            "needs_review": "magenta",
+        }
+        style = status_styles.get(status_display, "white")
+
+    text.append(f"{status_display}\n", style=style)
+
+    # Priority (may not exist for graded tasks)
+    if hasattr(task, "task_priority"):
+        priority_styles = {"HIGH": "red", "MEDIUM": "yellow", "LOWER": "blue", "POLISH": "dim"}
+        text.append("Priority: ", style="dim")
+        priority_val = task.task_priority.value if hasattr(task.task_priority, "value") else task.task_priority
+        text.append(f"{priority_val}\n", style=priority_styles.get(priority_val, "white"))
 
     # Category and Project
     if hasattr(task, "category") and task.category:
         text.append("Category: ", style="dim")
-        text.append(f"{task.category.value}\n", style="magenta")
-    if task.project:
+        cat_val = task.category.value if hasattr(task.category, "value") else task.category
+        text.append(f"{cat_val}\n", style="magenta")
+
+    project = getattr(task, "project", None)
+    if project:
         text.append("Project: ", style="dim")
-        text.append(f"{task.project}\n", style="blue")
+        text.append(f"{project}\n", style="blue")
 
     # Worker info
-    if task.claimed_by_ralph_id:
+    claimed_by = getattr(task, "claimed_by_ralph_id", None)
+    if claimed_by:
         text.append("Worker: ", style="dim")
-        text.append(f"{task.claimed_by_ralph_id}\n", style="cyan")
+        text.append(f"{claimed_by}\n", style="cyan")
 
     text.append("\n")
 
+    # Graded task info (Ralph Loop Alignment)
+    if hasattr(task, "grade") and task.grade is not None:
+        from chiefwiggum.prompt_grader import get_grade_letter
+
+        grade_letter = get_grade_letter(task.grade)
+
+        # Grade display with color
+        text.append("─" * 40 + "\n", style="dim")
+        text.append("Prompt Quality Grade\n", style="bold cyan")
+        text.append("\n")
+
+        text.append("Grade: ", style="dim")
+        if grade_letter == "A":
+            text.append(f"{grade_letter} ({task.grade}/100)", style="bold green")
+            text.append(" - Auto-spawn ready\n", style="green")
+        elif grade_letter == "B":
+            text.append(f"{grade_letter} ({task.grade}/100)", style="yellow")
+            text.append(" - Auto-spawn ready\n", style="yellow")
+        elif grade_letter == "C":
+            text.append(f"{grade_letter} ({task.grade}/100)", style=f"bold {COLOR_WARNING}")
+            text.append(" - Needs review\n", style=COLOR_WARNING)
+        else:
+            text.append(f"{grade_letter} ({task.grade}/100)", style="bold red")
+            text.append(" - Blocked (improve spec)\n", style="red")
+
+        text.append("\n")
+
+        # Grade reasoning
+        if hasattr(task, "grade_reasoning") and task.grade_reasoning:
+            text.append("Grade Breakdown:\n", style="bold yellow")
+            reasoning_lines = task.grade_reasoning.split("\n")
+            for line in reasoning_lines[:6]:  # Show first 6 criteria
+                if line.strip():
+                    text.append(f"  {line}\n", style="dim white")
+
+        # Generated prompt preview
+        if hasattr(task, "generated_prompt") and task.generated_prompt:
+            text.append("\n")
+            text.append("Generated Prompt Preview:\n", style="bold yellow")
+            prompt_lines = task.generated_prompt.split("\n")
+            # Show first 10 lines
+            for line in prompt_lines[:10]:
+                text.append(f"  {line[:70]}\n", style="dim cyan")
+            if len(prompt_lines) > 10:
+                text.append(f"  ... ({len(prompt_lines) - 10} more lines)\n", style="dim")
+
+        text.append("\n")
+
     # Timestamps and elapsed time
-    if task.started_at:
+    if hasattr(task, "started_at") and task.started_at:
         text.append("Started: ", style="dim")
         text.append(f"{task.started_at.strftime('%Y-%m-%d %H:%M:%S')}\n", style="white")
 
@@ -1759,47 +2005,64 @@ def create_task_detail_panel(task, state: TUIState) -> Panel:
         else:
             text.append(f"{elapsed_str}\n", style="white")
 
-    if task.completed_at:
+    completed_at = getattr(task, "completed_at", None)
+    if completed_at:
         text.append("Completed: ", style="dim")
-        text.append(f"{task.completed_at.strftime('%Y-%m-%d %H:%M:%S')}\n", style="green")
+        text.append(f"{completed_at.strftime('%Y-%m-%d %H:%M:%S')}\n", style="green")
 
     # Git commit
-    if task.git_commit_sha:
+    git_commit = getattr(task, "git_commit_sha", None)
+    if git_commit:
         text.append("\nCommit: ", style="dim")
-        text.append(f"{task.git_commit_sha[:12]}\n", style="yellow")
+        text.append(f"{git_commit[:12]}\n", style="yellow")
 
     # Error info section with full message
-    if task.error_message or task.error_category:
+    error_message = getattr(task, "error_message", None)
+    error_category = getattr(task, "error_category", None)
+    if error_message or error_category:
         text.append("\n")
         text.append("─" * 40 + "\n", style="dim")
 
-        if task.error_category:
+        if error_category:
             text.append("Error: ", style="bold red")
-            text.append(f"{task.error_category.value}\n", style="red")
+            cat_val = error_category.value if hasattr(error_category, "value") else error_category
+            text.append(f"{cat_val}\n", style="red")
 
-        if task.error_message:
+        if error_message:
             text.append("\nError Message:\n", style="bold red")
             # Show full error message (up to 500 chars)
-            error_display = task.error_message[:500]
-            if len(task.error_message) > 500:
+            error_display = error_message[:500]
+            if len(error_message) > 500:
                 error_display += "..."
             text.append(f"{error_display}\n", style="white")
 
     # Retry info
-    if task.retry_count > 0 or task.next_retry_at:
+    retry_count = getattr(task, "retry_count", 0)
+    next_retry_at = getattr(task, "next_retry_at", None)
+    if retry_count > 0 or next_retry_at:
         text.append("\n")
-        if task.retry_count > 0:
-            text.append(f"Retry Count: {task.retry_count}/{task.max_retries}\n", style="yellow")
-        if task.next_retry_at:
-            text.append(f"Next Retry: {task.next_retry_at.strftime('%H:%M:%S')}\n", style="yellow")
+        if retry_count > 0:
+            max_retries = getattr(task, "max_retries", 3)
+            text.append(f"Retry Count: {retry_count}/{max_retries}\n", style="yellow")
+        if next_retry_at:
+            text.append(f"Next Retry: {next_retry_at.strftime('%H:%M:%S')}\n", style="yellow")
 
     # Log tail section - show last few lines if we have the worker ID
-    if task.claimed_by_ralph_id and task.status in (TaskClaimStatus.IN_PROGRESS, TaskClaimStatus.FAILED):
+    # Check status appropriately
+    show_logs = False
+    if claimed_by:
+        if hasattr(task_status, "value"):
+            show_logs = task_status in (TaskClaimStatus.IN_PROGRESS, TaskClaimStatus.FAILED)
+        else:
+            status_str = getattr(task, "status", "")
+            show_logs = status_str in ("active", "needs_review")
+
+    if show_logs:
         text.append("\n")
         text.append("─" * 40 + "\n", style="dim")
         text.append("Recent Log Output:\n", style="bold yellow")
         try:
-            log_content = read_ralph_log(task.claimed_by_ralph_id, 10)
+            log_content = read_ralph_log(claimed_by, 10)
             if log_content:
                 lines = log_content.strip().split("\n")[-8:]  # Last 8 lines
                 for line in lines:
@@ -1896,7 +2159,7 @@ def create_instance_dashboard_content(instance, state: TUIState, current_task, p
     else:
         # Get health/staleness if not provided
         if process_health is None:
-            process_health = get_process_health(instance.ralph_id)
+            process_health = get_process_health_cached(instance.ralph_id)
         if status_staleness is None:
             status_staleness = get_status_staleness(instance.ralph_id)
 
@@ -2898,6 +3161,103 @@ def create_command_bar(state: TUIState, console_width: int = 80) -> Panel:
     return Panel(text, border_style="dim")
 
 
+async def update_display_only(layout: Layout, state: TUIState) -> None:
+    """Fast display update for navigation - uses cached data, no DB queries or I/O.
+
+    This is a lightweight alternative to update_dashboard() for simple navigation
+    operations (j/k/z keys). It skips expensive operations and just re-renders
+    the view with existing cached data.
+
+    Use this for:
+    - Navigation keys (j/k/z)
+    - Simple state changes that don't require fresh data
+
+    Use update_dashboard() for:
+    - Initial render
+    - Manual refresh (r key)
+    - Commands that modify state (spawn, stop, etc.)
+    - Periodic background refresh (every 2s)
+    """
+    # Get cached progress data (2s TTL, very cheap)
+    progress_data = get_all_instance_progress_cached()
+
+    # Use existing state data (already fetched by last update_dashboard call)
+    instances = state.instances
+    tasks = state.all_tasks_cache
+
+    # Update only the main content panels with current selection
+    if state.view_focus == ViewFocus.TASKS:
+        # Tasks only - full width
+        show_task_numbers = not state.bulk_mode_active
+        layout["main"].update(
+            Panel(
+                create_tasks_table(
+                    tasks,
+                    show_numbers=show_task_numbers,
+                    offset=state.task_scroll_offset,
+                    limit=state.tasks_per_page,
+                    bulk_mode=state.bulk_mode_active,
+                    selected_ids=state.selected_task_ids,
+                    selected_idx=state.selected_task_idx,
+                ),
+                border_style=BORDER_TASKS,
+            )
+        )
+    elif state.view_focus == ViewFocus.INSTANCES:
+        # Instances only - full width
+        layout["main"].update(
+            Panel(
+                create_instances_table(
+                    instances,
+                    state.show_all_instances,
+                    selected_idx=state.selected_instance_idx,
+                    progress_data=progress_data
+                ),
+                border_style=BORDER_INSTANCES
+            )
+        )
+    else:
+        # Both - split view (default)
+        # Recreate the split layout if it was previously replaced by a single panel
+        try:
+            # Try to access the sublayouts - if this fails, we need to recreate them
+            _ = layout["main"]["instances"]
+            _ = layout["main"]["tasks"]
+        except KeyError:
+            # Layout was flattened - recreate the split
+            layout["main"].split_row(
+                Layout(name="instances"),
+                Layout(name="tasks"),
+            )
+
+        show_task_numbers = not state.bulk_mode_active
+        layout["main"]["instances"].update(
+            Panel(
+                create_instances_table(
+                    instances,
+                    state.show_all_instances,
+                    selected_idx=state.selected_instance_idx,
+                    progress_data=progress_data
+                ),
+                border_style=BORDER_INSTANCES
+            )
+        )
+        layout["main"]["tasks"].update(
+            Panel(
+                create_tasks_table(
+                    tasks,
+                    show_numbers=show_task_numbers,
+                    offset=state.task_scroll_offset,
+                    limit=state.tasks_per_page,
+                    bulk_mode=state.bulk_mode_active,
+                    selected_ids=state.selected_task_ids,
+                    selected_idx=state.selected_task_idx,
+                ),
+                border_style=BORDER_TASKS,
+            )
+        )
+
+
 async def update_dashboard(layout: Layout, state: TUIState) -> None:
     """Update all dashboard components."""
     # Clean up dead/zombie Ralph processes
@@ -2925,10 +3285,16 @@ async def update_dashboard(layout: Layout, state: TUIState) -> None:
         state.status_message_time = time.time()
 
     # Fetch master data in parallel (3 queries instead of 6, run concurrently)
-    all_instances, all_tasks = await asyncio.gather(
+    # Also fetch graded tasks for Ralph Loop Alignment
+    from chiefwiggum.coordination import list_graded_tasks
+    all_instances, all_tasks, graded_tasks = await asyncio.gather(
         list_all_instances(),
         list_all_tasks(),
+        list_graded_tasks(),
     )
+
+    # Store graded tasks in state
+    state.graded_tasks = graded_tasks
 
     # Derive filtered lists from master data (no DB roundtrip)
     active_instances = [i for i in all_instances
@@ -2947,8 +3313,8 @@ async def update_dashboard(layout: Layout, state: TUIState) -> None:
     # Generate alerts from current state
     state.alerts = generate_alerts(state)
 
-    # Get progress data for all running instances
-    progress_data = get_all_instance_progress()
+    # Get progress data for all running instances (cached for performance)
+    progress_data = get_all_instance_progress_cached()
 
     # Compute base data hashes for dirty-bit detection
     instances_base_hash = compute_data_hash(all_instances)
@@ -2993,8 +3359,10 @@ async def update_dashboard(layout: Layout, state: TUIState) -> None:
     state.all_tasks_cache = tasks
 
     # Compute display hashes including all state that affects rendering
-    instances_display_hash = f"{instances_base_hash}:{state.show_all_instances}:{state.project_filter}:{state.selected_instance_idx}"
-    tasks_display_hash = f"{tasks_base_hash}:{state.show_all_tasks}:{state.project_filter}:{state.sort_order}:{state.task_scroll_offset}:{state.selected_task_idx}:{state.bulk_mode_active}:{len(state.selected_task_ids)}"
+    # NOTE: Deliberately exclude selected_instance_idx and selected_task_idx to avoid
+    # full table rebuilds on navigation. Selection highlighting is handled separately.
+    instances_display_hash = f"{instances_base_hash}:{state.show_all_instances}:{state.project_filter}"
+    tasks_display_hash = f"{tasks_base_hash}:{state.show_all_tasks}:{state.project_filter}:{state.sort_order}:{state.task_scroll_offset}:{state.bulk_mode_active}:{len(state.selected_task_ids)}"
 
     # Check if display state actually changed
     instances_changed = instances_display_hash != state.render_state.previous_instances_hash
@@ -3071,6 +3439,8 @@ async def update_dashboard(layout: Layout, state: TUIState) -> None:
     # Determine required layout structure based on mode
     if state.mode == TUIMode.HELP:
         required_structure = "help"
+    elif state.mode == TUIMode.GRADED_TASKS:
+        required_structure = "graded_tasks"
     elif state.mode == TUIMode.STATS:
         required_structure = "stats"
     elif state.mode == TUIMode.ERROR_DETAIL:
@@ -3166,6 +3536,44 @@ async def update_dashboard(layout: Layout, state: TUIState) -> None:
 
         text.append("\n\nPress any key to close", style="dim")
         layout["main"].update(Panel(text, title="Statistics", border_style=BORDER_OVERLAY, box=box.DOUBLE, padding=(1, 2)))
+
+    elif state.mode == TUIMode.GRADED_TASKS:
+        # Show graded tasks queue with grade distribution
+        graded_table = create_graded_tasks_table(
+            state.graded_tasks,
+            offset=state.task_scroll_offset,
+            limit=state.tasks_per_page,
+            selected_idx=state.selected_graded_task_idx,
+            expanded=(state.view_focus == ViewFocus.TASKS),
+        )
+
+        # Add grade summary panel
+        grade_summary = Text()
+        grade_summary.append("Grade Distribution\n\n", style="bold cyan")
+
+        grade_counts = {"A": 0, "B": 0, "C": 0, "F": 0, "?": 0}
+        from chiefwiggum.prompt_grader import get_grade_letter
+        for task in state.graded_tasks:
+            grade = task.get("grade")
+            letter = get_grade_letter(grade) if grade is not None else "?"
+            grade_counts[letter] = grade_counts.get(letter, 0) + 1
+
+        grade_summary.append(f"[bold green]A (90-100):[/bold green] {grade_counts['A']} tasks (auto-spawn)\n")
+        grade_summary.append(f"[yellow]B (70-89):[/yellow] {grade_counts['B']} tasks (auto-spawn)\n")
+        grade_summary.append(f"[bold {COLOR_WARNING}]C (50-69):[/bold {COLOR_WARNING}] {grade_counts['C']} tasks (needs review)\n")
+        grade_summary.append(f"[bold red]F (<50):[/bold red] {grade_counts['F']} tasks (blocked)\n")
+        if grade_counts["?"]:
+            grade_summary.append(f"[dim]? (ungraded):[/dim] {grade_counts['?']} tasks\n")
+
+        grade_summary.append("\n[dim]Enter: View details  |  ESC: Back  |  g: Toggle view[/dim]")
+
+        summary_panel = Panel(grade_summary, title="Grade Summary", border_style="cyan", box=box.ROUNDED, padding=(1, 2))
+
+        # Create layout with table and summary
+        layout["main"].split_column(
+            Layout(graded_table, name="graded_table", ratio=7),
+            Layout(summary_panel, name="grade_summary", ratio=3),
+        )
 
     elif state.mode == TUIMode.ERROR_DETAIL:
         task = state.failed_tasks[state.selected_task_idx] if state.failed_tasks else None
@@ -3313,7 +3721,18 @@ async def update_dashboard(layout: Layout, state: TUIState) -> None:
             )
         else:
             # Both - split view (default)
-            # Split structure already created by layout caching logic above
+            # Recreate the split layout if it was previously replaced by a single panel
+            try:
+                # Try to access the sublayouts - if this fails, we need to recreate them
+                _ = layout["main"]["instances"]
+                _ = layout["main"]["tasks"]
+            except KeyError:
+                # Layout was flattened - recreate the split
+                layout["main"].split_row(
+                    Layout(name="instances"),
+                    Layout(name="tasks"),
+                )
+
             # Always update split view panels (main content area)
             # The dirty checking is more effective for header/stats/alerts which update less frequently
             layout["main"]["instances"].update(
@@ -3475,6 +3894,10 @@ def handle_normal_mode(key: str, state: TUIState, tasks_count: int = 0) -> bool:
             state.status_message_time = time.time()
     elif key == "t":  # US11: Statistics
         state.mode = TUIMode.STATS
+    elif key == "g":  # Toggle graded tasks view (Ralph Loop Alignment)
+        state.mode = TUIMode.GRADED_TASKS
+        state.selected_graded_task_idx = 0
+        state.task_scroll_offset = 0
     elif key == "l":  # US8: Log view
         if state.instances:
             state.selected_instance_idx = 0
@@ -3817,23 +4240,10 @@ async def handle_search(key: str, state: TUIState) -> None:
         state.mode = TUIMode.NORMAL
     elif key == "\x7f" or key == "BACKSPACE":  # Backspace
         state.search_query = state.search_query[:-1]
-        # Live search as user types
-        if state.search_query:
-            all_tasks = await list_all_tasks()
-            query_lower = state.search_query.lower()
-            state.search_results = [
-                t for t in all_tasks
-                if query_lower in t.task_title.lower()
-            ]
+        # Note: Search executes on Enter to avoid DB query on every keystroke
     elif len(key) == 1 and key.isprintable():  # Regular character
         state.search_query += key
-        # Live search as user types
-        all_tasks = await list_all_tasks()
-        query_lower = state.search_query.lower()
-        state.search_results = [
-            t for t in all_tasks
-            if query_lower in t.task_title.lower()
-        ]
+        # Note: Search executes on Enter to avoid DB query on every keystroke
 
 
 async def handle_settings(key: str, state: TUIState) -> None:
@@ -4492,6 +4902,38 @@ async def handle_command(key: str, state: TUIState) -> bool:
     elif state.mode == TUIMode.TASK_DETAIL:
         if key in ("d", "q", "ESCAPE"):  # d toggle, q, or Esc
             state.mode = TUIMode.NORMAL
+
+    elif state.mode == TUIMode.GRADED_TASKS:
+        # Handle graded tasks view navigation
+        if key in ("g", "q", "ESCAPE"):  # g toggle, q, or Esc
+            state.mode = TUIMode.NORMAL
+            state.selected_graded_task_idx = 0
+            state.task_scroll_offset = 0
+        elif key == "j":  # Move selection down
+            if state.graded_tasks:
+                state.selected_graded_task_idx = min(
+                    state.selected_graded_task_idx + 1,
+                    len(state.graded_tasks) - 1
+                )
+                # Auto-scroll if selection goes off-screen
+                if state.selected_graded_task_idx >= state.task_scroll_offset + state.tasks_per_page:
+                    state.task_scroll_offset = state.selected_graded_task_idx - state.tasks_per_page + 1
+        elif key == "k":  # Move selection up
+            if state.graded_tasks:
+                state.selected_graded_task_idx = max(0, state.selected_graded_task_idx - 1)
+                # Auto-scroll if selection goes off-screen
+                if state.selected_graded_task_idx < state.task_scroll_offset:
+                    state.task_scroll_offset = state.selected_graded_task_idx
+        elif key in ("\r", "\n"):  # Enter - view task detail
+            if state.graded_tasks and 0 <= state.selected_graded_task_idx < len(state.graded_tasks):
+                # Switch to TASK_DETAIL mode for the selected graded task
+                # Store the selected task in state
+                task = state.graded_tasks[state.selected_graded_task_idx]
+                # Convert dict to a simple object for compatibility
+                from types import SimpleNamespace
+                state.selected_task = SimpleNamespace(**task)
+                state.mode = TUIMode.TASK_DETAIL
+        # Other keys ignored
         # Other keys ignored
 
     elif state.mode == TUIMode.PROJECT_FILTER:
@@ -4614,8 +5056,20 @@ def run_tui(debug: bool = False):
                         debug_file.flush()
                     if should_quit:
                         break
-                    # Refresh display after command
-                    loop.run_until_complete(update_dashboard(layout, state))
+
+                    # Fast path for navigation keys - use cached data, no DB queries
+                    # This makes j/k/z navigation feel instant (<10ms instead of 200-500ms)
+                    is_navigation_key = (
+                        state.mode == TUIMode.NORMAL and
+                        key in ("j", "k", "z")
+                    )
+
+                    if is_navigation_key:
+                        # Fast display-only update (no DB queries, uses cached data)
+                        loop.run_until_complete(update_display_only(layout, state))
+                    else:
+                        # Full update with data refresh (DB queries, cleanup, etc.)
+                        loop.run_until_complete(update_dashboard(layout, state))
 
                 # Refresh data every 2 seconds
                 current_time = time.time()

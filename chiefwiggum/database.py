@@ -158,6 +158,30 @@ async def init_db():
             );
 
             CREATE INDEX IF NOT EXISTS idx_fix_plan_sources_project ON fix_plan_sources(project);
+
+            -- Tasks: New task queue with prompt grading (Ralph Loop Alignment)
+            CREATE TABLE IF NOT EXISTS tasks (
+                id TEXT PRIMARY KEY,              -- T1.2, T1.3, etc.
+                title TEXT NOT NULL,
+                description TEXT NOT NULL,        -- Original text from @fix_plan.md
+                generated_prompt TEXT,            -- Task-specific prompt for Ralph
+                grade INTEGER,                    -- 0-100 score
+                grade_reasoning TEXT,             -- Why this grade
+                status TEXT DEFAULT 'pending',    -- 'pending', 'active', 'completed', 'blocked', 'needs_review'
+                claimed_by_ralph_id TEXT,
+                depends_on TEXT,                  -- JSON array of task IDs this depends on
+                source_file TEXT,                 -- @fix_plan.md or other source
+                source_line INTEGER,              -- Line number in source file
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP,
+                completed_at TIMESTAMP,
+                FOREIGN KEY (claimed_by_ralph_id) REFERENCES ralph_instances(ralph_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
+            CREATE INDEX IF NOT EXISTS idx_tasks_grade ON tasks(grade);
+            CREATE INDEX IF NOT EXISTS idx_tasks_ralph ON tasks(claimed_by_ralph_id);
+            CREATE INDEX IF NOT EXISTS idx_tasks_created ON tasks(created_at);
         """)
 
         # Run migrations for existing databases
@@ -195,6 +219,13 @@ async def _run_migrations(conn: aiosqlite.Connection):
         ("started_at", "TIMESTAMP"),
         ("completed_at", "TIMESTAMP"),
         ("verified_at", "TIMESTAMP"),
+        # Worktree columns
+        ("worktree_path", "TEXT"),
+        ("worktree_branch", "TEXT"),
+        ("merge_status", "TEXT"),
+        ("merge_strategy", "TEXT"),
+        ("merge_attempted_at", "TIMESTAMP"),
+        ("merge_error", "TEXT"),
     ]
 
     for col_name, col_type in new_task_columns:
@@ -210,6 +241,8 @@ async def _run_migrations(conn: aiosqlite.Connection):
     migration_indexes = [
         "CREATE INDEX IF NOT EXISTS idx_task_claims_category ON task_claims(category)",
         "CREATE INDEX IF NOT EXISTS idx_task_claims_retry ON task_claims(next_retry_at)",
+        "CREATE INDEX IF NOT EXISTS idx_task_claims_worktree ON task_claims(worktree_path)",
+        "CREATE INDEX IF NOT EXISTS idx_task_claims_merge_status ON task_claims(merge_status)",
     ]
     for index_sql in migration_indexes:
         try:
@@ -228,6 +261,9 @@ async def _run_migrations(conn: aiosqlite.Connection):
         ("tasks_failed", "INTEGER DEFAULT 0"),
         ("total_work_seconds", "REAL DEFAULT 0.0"),
         ("prompt_path", "TEXT"),  # Path to the prompt file this Ralph reads from
+        # Worktree columns
+        ("worktree_base_path", "TEXT"),
+        ("use_worktrees", "INTEGER DEFAULT 1"),  # Default ON
     ]
 
     for col_name, col_type in new_instance_columns:
@@ -288,6 +324,7 @@ async def reset_db():
             DELETE FROM task_history;
             DELETE FROM system_settings;
             DELETE FROM fix_plan_sources;
+            DELETE FROM tasks;
         """)
         await conn.commit()
         logger.info("Database reset complete")

@@ -31,15 +31,27 @@ Launch `chiefwiggum tui` to get a live dashboard with:
 
 ## Installation
 
+### Quick Start (Development)
+```bash
+git clone https://github.com/bradydibble/chiefwiggum.git
+cd chiefwiggum
+make dev-setup
+```
+
+### Production Install
 ```bash
 pipx install git+https://github.com/bradydibble/chiefwiggum.git
 ```
 
-Or for development:
+📖 **See [INSTALL.md](INSTALL.md) for detailed installation options and troubleshooting.**
+
+## Verification
+
+After installation, verify everything works:
 ```bash
-git clone https://github.com/bradydibble/chiefwiggum.git
-cd chiefwiggum
-pip install -e .
+chiefwiggum verify
+# or
+make verify
 ```
 
 ## Prerequisites
@@ -219,6 +231,8 @@ ChiefWiggum syncs these markers back to your file when tasks complete.
 
 | Command | Description | Example |
 |---------|-------------|---------|
+| `chiefwiggum update` | Update to latest version | `wig update` |
+| `chiefwiggum verify` | Verify installation | `wig verify` |
 | `chiefwiggum export-history` | Export task history to CSV | `chiefwiggum export-history --project myproject` |
 | `chiefwiggum paths` | Show database and config paths | `chiefwiggum paths` |
 | `chiefwiggum reset` | Reset database (⚠️ deletes all data) | `chiefwiggum reset` |
@@ -409,13 +423,27 @@ File issues at https://github.com/bradydibble/chiefwiggum/issues
 
 ## Development
 
+### Quick Update (after pulling changes)
 ```bash
-# Install dev dependencies
-pip install -e ".[dev]"
-
-# Run tests
-pytest tests/ -v
+wig update              # Smart update (git pull + reinstall)
+# or
+make reinstall          # Manual reinstall
 ```
+
+### Run Tests
+```bash
+make test
+```
+
+### Other Development Commands
+```bash
+make help       # Show all available commands
+make lint       # Run linting checks
+make format     # Format code with ruff
+make build      # Build distribution packages
+```
+
+📖 **See [INSTALL.md](INSTALL.md) for complete development workflow.**
 
 ## Environment Variables
 

@@ -14,6 +14,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from chiefwiggum.cache import progress_data_cache
 from chiefwiggum.database import get_connection, get_setting
 from chiefwiggum.fix_plan_writer import update_task_completion_marker
 from chiefwiggum.git_verifier import verify_commit_in_repo
@@ -31,6 +32,13 @@ from chiefwiggum.models import (
     TaskHistory,
     TaskPriority,
 )
+from chiefwiggum.worktree_manager import (
+    cleanup_stale_worktrees,
+    cleanup_worktree,
+    create_worktree,
+    get_worktree_branch_name,
+)
+from chiefwiggum.git_merge import attempt_merge
 
 logger = logging.getLogger(__name__)
 
@@ -340,6 +348,7 @@ async def claim_task(ralph_id: str, project: str | None = None, fix_plan_path: s
             result = await cursor.fetchone()
 
             if result:
+                task_id = result[0]
                 await conn.commit()  # Release lock
 
                 # Clear any stale current_task_id from other Ralphs
@@ -347,14 +356,42 @@ async def claim_task(ralph_id: str, project: str | None = None, fix_plan_path: s
                     """UPDATE ralph_instances
                        SET current_task_id = NULL
                        WHERE current_task_id = ? AND ralph_id != ?""",
-                    (result[0], ralph_id)
+                    (task_id, ralph_id)
                 )
                 await conn.commit()
 
-                await _update_instance_task(ralph_id, result[0])
+                # NEW: Create worktree if enabled
+                ralph_instance = await get_ralph_instance(ralph_id)
+                if ralph_instance and ralph_instance.config.use_worktree:
+                    project_path = Path(result[4]) if result[4] else Path.cwd()
+
+                    success, msg, wt_path = await create_worktree(
+                        project_path=project_path,
+                        ralph_id=ralph_id,
+                        task_id=task_id,
+                        base_branch="main"
+                    )
+
+                    if success and wt_path:
+                        branch_name = get_worktree_branch_name(ralph_id, task_id)
+                        await conn.execute(
+                            """UPDATE task_claims
+                               SET worktree_path = ?,
+                                   worktree_branch = ?,
+                                   merge_strategy = ?
+                               WHERE task_id = ?""",
+                            (str(wt_path), branch_name, ralph_instance.config.merge_strategy, task_id)
+                        )
+                        await conn.commit()
+                        logger.info(f"Created worktree for {task_id} at {wt_path}")
+                    else:
+                        # Log warning but continue (fallback to shared workspace)
+                        logger.warning(f"Worktree creation failed for {task_id}: {msg}")
+
+                await _update_instance_task(ralph_id, task_id)
 
                 return {
-                    "task_id": result[0],
+                    "task_id": task_id,
                     "task_title": result[1],
                     "task_priority": result[2],
                     "task_section": result[3],
@@ -455,31 +492,100 @@ async def complete_task(
                 except Exception:
                     pass  # Ignore cost data errors, not critical
 
-            # Record in task_history
-            await _record_task_history(conn, task_id, ralph_id, started_at, now, "completed", cost_data=cost_data)
-            # Commit before calling helpers that open their own connections
-            await conn.commit()
-            await _update_instance_task(ralph_id, None)
-            # Update instance stats
-            work_seconds = (now - datetime.fromisoformat(started_at)).total_seconds() if started_at else 0
-            cost_usd = cost_data.get("accumulated_cost", 0.0) if cost_data else 0.0
-            input_tok = cost_data.get("input_tokens", 0) if cost_data else 0
-            output_tok = cost_data.get("output_tokens", 0) if cost_data else 0
-            await _increment_instance_stats(
-                ralph_id,
-                completed=True,
-                work_seconds=work_seconds,
-                cost_increment=cost_usd,
-                input_tokens=input_tok,
-                output_tokens=output_tok
-            )
-
-            # Update @fix_plan.md with completion marker
+            # NEW: Attempt auto-merge if worktree was used
             task_claim = await get_task_claim(task_id)
-            if task_claim and task_claim.project:
-                await update_fix_plan_on_completion(task_id, task_claim.project)
+            merge_succeeded = True  # Track if merge was needed and succeeded
 
-            return True
+            if task_claim and task_claim.worktree_path and task_claim.worktree_branch:
+                logger.info(f"Attempting merge for {task_id} using strategy: {task_claim.merge_strategy or 'auto'}")
+
+                project_path = Path(task_claim.project) if task_claim.project else Path.cwd()
+                strategy = task_claim.merge_strategy or "auto"
+
+                # Attempt merge with fallback
+                merge_result = await attempt_merge(
+                    worktree_branch=task_claim.worktree_branch,
+                    target_branch="main",
+                    strategy=strategy,
+                    repo_path=project_path
+                )
+
+                if merge_result.success:
+                    # Merge succeeded!
+                    await conn.execute(
+                        """UPDATE task_claims
+                           SET merge_status = 'merged',
+                               merge_attempted_at = ?,
+                               has_conflict = 0
+                           WHERE task_id = ?""",
+                        (merge_result.merged_at, task_id)
+                    )
+                    await conn.commit()
+
+                    # Cleanup worktree
+                    cleanup_success, cleanup_msg = await cleanup_worktree(Path(task_claim.worktree_path))
+                    if cleanup_success:
+                        logger.info(f"Merged and cleaned up worktree for {task_id}")
+                    else:
+                        logger.warning(f"Merge succeeded but cleanup failed: {cleanup_msg}")
+
+                else:
+                    # Merge failed with conflicts - RELEASE TASK
+                    logger.warning(f"Merge conflict for {task_id}: {merge_result.error_message}")
+                    merge_succeeded = False
+
+                    # Cleanup worktree
+                    await cleanup_worktree(Path(task_claim.worktree_path), force=True)
+
+                    # Mark task as failed and release back to queue
+                    await conn.execute(
+                        """UPDATE task_claims
+                           SET status = 'pending',
+                               merge_status = 'conflict',
+                               merge_attempted_at = ?,
+                               merge_error = ?,
+                               has_conflict = 1,
+                               claimed_by_ralph_id = NULL,
+                               claimed_at = NULL,
+                               expires_at = NULL,
+                               completed_at = NULL
+                           WHERE task_id = ?""",
+                        (merge_result.merged_at, merge_result.error_message, task_id)
+                    )
+                    await conn.commit()
+
+                    logger.info(f"Released {task_id} back to queue due to merge conflict")
+
+            # Only record completion if merge succeeded (or no merge was needed)
+            if merge_succeeded:
+                # Record in task_history
+                await _record_task_history(conn, task_id, ralph_id, started_at, now, "completed", cost_data=cost_data)
+                # Commit before calling helpers that open their own connections
+                await conn.commit()
+                await _update_instance_task(ralph_id, None)
+                # Update instance stats
+                work_seconds = (now - datetime.fromisoformat(started_at)).total_seconds() if started_at else 0
+                cost_usd = cost_data.get("accumulated_cost", 0.0) if cost_data else 0.0
+                input_tok = cost_data.get("input_tokens", 0) if cost_data else 0
+                output_tok = cost_data.get("output_tokens", 0) if cost_data else 0
+                await _increment_instance_stats(
+                    ralph_id,
+                    completed=True,
+                    work_seconds=work_seconds,
+                    cost_increment=cost_usd,
+                    input_tokens=input_tok,
+                    output_tokens=output_tok
+                )
+
+                # Update @fix_plan.md with completion marker
+                if task_claim and task_claim.project:
+                    await update_fix_plan_on_completion(task_id, task_claim.project)
+
+                return True
+            else:
+                # Merge failed, task was released back to queue
+                await _update_instance_task(ralph_id, None)
+                return False
         return False
     finally:
         await conn.close()
@@ -1263,8 +1369,32 @@ async def mark_stale_instances_crashed() -> int:
 
         await conn.commit()
 
+        # NEW: Cleanup stale worktrees
         for ralph_id in stale_ids:
             logger.warning(f"Marked Ralph instance as crashed: {ralph_id}")
+
+            # Get project from crashed instance
+            cursor = await conn.execute(
+                "SELECT project FROM ralph_instances WHERE ralph_id = ?",
+                (ralph_id,)
+            )
+            row = await cursor.fetchone()
+            if row and row[0]:
+                project_path = Path(row[0])
+                # Get list of active ralph IDs (excluding crashed ones)
+                cursor = await conn.execute(
+                    "SELECT ralph_id FROM ralph_instances WHERE status != 'crashed'"
+                )
+                active_instances = await cursor.fetchall()
+                active_ralph_ids = [r[0] for r in active_instances]
+
+                # Cleanup stale worktrees
+                cleanup_results = await cleanup_stale_worktrees(project_path, active_ralph_ids)
+                for wt_path, success, msg in cleanup_results:
+                    if success:
+                        logger.info(f"Cleaned up stale worktree: {wt_path}")
+                    else:
+                        logger.warning(f"Failed to cleanup {wt_path}: {msg}")
 
         return len(stale_ids)
     finally:
@@ -3495,3 +3625,379 @@ def get_all_instance_progress() -> dict[str, dict]:
             progress_data[ralph_id] = extract_progress_from_logs(ralph_id)
 
     return progress_data
+
+
+def get_all_instance_progress_cached() -> dict[str, dict]:
+    """
+    Get progress data for all instances with caching to avoid repeated log parsing.
+
+    This is a cached wrapper around get_all_instance_progress() with 2s TTL.
+    Use this in UI rendering to avoid blocking on file I/O.
+
+    Returns:
+        Dict mapping ralph_id -> {percent: int, last_update: datetime}
+    """
+    cache_key = "all_progress"
+    cached_result = progress_data_cache.get(cache_key)
+
+    if cached_result is not None:
+        return cached_result
+
+    # Cache miss - fetch fresh data
+    result = get_all_instance_progress()
+    progress_data_cache.set(cache_key, result)
+    return result
+
+
+def invalidate_progress_cache() -> None:
+    """Invalidate all progress data cache."""
+    progress_data_cache.invalidate_all()
+
+
+# =============================================================================
+# NEW TASK QUEUE WITH GRADING (Ralph Loop Alignment)
+# =============================================================================
+
+
+async def sync_tasks_with_grading(
+    fix_plan_path: str | Path,
+    project: str | None = None,
+    repo_path: Path | None = None
+) -> dict[str, int]:
+    """Sync tasks from @fix_plan.md with prompt generation and grading.
+
+    This is the NEW task queue system for Ralph Loop Alignment.
+    Generates task-specific prompts and grades them before spawning Ralph.
+
+    Args:
+        fix_plan_path: Path to @fix_plan.md
+        project: Project name (auto-detected from path if not provided)
+        repo_path: Repository root path for codebase context
+
+    Returns:
+        Dict with counts: {
+            'total': int,
+            'grade_a': int,
+            'grade_b': int,
+            'grade_c': int,
+            'grade_f': int
+        }
+    """
+    from chiefwiggum.prompt_generator import generate_task_prompt
+    from chiefwiggum.prompt_grader import grade_prompt, get_grade_letter
+
+    tasks = parse_fix_plan(fix_plan_path)
+    if not tasks:
+        return {'total': 0, 'grade_a': 0, 'grade_b': 0, 'grade_c': 0, 'grade_f': 0}
+
+    # Auto-detect project and repo path
+    fix_plan_path = Path(fix_plan_path)
+    if project is None:
+        project = fix_plan_path.parent.name
+    if repo_path is None:
+        repo_path = fix_plan_path.parent
+
+    conn = await get_connection()
+    try:
+        now = datetime.now()
+        counts = {'total': 0, 'grade_a': 0, 'grade_b': 0, 'grade_c': 0, 'grade_f': 0}
+
+        for task in tasks:
+            # Build task description from title and subtasks
+            description_parts = [task.title]
+            if task.subtasks:
+                description_parts.append("\n\nSubtasks:")
+                for subtask in task.subtasks:
+                    description_parts.append(f"- {subtask}")
+            if task.completed_subtasks:
+                description_parts.append("\n\nCompleted:")
+                for subtask in task.completed_subtasks:
+                    description_parts.append(f"- [x] {subtask}")
+
+            description = "\n".join(description_parts)
+
+            # Generate task-specific prompt
+            context = {
+                'repo_path': str(repo_path),
+                'project_name': project,
+                'related_files': [],  # TODO: Use codebase search
+                'patterns': {}  # TODO: Extract patterns from existing code
+            }
+            prompt = generate_task_prompt(task.task_id, description, context)
+
+            # Grade the prompt
+            grade_score, grade_reasoning = grade_prompt(prompt)
+            grade_letter = get_grade_letter(grade_score)
+
+            # Update counts
+            counts['total'] += 1
+            if grade_letter == 'A':
+                counts['grade_a'] += 1
+            elif grade_letter == 'B':
+                counts['grade_b'] += 1
+            elif grade_letter == 'C':
+                counts['grade_c'] += 1
+            else:
+                counts['grade_f'] += 1
+
+            # Determine initial status
+            # Block Grade F tasks by default
+            if grade_letter == 'F':
+                status = 'blocked'
+            elif task.is_complete:
+                status = 'completed'
+            else:
+                status = 'pending'
+
+            # Check if task already exists
+            cursor = await conn.execute(
+                "SELECT id, status FROM tasks WHERE id = ?",
+                (task.task_id,)
+            )
+            existing = await cursor.fetchone()
+
+            # Find source line number in @fix_plan.md
+            source_line = _find_task_line_in_file(fix_plan_path, task.task_id)
+
+            if existing:
+                # Update existing task
+                existing_status = existing[1]
+
+                # Only update if not already completed (preserve completed state)
+                if existing_status != 'completed':
+                    await conn.execute(
+                        """UPDATE tasks
+                           SET title = ?, description = ?, generated_prompt = ?,
+                               grade = ?, grade_reasoning = ?, status = ?,
+                               source_file = ?, source_line = ?, updated_at = ?
+                           WHERE id = ?""",
+                        (task.title, description, prompt, grade_score, grade_reasoning,
+                         status, str(fix_plan_path), source_line, now, task.task_id)
+                    )
+            else:
+                # Insert new task
+                await conn.execute(
+                    """INSERT INTO tasks
+                       (id, title, description, generated_prompt, grade, grade_reasoning,
+                        status, source_file, source_line, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (task.task_id, task.title, description, prompt, grade_score,
+                     grade_reasoning, status, str(fix_plan_path), source_line, now, now)
+                )
+
+        await conn.commit()
+        logger.info(f"Synced {counts['total']} tasks: "
+                   f"A={counts['grade_a']}, B={counts['grade_b']}, "
+                   f"C={counts['grade_c']}, F={counts['grade_f']}")
+        return counts
+    finally:
+        await conn.close()
+
+
+def _find_task_line_in_file(file_path: Path, task_id: str) -> int | None:
+    """Find the line number where a task appears in @fix_plan.md.
+
+    Args:
+        file_path: Path to @fix_plan.md
+        task_id: Task ID to search for
+
+    Returns:
+        Line number (1-indexed) or None if not found
+    """
+    try:
+        content = file_path.read_text()
+        lines = content.split('\n')
+
+        # Look for task ID in headers (### 22. Title or #### PF-1: Title)
+        for i, line in enumerate(lines, start=1):
+            if task_id in line and line.strip().startswith('#'):
+                return i
+
+        return None
+    except Exception as e:
+        logger.debug(f"Error finding task line: {e}")
+        return None
+
+
+async def list_graded_tasks(
+    min_grade: int | None = None,
+    status: str | None = None
+) -> list[dict]:
+    """List tasks from the new graded task queue.
+
+    Args:
+        min_grade: Minimum grade filter (e.g., 70 for Grade B+)
+        status: Status filter ('pending', 'active', 'completed', 'blocked')
+
+    Returns:
+        List of task dicts with fields: id, title, grade, status, etc.
+    """
+    conn = await get_connection()
+    try:
+        query = "SELECT * FROM tasks WHERE 1=1"
+        params = []
+
+        if min_grade is not None:
+            query += " AND grade >= ?"
+            params.append(min_grade)
+
+        if status is not None:
+            query += " AND status = ?"
+            params.append(status)
+
+        query += " ORDER BY created_at ASC"
+
+        cursor = await conn.execute(query, params)
+        rows = await cursor.fetchall()
+
+        # Get column names
+        columns = [desc[0] for desc in cursor.description]
+
+        tasks = []
+        for row in rows:
+            task_dict = dict(zip(columns, row))
+            tasks.append(task_dict)
+
+        return tasks
+    finally:
+        await conn.close()
+
+
+async def get_graded_task(task_id: str) -> dict | None:
+    """Get a single task from the graded task queue.
+
+    Args:
+        task_id: Task ID to retrieve
+
+    Returns:
+        Task dict or None if not found
+    """
+    conn = await get_connection()
+    try:
+        cursor = await conn.execute(
+            "SELECT * FROM tasks WHERE id = ?",
+            (task_id,)
+        )
+        row = await cursor.fetchone()
+
+        if not row:
+            return None
+
+        # Get column names
+        columns = [desc[0] for desc in cursor.description]
+        return dict(zip(columns, row))
+    finally:
+        await conn.close()
+
+
+async def on_ralph_exit(ralph_id: str, exit_code: int, task_id: str | None = None) -> None:
+    """Handle Ralph process exit for graded task queue.
+
+    Exit codes:
+    - 0: Success - task complete
+    - 2: Script error (jq, command fail)
+    - 3: Circuit breaker trip
+    - 10: Cost limit exceeded
+    - 130: SIGINT (Ctrl+C)
+
+    Args:
+        ralph_id: Ralph instance ID
+        exit_code: Process exit code
+        task_id: Task ID if known (will be looked up if None)
+    """
+    logger.info(f"[EXIT_HANDLER] Ralph {ralph_id} exited with code {exit_code}")
+
+    # Get task ID if not provided
+    if not task_id:
+        conn = await get_connection()
+        try:
+            cursor = await conn.execute(
+                "SELECT id FROM tasks WHERE claimed_by_ralph_id = ? AND status = 'active'",
+                (ralph_id,)
+            )
+            row = await cursor.fetchone()
+            if row:
+                task_id = row[0]
+        finally:
+            await conn.close()
+
+    if not task_id:
+        logger.warning(f"[EXIT_HANDLER] No active task found for {ralph_id}")
+        return
+
+    conn = await get_connection()
+    try:
+        now = datetime.now()
+
+        if exit_code == 0:
+            # Success - mark task complete
+            logger.info(f"[EXIT_HANDLER] Marking task {task_id} as completed")
+            await conn.execute(
+                """UPDATE tasks
+                   SET status = 'completed', completed_at = ?, updated_at = ?
+                   WHERE id = ? AND claimed_by_ralph_id = ?""",
+                (now, now, task_id, ralph_id)
+            )
+
+        elif exit_code == 2:
+            # Script error - mark crashed, don't retry
+            logger.warning(f"[EXIT_HANDLER] Task {task_id} crashed (script error)")
+            await conn.execute(
+                """UPDATE tasks
+                   SET status = 'pending', claimed_by_ralph_id = NULL, updated_at = ?
+                   WHERE id = ?""",
+                (now, task_id)
+            )
+
+        elif exit_code == 3:
+            # Circuit breaker - needs review
+            logger.warning(f"[EXIT_HANDLER] Task {task_id} halted (circuit breaker)")
+            await conn.execute(
+                """UPDATE tasks
+                   SET status = 'needs_review', claimed_by_ralph_id = NULL, updated_at = ?
+                   WHERE id = ?""",
+                (now, task_id)
+            )
+
+        elif exit_code == 10:
+            # Cost limit - mark stopped
+            logger.warning(f"[EXIT_HANDLER] Task {task_id} stopped (cost limit)")
+            await conn.execute(
+                """UPDATE tasks
+                   SET status = 'pending', claimed_by_ralph_id = NULL, updated_at = ?
+                   WHERE id = ?""",
+                (now, task_id)
+            )
+
+        elif exit_code == 130:
+            # SIGINT - graceful stop
+            logger.info(f"[EXIT_HANDLER] Task {task_id} interrupted (SIGINT)")
+            await conn.execute(
+                """UPDATE tasks
+                   SET status = 'pending', claimed_by_ralph_id = NULL, updated_at = ?
+                   WHERE id = ?""",
+                (now, task_id)
+            )
+
+        else:
+            # Unknown exit code - release task
+            logger.warning(f"[EXIT_HANDLER] Task {task_id} failed (exit code {exit_code})")
+            await conn.execute(
+                """UPDATE tasks
+                   SET status = 'pending', claimed_by_ralph_id = NULL, updated_at = ?
+                   WHERE id = ?""",
+                (now, task_id)
+            )
+
+        await conn.commit()
+        logger.info(f"[EXIT_HANDLER] Task {task_id} status updated")
+
+    finally:
+        await conn.close()
+
+    # Shutdown Ralph instance
+    try:
+        await shutdown_instance(ralph_id)
+        logger.info(f"[EXIT_HANDLER] Ralph {ralph_id} shutdown")
+    except Exception as e:
+        logger.warning(f"[EXIT_HANDLER] Failed to shutdown {ralph_id}: {e}")

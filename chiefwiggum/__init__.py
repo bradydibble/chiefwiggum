@@ -19,6 +19,7 @@ from chiefwiggum.coordination import (
     # Task operations
     claim_task,
     complete_task,
+    complete_and_claim_next,
     archive_task,
     extend_claim,
     fail_task,
@@ -71,6 +72,15 @@ from chiefwiggum.coordination import (
     # Cleanup
     cleanup_instance_files,
 )
+from chiefwiggum.worktree_manager import (
+    cleanup_stale_worktrees,
+    cleanup_worktree,
+    create_worktree,
+    get_worktree_branch_name,
+    get_worktree_status,
+    list_active_worktrees,
+)
+from chiefwiggum.git_merge import attempt_merge, detect_conflicts, MergeResult
 from chiefwiggum.database import get_database_path, get_setting, init_db, reset_db, set_setting
 from chiefwiggum.models import (
     # Enums
@@ -100,6 +110,7 @@ __all__ = [
     # Task operations
     "claim_task",
     "complete_task",
+    "complete_and_claim_next",
     "archive_task",
     "extend_claim",
     "fail_task",
@@ -151,6 +162,17 @@ __all__ = [
     # Fix plan sources (US1)
     "register_fix_plan_source",
     "list_fix_plan_sources",
+    # Worktree management
+    "create_worktree",
+    "cleanup_worktree",
+    "cleanup_stale_worktrees",
+    "list_active_worktrees",
+    "get_worktree_branch_name",
+    "get_worktree_status",
+    # Git merge
+    "attempt_merge",
+    "detect_conflicts",
+    "MergeResult",
     # Database
     "init_db",
     "reset_db",

@@ -96,6 +96,7 @@ class RalphConfig(BaseModel):
 
     timeout_minutes: int = 30  # Max time per task before killing
     no_continue: bool = True  # Stop after one task by default (vs loop continuously)
+    single_task: bool = False  # Exit after completing one task (no auto-claim next)
     max_loops: int | None = None  # Stop after N tasks completed (None = unlimited)
     model: ClaudeModel = ClaudeModel.SONNET  # Which Claude model to use
     persona: str | None = None  # Skill/persona to load (e.g., "ux-specialist")
@@ -103,6 +104,10 @@ class RalphConfig(BaseModel):
     session_expiry_hours: int = 24  # --session-expiry value
     output_format: str = "json"  # --output-format (json/text)
     max_calls_per_hour: int = 100  # --calls value
+    # Worktree Settings
+    use_worktree: bool = True  # Use git worktrees for isolation (DEFAULT ON)
+    worktree_cleanup: bool = True  # Cleanup worktree after completion
+    merge_strategy: str = "auto"  # auto, fast-forward, regular, squash
 
 
 class TaskClaim(BaseModel):
@@ -129,6 +134,13 @@ class TaskClaim(BaseModel):
     # Branch isolation (US7)
     branch_name: str | None = None
     has_conflict: bool = False
+    # Worktree isolation
+    worktree_path: str | None = None
+    worktree_branch: str | None = None
+    merge_status: str | None = None  # 'pending', 'merged', 'conflict', 'failed'
+    merge_strategy: str | None = None  # 'auto', 'fast-forward', 'regular', 'squash'
+    merge_attempted_at: datetime | None = None
+    merge_error: str | None = None
     # Timestamps
     created_at: datetime = Field(default_factory=datetime.now)
     updated_at: datetime | None = None
@@ -163,6 +175,9 @@ class RalphInstance(BaseModel):
     total_output_tokens: int = 0
     total_cost_usd: float = 0.0
     last_cost_update: datetime | None = None
+    # Worktree tracking
+    worktree_base_path: str | None = None
+    use_worktrees: bool = True  # Track if this instance uses worktrees
 
 
 class FixPlanTask(BaseModel):

@@ -28,6 +28,8 @@ from chiefwiggum.spawner import (
     read_ralph_status,
     is_ralph_running,
     get_ralph_status_path,
+    get_ralph_log_path,
+    check_task_completion,
 )
 
 
@@ -540,3 +542,129 @@ class TestHandleStuckRalph:
         status = read_ralph_status(ralph_id)
         assert status is not None
         assert status["status"] == "crashed"
+
+
+# =============================================================================
+# Task Completion Detection Tests
+# =============================================================================
+
+
+class TestTaskCompletionDetection:
+    """Tests for check_task_completion() function.
+
+    These tests verify that task completion is properly detected from Ralph's
+    log output in both RALPH_STATUS block format and legacy format.
+    """
+
+    def test_check_task_completion_with_ralph_status(self, mock_ralph_data_dir):
+        """Test check_task_completion() detects RALPH_STATUS block."""
+        ralph_id = "test-ralph-001"
+
+        # Write log file with RALPH_STATUS block
+        log_path = get_ralph_log_path(ralph_id)
+        log_path.write_text("""
+[2026-01-22 17:47:12] Claude output received
+---RALPH_STATUS---
+STATUS: COMPLETE
+TASK_ID: task-7-journey-1
+COMMIT: 2ab8ed55d83cf1f48c7a7dc30cf25d3e2eb84623
+VERIFICATION: All tests pass
+---END_RALPH_STATUS---
+""")
+
+        task_id, failure, commit = check_task_completion(ralph_id)
+        assert task_id == "task-7-journey-1"
+        assert failure is None
+        assert commit == "2ab8ed55d83cf1f48c7a7dc30cf25d3e2eb84623"
+
+    def test_check_task_completion_with_legacy_format(self, mock_ralph_data_dir):
+        """Test check_task_completion() falls back to legacy format."""
+        ralph_id = "test-ralph-002"
+
+        log_path = get_ralph_log_path(ralph_id)
+        log_path.write_text("""
+[2026-01-22 16:44:41] Task completed
+TASK_COMPLETE: task-5-issue-5
+COMMIT: 60af9ebcbca3b926d491ee8bdf1d35e3d91bdb67
+""")
+
+        task_id, failure, commit = check_task_completion(ralph_id)
+        assert task_id == "task-5-issue-5"
+        assert failure is None
+        assert commit == "60af9ebcbca3b926d491ee8bdf1d35e3d91bdb67"
+
+    def test_check_task_completion_no_marker(self, mock_ralph_data_dir):
+        """Test check_task_completion() returns None when no marker found."""
+        ralph_id = "test-ralph-003"
+
+        log_path = get_ralph_log_path(ralph_id)
+        log_path.write_text("""
+[2026-01-22 17:00:00] Ralph working on task...
+[2026-01-22 17:05:00] Still working...
+""")
+
+        task_id, failure, commit = check_task_completion(ralph_id)
+        assert task_id is None
+        assert failure is None
+        assert commit is None
+
+    def test_check_task_completion_failed_status(self, mock_ralph_data_dir):
+        """Test check_task_completion() detects FAILED status."""
+        ralph_id = "test-ralph-004"
+
+        log_path = get_ralph_log_path(ralph_id)
+        log_path.write_text("""
+---RALPH_STATUS---
+STATUS: FAILED
+TASK_ID: task-99-failed-task
+REASON: Tests failed with 5 errors
+---END_RALPH_STATUS---
+""")
+
+        task_id, failure, commit = check_task_completion(ralph_id)
+        assert task_id == "task-99-failed-task"
+        assert failure == "Tests failed with 5 errors"
+        assert commit is None
+
+    def test_check_task_completion_no_commit_sha(self, mock_ralph_data_dir):
+        """Test check_task_completion() handles missing commit SHA."""
+        ralph_id = "test-ralph-005"
+
+        log_path = get_ralph_log_path(ralph_id)
+        log_path.write_text("""
+---RALPH_STATUS---
+STATUS: COMPLETE
+TASK_ID: task-50-no-sha
+VERIFICATION: Task complete but no commit SHA
+---END_RALPH_STATUS---
+""")
+
+        task_id, failure, commit = check_task_completion(ralph_id)
+        assert task_id == "task-50-no-sha"
+        assert failure is None
+        assert commit is None  # No commit SHA provided
+
+    def test_check_task_completion_in_large_log(self, mock_ralph_data_dir):
+        """Test check_task_completion() finds marker in large log (last 50KB)."""
+        ralph_id = "test-ralph-006"
+
+        # Create a large log file (> 50KB)
+        log_path = get_ralph_log_path(ralph_id)
+        with open(log_path, "w") as f:
+            # Write 60KB of junk data
+            for i in range(3000):
+                f.write(f"[2026-01-22 10:00:{i%60:02d}] Working on task... line {i}\n")
+
+            # Add completion marker at the end
+            f.write("""
+---RALPH_STATUS---
+STATUS: COMPLETE
+TASK_ID: task-large-log
+COMMIT: abcdef1234567890
+---END_RALPH_STATUS---
+""")
+
+        task_id, failure, commit = check_task_completion(ralph_id)
+        assert task_id == "task-large-log"
+        assert failure is None
+        assert commit == "abcdef1234567890"
