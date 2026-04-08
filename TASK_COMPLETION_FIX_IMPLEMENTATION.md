@@ -138,9 +138,9 @@ fi
 ### Test 1: New Prompt Works
 ```bash
 # Create a test task and spawn Ralph
-cd /Users/bdibble/claudecode/tian
+cd ~/projects/my-project
 wig sync @fix_plan.md
-wig spawn --project tian
+wig spawn --project my-project
 
 # Monitor Ralph output for RALPH_STATUS block
 tail -f ~/.chiefwiggum/ralphs/ralph-*.log
@@ -166,7 +166,7 @@ bash chiefwiggum/scripts/lib/response_analyzer.sh
 ### Test 3: Manual Completion Command
 ```bash
 # Test the new mark-complete command
-cd /Users/bdibble/claudecode/tian
+cd ~/projects/my-project
 
 # Mark a completed but undetected task
 wig mark-complete task-1 --commit HEAD
@@ -178,24 +178,24 @@ wig mark-complete task-1 --commit HEAD
 
 ### Test 4: Retrospective Completion (Real Use Case)
 
-For tasks already done in the tian project (Issues 1-3):
+For tasks already done in a project (Issues 1-3):
 
 ```bash
-cd /Users/bdibble/claudecode/tian
+cd ~/projects/my-project
 
 # Get commit SHAs from git log
-git log --oneline --grep="Issue 1" | head -1  # 290d56f
-git log --oneline --grep="Issue 2" | head -1  # 87b286c
-git log --oneline --grep="Issue 3" | head -1  # 62abe42
+git log --oneline --grep="Issue 1" | head -1
+git log --oneline --grep="Issue 2" | head -1
+git log --oneline --grep="Issue 3" | head -1
 
 # Mark them complete
-cd /Users/bdibble/claudecode/chiefwiggum
-wig mark-complete "Issue 1" --commit 290d56f --message "Retrospectively marking complete"
-wig mark-complete "Issue 2" --commit 87b286c --message "Retrospectively marking complete"
-wig mark-complete "Issue 3" --commit 62abe42 --message "Retrospectively marking complete"
+cd ~/projects/chiefwiggum
+wig mark-complete "Issue 1" --commit <sha> --message "Retrospectively marking complete"
+wig mark-complete "Issue 2" --commit <sha> --message "Retrospectively marking complete"
+wig mark-complete "Issue 3" --commit <sha> --message "Retrospectively marking complete"
 
 # Verify
-wig list --all --project tian
+wig list --all --project my-project
 # Expected: Issues 1-3 show as "completed"
 ```
 
@@ -282,7 +282,7 @@ grep -n "✓" @fix_plan.md
 
 ## Next Steps
 
-1. **Backfill completed tasks**: Use `mark-complete` for Issues 1-3 in tian
+1. **Backfill completed tasks**: Use `mark-complete` for any issues already completed but not yet tracked
 2. **Monitor new tasks**: Watch for RALPH_STATUS blocks in logs
 3. **Tune fallback**: Adjust confidence thresholds based on false positive/negative rate
 4. **Document pattern**: Update team docs on proper task completion signaling

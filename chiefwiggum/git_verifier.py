@@ -24,7 +24,7 @@ def _is_cache_valid(timestamp: datetime) -> bool:
 
 
 async def verify_commit_in_repo(
-    commit_sha: str, repo_path: str | Path = "../tian"
+    commit_sha: str, repo_path: str | Path = "."
 ) -> tuple[bool, Optional[str]]:
     """Verify if a commit exists in the specified repository.
 
@@ -100,7 +100,7 @@ async def verify_commit_in_repo(
 
 
 async def get_commit_message(
-    commit_sha: str, repo_path: str | Path = "../tian"
+    commit_sha: str, repo_path: str | Path = "."
 ) -> Optional[str]:
     """Extract the commit message for a given SHA.
 

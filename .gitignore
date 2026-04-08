@@ -47,3 +47,6 @@ logs/
 
 # Claude sessions
 .claude-sessions/
+
+# Backup files
+*.backup*

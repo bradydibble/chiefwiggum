@@ -287,7 +287,7 @@ class TestRalphConfig:
             model=ClaudeModel.OPUS,
         )
         targeting = TargetingConfig(
-            project="tian",
+            project="my-project",
             priority_min=TaskPriority.HIGH,
         )
 
@@ -301,7 +301,7 @@ class TestRalphConfig:
         assert inst.config.timeout_minutes == 60
         assert inst.config.no_continue is True
         assert inst.config.model == ClaudeModel.OPUS
-        assert inst.targeting.project == "tian"
+        assert inst.targeting.project == "my-project"
         assert inst.targeting.priority_min == TaskPriority.HIGH
 
     @pytest.mark.asyncio

@@ -10,7 +10,7 @@ Usage as a CLI:
     chiefwiggum status
     chiefwiggum tui
     chiefwiggum register --name my-ralph
-    chiefwiggum claim tian
+    chiefwiggum claim my-project
 """
 
 from chiefwiggum.coordination import (

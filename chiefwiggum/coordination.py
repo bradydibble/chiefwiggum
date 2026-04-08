@@ -112,6 +112,11 @@ def parse_fix_plan(path: str | Path) -> list[FixPlanTask]:
         (r"###\s*Tier\s*2", TaskPriority.MEDIUM),
         (r"###\s*Tier\s*3", TaskPriority.LOWER),
         (r"###\s*Tier\s*4", TaskPriority.POLISH),
+        # Tier-numbered sections (#### TIER N: ...) as used in @fix_plan.md
+        (r"####\s*TIER\s*[01][:\s]", TaskPriority.HIGH),
+        (r"####\s*TIER\s*[23][:\s]", TaskPriority.MEDIUM),
+        (r"####\s*TIER\s*[45][:\s]", TaskPriority.LOWER),
+        (r"####\s*TIER\s*[6-9][:\s]", TaskPriority.POLISH),
     ]
 
     for line in content.split("\n"):
@@ -152,13 +157,33 @@ def parse_fix_plan(path: str | Path) -> list[FixPlanTask]:
                 task_match = True
 
         # Format 3: #### Title (no number, just header under a Tier section)
+        # Must be a multi-word title to avoid matching section headers, notes, etc.
+        _NON_TASK_HEADERS = {
+            "note", "notes", "overview", "background", "summary", "important",
+            "warning", "example", "examples", "table", "appendix", "reference",
+            "references", "detail", "details", "description", "context",
+            "tier",
+        }
+        # Format 4: ##### T0.1: Title  (dot-numbered tier tasks, e.g. @fix_plan.md)
+        if not task_match and current_priority:
+            tier_task_match = re.match(r"#{2,5}\s*(T\d+\.\d+)[:\s]+(.+)", line)
+            if tier_task_match:
+                task_counter += 1
+                task_number = task_counter
+                title_part = f"{tier_task_match.group(1)}: {tier_task_match.group(2).strip()}"
+                task_match = True
+
         if not task_match and current_priority:
             plain_match = re.match(r"####\s+([A-Z][^#].{5,})", line)  # At least 6 chars, starts with capital
             if plain_match and not plain_match.group(1).startswith("**"):  # Not bold text
-                task_counter += 1
-                task_number = task_counter
-                title_part = plain_match.group(1)
-                task_match = True
+                title_candidate = plain_match.group(1).strip()
+                first_word = title_candidate.split()[0].lower().rstrip(":")
+                # Require multiple words and exclude known non-task header keywords
+                if " " in title_candidate and first_word not in _NON_TASK_HEADERS:
+                    task_counter += 1
+                    task_number = task_counter
+                    title_part = title_candidate
+                    task_match = True
 
         if task_match and task_number and title_part and current_priority:
             if current_task:
@@ -644,17 +669,15 @@ async def update_fix_plan_on_completion(task_id: str, project: str | None = None
             return False
 
         # Determine fix_plan_path from project
-        # Default: look for @fix_plan.md in current directory or ../tian
+        # Default: look for @fix_plan.md in current directory
         fix_plan_path = None
-        if project == "tian":
-            fix_plan_path = Path("../tian/@fix_plan.md")
-        elif project == "chiefwiggum":
-            fix_plan_path = Path("@fix_plan.md")
-        else:
-            # Try current directory first
+        if project:
+            # Try current directory first, then sibling project directory
             fix_plan_path = Path("@fix_plan.md")
             if not fix_plan_path.exists():
-                fix_plan_path = Path("..") / (project or "tian") / "@fix_plan.md"
+                fix_plan_path = Path("..") / project / "@fix_plan.md"
+        else:
+            fix_plan_path = Path("@fix_plan.md")
 
         if not fix_plan_path.exists():
             logger.warning(f"@fix_plan.md not found at {fix_plan_path}")
@@ -708,11 +731,7 @@ async def verify_and_record_commit(
     try:
         # Determine repo_path from project
         repo_path = Path(".")
-        if project == "tian":
-            repo_path = Path("../tian")
-        elif project == "chiefwiggum":
-            repo_path = Path(".")
-        elif project:
+        if project:
             # Try to get from settings
             repo_setting = await get_setting(f"repo_path:{project}")
             if repo_setting:
@@ -1013,16 +1032,22 @@ async def check_ralph_completions() -> list[dict]:
             )
         await conn.commit()
 
-        # Extend claim expiry for all running Ralphs with active tasks
-        # This prevents claims from expiring while Ralph is still running
+        # Extend claim expiry for all running Ralphs with active tasks.
+        # Only extend for instances still marked active/idle in the DB to avoid
+        # re-animating claims that mark_stale_instances_crashed() has already released.
         expires_at = now + timedelta(minutes=CLAIM_EXPIRY_MINUTES)
         for ralph_id in running_ralph_ids:
             await conn.execute(
                 """UPDATE task_claims
                    SET expires_at = ?, updated_at = ?
                    WHERE claimed_by_ralph_id = ?
-                     AND status = 'in_progress'""",
-                (expires_at, now, ralph_id)
+                     AND status = 'in_progress'
+                     AND claimed_by_ralph_id IN (
+                         SELECT ralph_id FROM ralph_instances
+                         WHERE ralph_id = ?
+                           AND status NOT IN ('crashed', 'stopped')
+                     )""",
+                (expires_at, now, ralph_id, ralph_id)
             )
         await conn.commit()
 
@@ -1528,7 +1553,9 @@ async def get_task_claim(task_id: str) -> TaskClaim | None:
                       claimed_by_ralph_id, claimed_at, expires_at, status,
                       completion_message, git_commit_sha, created_at, updated_at,
                       category, error_category, error_message, retry_count, max_retries,
-                      next_retry_at, branch_name, has_conflict, started_at, completed_at
+                      next_retry_at, branch_name, has_conflict, started_at, completed_at,
+                      worktree_path, worktree_branch, merge_status, merge_strategy,
+                      merge_attempted_at, merge_error, verified_at
                FROM task_claims WHERE task_id = ?""",
             (task_id,)
         )
@@ -1754,7 +1781,9 @@ async def list_all_tasks(project: str | None = None) -> list[TaskClaim]:
                       claimed_by_ralph_id, claimed_at, expires_at, status,
                       completion_message, git_commit_sha, created_at, updated_at,
                       category, error_category, error_message, retry_count, max_retries,
-                      next_retry_at, branch_name, has_conflict, started_at, completed_at
+                      next_retry_at, branch_name, has_conflict, started_at, completed_at,
+                      worktree_path, worktree_branch, merge_status, merge_strategy,
+                      merge_attempted_at, merge_error, verified_at
                FROM task_claims
                {project_filter}
                ORDER BY
@@ -1800,6 +1829,14 @@ def _row_to_task_claim(row: tuple) -> TaskClaim:
         has_conflict=bool(row[20]) if row[20] is not None else False,
         started_at=datetime.fromisoformat(row[21]) if row[21] else None,
         completed_at=datetime.fromisoformat(row[22]) if row[22] else None,
+        # Worktree fields (rows 23-29)
+        worktree_path=row[23] if len(row) > 23 else None,
+        worktree_branch=row[24] if len(row) > 24 else None,
+        merge_status=row[25] if len(row) > 25 else None,
+        merge_strategy=row[26] if len(row) > 26 else None,
+        merge_attempted_at=datetime.fromisoformat(row[27]) if len(row) > 27 and row[27] else None,
+        merge_error=row[28] if len(row) > 28 else None,
+        verified_at=datetime.fromisoformat(row[29]) if len(row) > 29 and row[29] else None,
     )
 
 
@@ -3337,7 +3374,7 @@ async def reconcile_completed_tasks(
     3. If commit verified (or no commit needed), update @fix_plan.md
 
     Args:
-        project: Optional project filter (e.g., "tian", "chiefwiggum")
+        project: Optional project filter (e.g., "my-project", "chiefwiggum")
         dry_run: If True, report what would be done without making changes
 
     Returns:
@@ -3377,15 +3414,13 @@ async def reconcile_completed_tasks(
 
         # Determine fix_plan_path
         fix_plan_path = None
-        if project == "tian":
-            fix_plan_path = Path("../tian/@fix_plan.md")
-        elif project == "chiefwiggum":
-            fix_plan_path = Path("@fix_plan.md")
-        else:
-            # Try current directory first
+        if project:
+            # Try current directory first, then sibling project directory
             fix_plan_path = Path("@fix_plan.md")
             if not fix_plan_path.exists():
-                fix_plan_path = Path("..") / (project or "tian") / "@fix_plan.md"
+                fix_plan_path = Path("..") / project / "@fix_plan.md"
+        else:
+            fix_plan_path = Path("@fix_plan.md")
 
         if not fix_plan_path.exists():
             logger.error(f"@fix_plan.md not found at {fix_plan_path}")
@@ -3422,11 +3457,7 @@ async def reconcile_completed_tasks(
             commit_verified = False
             if task_claim.git_commit_sha:
                 repo_path = Path(".")
-                if task_claim.project == "tian":
-                    repo_path = Path("../tian")
-                elif task_claim.project == "chiefwiggum":
-                    repo_path = Path(".")
-                elif task_claim.project:
+                if task_claim.project:
                     # Try to get from settings
                     repo_setting = await get_setting(f"repo_path:{task_claim.project}")
                     if repo_setting:
