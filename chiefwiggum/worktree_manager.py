@@ -4,6 +4,7 @@ Manages isolated git worktrees for each Ralph instance to prevent merge conflict
 Each worktree operates in a separate directory with its own branch.
 """
 
+import asyncio
 import logging
 import re
 import subprocess
@@ -11,6 +12,10 @@ from datetime import datetime
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+# Serializes concurrent create_worktree calls within the same process so
+# check-then-act on worktree_path.exists() doesn't race between coroutines.
+_worktree_creation_lock = asyncio.Lock()
 
 
 def get_worktree_branch_name(ralph_id: str, task_id: str) -> str:
@@ -51,6 +56,17 @@ async def create_worktree(
     Returns:
         Tuple of (success, message, worktree_path)
     """
+    async with _worktree_creation_lock:
+        return await _create_worktree_locked(project_path, ralph_id, task_id, base_branch)
+
+
+async def _create_worktree_locked(
+    project_path: Path,
+    ralph_id: str,
+    task_id: str,
+    base_branch: str,
+) -> tuple[bool, str, Path | None]:
+    """Internal implementation called while holding _worktree_creation_lock."""
     try:
         # Ensure project_path is a git repository
         if not (project_path / ".git").exists():
@@ -60,10 +76,10 @@ async def create_worktree(
         worktree_base = project_path / ".worktrees"
         worktree_path = worktree_base / ralph_id
 
-        # Check if worktree already exists
+        # Clean up any pre-existing worktree for this ralph_id (e.g. after a crash/restart).
+        # Re-check after acquiring the lock to avoid a TOCTOU race with concurrent callers.
         if worktree_path.exists():
             logger.warning(f"Worktree already exists: {worktree_path}")
-            # Clean up existing worktree first
             cleanup_success, cleanup_msg = await cleanup_worktree(worktree_path, force=True)
             if not cleanup_success:
                 return False, f"Failed to cleanup existing worktree: {cleanup_msg}", None

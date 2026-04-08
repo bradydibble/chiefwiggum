@@ -104,6 +104,7 @@ async def init_db():
                 current_task_id TEXT,
                 loop_count INTEGER DEFAULT 0,
                 status TEXT DEFAULT 'active',  -- 'active', 'idle', 'paused', 'stopped', 'crashed'
+                last_error TEXT,              -- Last error message (for CRASHED status)
                 -- Configuration (US9) - stored as JSON
                 config_json TEXT,             -- RalphConfig serialized
                 -- Targeting (US4) - stored as JSON
@@ -131,6 +132,15 @@ async def init_db():
                 status TEXT NOT NULL,
                 commit_sha TEXT,
                 error_message TEXT,
+                -- Cost tracking
+                input_tokens INTEGER DEFAULT 0,
+                output_tokens INTEGER DEFAULT 0,
+                cache_creation_tokens INTEGER DEFAULT 0,
+                cache_read_tokens INTEGER DEFAULT 0,
+                estimated_cost_usd REAL DEFAULT 0.0,
+                actual_cost_usd REAL,
+                cost_source TEXT DEFAULT 'estimation',
+                model_used TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
 
@@ -260,6 +270,7 @@ async def _run_migrations(conn: aiosqlite.Connection):
         ("tasks_completed", "INTEGER DEFAULT 0"),
         ("tasks_failed", "INTEGER DEFAULT 0"),
         ("total_work_seconds", "REAL DEFAULT 0.0"),
+        ("last_error", "TEXT"),  # Last error message (for CRASHED status)
         ("prompt_path", "TEXT"),  # Path to the prompt file this Ralph reads from
         # Worktree columns
         ("worktree_base_path", "TEXT"),

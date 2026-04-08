@@ -298,7 +298,6 @@ class TUIMode(Enum):
     LOG_VIEW = auto()  # US8: Log viewer
     HISTORY = auto()  # US12: History view
     SEARCH = auto()  # Search tasks by title
-    TASK_DETAIL = auto()  # Full task detail view
     BULK_SELECT = auto()  # Bulk task selection mode
     BULK_ACTION = auto()  # Bulk action menu
     LOG_STREAM = auto()  # Live log streaming view
@@ -2444,8 +2443,8 @@ def create_instance_dashboard_content(instance, state: TUIState, current_task, p
 
                     text.append(f"  ~{tokens} tokens ({pct}%){warning}\n", style=token_color)
                     text.append("\n")
-            except (ValueError, IOError):
-                pass  # Silently skip if files are unreadable
+            except (ValueError, IOError) as e:
+                logger.debug(f"Could not read token usage files: {e}")
 
     # === SECTION 5: ACTIVITY & HEALTH ===
     text.append("━━━ ACTIVITY ━━━\n", style="bold yellow")
@@ -3182,8 +3181,8 @@ async def update_display_only(layout: Layout, state: TUIState) -> None:
     progress_data = get_all_instance_progress_cached()
 
     # Use existing state data (already fetched by last update_dashboard call)
-    instances = state.instances
-    tasks = state.all_tasks_cache
+    instances = state.instances or []
+    tasks = state.all_tasks_cache or []
 
     # Update only the main content panels with current selection
     if state.view_focus == ViewFocus.TASKS:
@@ -3434,7 +3433,7 @@ async def update_dashboard(layout: Layout, state: TUIState) -> None:
                 # No alerts - show an empty panel
                 layout["alerts"].update(Panel("", height=3, border_style="dim"))
         except KeyError:
-            pass  # Layout doesn't have alerts section
+            logger.debug("Layout does not have an alerts section")
 
     # Determine required layout structure based on mode
     if state.mode == TUIMode.HELP:
@@ -4494,8 +4493,8 @@ async def handle_bulk_task_action(key: str, state: TUIState) -> None:
                 try:
                     await release_claim(task.claimed_by_ralph_id, task_id)
                     released += 1
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning(f"Failed to release task {task_id}: {e}")
         state.status_message = f"Released {released} task(s)"
         state.status_message_time = time.time()
         state.selected_task_ids = set()

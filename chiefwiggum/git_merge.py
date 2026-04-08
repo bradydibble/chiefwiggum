@@ -280,7 +280,7 @@ async def attempt_merge(
 
             if result.returncode == 0:
                 # Need to commit after squash
-                result = subprocess.run(
+                commit_result = subprocess.run(
                     ["git", "commit", "-m", f"Squash merge {worktree_branch} into {target_branch}"],
                     cwd=str(repo_path),
                     capture_output=True,
@@ -288,7 +288,7 @@ async def attempt_merge(
                     timeout=30
                 )
 
-                if result.returncode == 0:
+                if commit_result.returncode == 0:
                     merge_sha = await _get_head_sha(repo_path)
                     return MergeResult(
                         success=True,
@@ -298,12 +298,41 @@ async def attempt_merge(
                         merged_at=merged_at
                     )
 
-            # Check for conflicts
+                # Commit failed after squash — check for "nothing to commit" (already merged)
+                combined_output = (commit_result.stdout + commit_result.stderr).lower()
+                if "nothing to commit" in combined_output:
+                    merge_sha = await _get_head_sha(repo_path)
+                    return MergeResult(
+                        success=True,
+                        has_conflicts=False,
+                        merge_sha=merge_sha,
+                        strategy_used="squash",
+                        merged_at=merged_at
+                    )
+
+                # Commit failed for another reason — reset staged changes to leave repo clean
+                subprocess.run(
+                    ["git", "reset", "HEAD"],
+                    cwd=str(repo_path),
+                    capture_output=True,
+                    text=True,
+                    timeout=10
+                )
+                return MergeResult(
+                    success=False,
+                    has_conflicts=False,
+                    strategy_used="squash",
+                    error_message=f"Squash commit failed: {commit_result.stderr}",
+                    merged_at=merged_at
+                )
+
+            # git merge --squash itself failed — check for conflicts
             conflicted_files = await detect_conflicts(repo_path)
 
             if conflicted_files:
+                # Squash doesn't create MERGE_HEAD, so reset staged changes instead
                 subprocess.run(
-                    ["git", "merge", "--abort"],
+                    ["git", "reset", "HEAD"],
                     cwd=str(repo_path),
                     capture_output=True,
                     text=True,

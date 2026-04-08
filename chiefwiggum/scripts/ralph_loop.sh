@@ -570,8 +570,15 @@ should_exit_gracefully() {
             log_status "INFO" "DEBUG: Not triggering project_complete exit - letting task handler claim next task" >&2
             # Return empty (don't exit) - let the task completion handler take over
             return 1
+        elif [[ -n "$RALPH_ID" ]]; then
+            # In ChiefWiggum mode but no task_id confirmed (empty string or jq failure).
+            # Be conservative — don't signal project_complete when we can't verify the
+            # completed_task_id, as a jq/parse failure could produce an empty string even
+            # when a real task just finished.
+            log_status "WARN" "Completion indicators ($recent_completion_indicators) in ChiefWiggum mode but task_id unconfirmed; continuing instead of project_complete" >&2
+            return 1
         else
-            # No task_id - this is a standalone project completion
+            # No task_id, not in ChiefWiggum mode — standalone project completion
             log_status "WARN" "Exit condition: Strong completion indicators ($recent_completion_indicators) with EXIT_SIGNAL=$claude_exit_signal (no task_id - project completion)" >&2
             echo "project_complete"
             return 0
@@ -2242,9 +2249,21 @@ claim_next_task_for_ralph() {
             for verify_attempt in $(seq 1 $max_verify_attempts); do
                 sleep $verify_delay
 
-                # Get task info from database
-                local task_info
-                task_info=$(wig instances --format=json 2>&1 | jq -r ".[] | select(.ralph_id == \"$ralph_id\") | .current_task_id // \"\"" 2>&1)
+                # Get task info from database — keep wig and jq stderr separate so
+                # a jq parse error never masquerades as a valid task ID.
+                local instances_json task_info
+                instances_json=$(wig instances --format=json 2>/dev/null)
+                if [[ $? -ne 0 ]]; then
+                    log_status "DEBUG" "wig instances failed on verify attempt $verify_attempt, retrying..."
+                    verify_delay=$((verify_delay * 2))
+                    continue
+                fi
+                task_info=$(echo "$instances_json" | jq -r ".[] | select(.ralph_id == \"$ralph_id\") | .current_task_id // \"\"" 2>/dev/null)
+                if [[ $? -ne 0 ]]; then
+                    log_status "DEBUG" "jq failed parsing instances on verify attempt $verify_attempt, retrying..."
+                    verify_delay=$((verify_delay * 2))
+                    continue
+                fi
 
                 if [[ -n "$task_info" && "$task_info" != "null" && "$task_info" != "" ]]; then
                     log_status "SUCCESS" "Task assignment verified: $task_info"
@@ -2308,8 +2327,20 @@ get_task_info_with_retry() {
     for attempt in $(seq 1 $max_attempts); do
         sleep $delay
 
-        local task_id
-        task_id=$(wig instances --format=json 2>&1 | jq -r ".[] | select(.ralph_id == \"$ralph_id\") | .current_task_id // \"\"" 2>&1)
+        # Keep wig and jq stderr separate — a jq error must not look like a task ID.
+        local instances_json task_id
+        instances_json=$(wig instances --format=json 2>/dev/null)
+        if [[ $? -ne 0 ]]; then
+            log_status "DEBUG" "Task info retry attempt $attempt/$max_attempts (wig failed)"
+            delay=$((delay * 2))
+            continue
+        fi
+        task_id=$(echo "$instances_json" | jq -r ".[] | select(.ralph_id == \"$ralph_id\") | .current_task_id // \"\"" 2>/dev/null)
+        if [[ $? -ne 0 ]]; then
+            log_status "DEBUG" "Task info retry attempt $attempt/$max_attempts (jq failed)"
+            delay=$((delay * 2))
+            continue
+        fi
 
         if [[ -n "$task_id" && "$task_id" != "null" && "$task_id" != "" ]]; then
             local task_title
