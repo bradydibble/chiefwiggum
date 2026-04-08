@@ -85,14 +85,18 @@ def generate_task_prompt(
     # Build prompt sections
     prompt = f"# Task {task_id}: {title}\n\n"
 
-    # Goal section
+    # Goal section - use enriched description if available
     prompt += "## Goal\n"
-    prompt += f"{task_description}\n\n"
+    if context.get('description'):
+        prompt += f"{context['description']}\n\n"
+    else:
+        prompt += f"{task_description}\n\n"
 
-    # Files section (if context provides related files)
-    if context.get('related_files'):
+    # Files section (prefer extracted file_paths, fall back to related_files)
+    file_paths = context.get('file_paths') or context.get('related_files')
+    if file_paths:
         prompt += "## Files\n"
-        for file_path in context['related_files']:
+        for file_path in file_paths:
             prompt += f"- `{file_path}`\n"
         prompt += "\n"
 
@@ -102,9 +106,26 @@ def generate_task_prompt(
         for pattern_name, pattern_code in context['patterns'].items():
             prompt += f"{pattern_name}:\n```python\n{pattern_code}\n```\n\n"
 
+    # Code examples from fix plan (if available)
+    if context.get('code_blocks'):
+        prompt += "## Code Examples\n"
+        prompt += "The following code blocks from the spec provide implementation guidance:\n\n"
+        for block in context['code_blocks']:
+            prompt += f"{block}\n\n"
+
+    # Dependencies section (if available)
+    if context.get('depends_on'):
+        prompt += "## Dependencies\n"
+        prompt += "This task depends on the completion of:\n"
+        for dep in context['depends_on']:
+            prompt += f"- {dep}\n"
+        prompt += "\n"
+
     # Acceptance Criteria section
     prompt += "## Acceptance Criteria\n"
-    criteria = _extract_acceptance_criteria(task_description)
+    # Use enriched description for criteria extraction if available
+    criteria_source = context.get('description', task_description)
+    criteria = _extract_acceptance_criteria(criteria_source)
     if criteria:
         for criterion in criteria:
             prompt += f"- [ ] {criterion}\n"

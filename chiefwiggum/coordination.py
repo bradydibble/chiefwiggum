@@ -48,195 +48,8 @@ HEARTBEAT_STALE_MINUTES = 10  # Mark instances crashed after 10 minutes
 PRIORITY_ORDER = [TaskPriority.HIGH, TaskPriority.MEDIUM, TaskPriority.LOWER, TaskPriority.POLISH]
 
 
-def _slugify(text: str) -> str:
-    """Convert text to URL-safe slug."""
-    slug = re.sub(r"[^\w\s-]", "", text.lower())
-    slug = re.sub(r"[-\s]+", "-", slug).strip("-")
-    return slug[:50]
-
-
-def _generate_task_id(task_number: int, title: str) -> str:
-    """Generate task ID from number and title."""
-    return f"task-{task_number}-{_slugify(title)}"
-
-
-def parse_fix_plan(path: str | Path) -> list[FixPlanTask]:
-    """Parse @fix_plan.md and return list of tasks.
-
-    Supports multiple formats:
-
-    Format 1 (numbered):
-    - Section: `## HIGH PRIORITY - Get Data Flowing`
-    - Task: `### 22. File Processing Workflow COMPLETE`
-    - Subtask: `- [x] Create file upload endpoint`
-
-    Format 2 (ID-based):
-    - Section: `## PRODUCT FEEDBACK (IMMEDIATE PRIORITY)`
-    - Task: `#### PF-1: Timezone to Pacific`
-    - Subtask: `- [ ] Change timezone setting`
-
-    Args:
-        path: Path to the fix_plan.md file
-
-    Returns:
-        List of FixPlanTask objects
-    """
-    path = Path(path)
-    if not path.exists():
-        logger.warning(f"Fix plan not found: {path}")
-        return []
-
-    content = path.read_text()
-    tasks: list[FixPlanTask] = []
-
-    current_section: str | None = None
-    current_priority: TaskPriority | None = None
-    current_task: FixPlanTask | None = None
-    task_counter = 0  # For ID-based tasks without numbers
-
-    # Priority section patterns - check most specific first
-    section_patterns = [
-        # Explicit priority keywords
-        (r"##\s*HIGH\s*PRIORITY", TaskPriority.HIGH),
-        (r"##\s*MEDIUM\s*PRIORITY", TaskPriority.MEDIUM),
-        (r"##\s*LOWER\s*PRIORITY", TaskPriority.LOWER),
-        (r"##\s*POLISH", TaskPriority.POLISH),
-        # Alternative patterns
-        (r"##.*IMMEDIATE\s*PRIORITY", TaskPriority.HIGH),
-        (r"##.*CRITICAL", TaskPriority.HIGH),
-        (r"##.*Tier\s*1", TaskPriority.HIGH),
-        (r"##.*Tier\s*2", TaskPriority.MEDIUM),
-        (r"##.*Tier\s*3", TaskPriority.LOWER),
-        (r"##.*Tier\s*4", TaskPriority.POLISH),
-        (r"###\s*Tier\s*1", TaskPriority.HIGH),
-        (r"###\s*Tier\s*2", TaskPriority.MEDIUM),
-        (r"###\s*Tier\s*3", TaskPriority.LOWER),
-        (r"###\s*Tier\s*4", TaskPriority.POLISH),
-        # Tier-numbered sections (#### TIER N: ...) as used in @fix_plan.md
-        (r"####\s*TIER\s*[01][:\s]", TaskPriority.HIGH),
-        (r"####\s*TIER\s*[23][:\s]", TaskPriority.MEDIUM),
-        (r"####\s*TIER\s*[45][:\s]", TaskPriority.LOWER),
-        (r"####\s*TIER\s*[6-9][:\s]", TaskPriority.POLISH),
-    ]
-
-    for line in content.split("\n"):
-        line = line.strip()
-
-        # Check for section headers
-        for pattern, priority in section_patterns:
-            if re.match(pattern, line, re.IGNORECASE):
-                current_priority = priority
-                # Extract section name after the priority indicator
-                match = re.search(r"[-:]\s*(.+)$", line)
-                if match:
-                    current_section = match.group(1).strip()
-                else:
-                    # Use the whole line minus ## as section
-                    current_section = re.sub(r"^##+\s*", "", line).strip()
-                break
-
-        # Check for task headers - multiple formats
-        task_match = None
-        task_number = None
-        title_part = None
-
-        # Format 1: ### N. Title (numbered)
-        numbered_match = re.match(r"#{2,4}\s*(\d+)\.\s*(.+)", line)
-        if numbered_match:
-            task_number = int(numbered_match.group(1))
-            title_part = numbered_match.group(2)
-            task_match = True
-
-        # Format 2: #### ID-N: Title (ID-based like PF-1, BUG-42)
-        if not task_match:
-            id_match = re.match(r"#{2,4}\s*([A-Z]+-\d+)[:\s]+(.+)", line)
-            if id_match:
-                task_counter += 1
-                task_number = task_counter
-                title_part = f"{id_match.group(1)}: {id_match.group(2)}"
-                task_match = True
-
-        # Format 3: #### Title (no number, just header under a Tier section)
-        # Must be a multi-word title to avoid matching section headers, notes, etc.
-        _NON_TASK_HEADERS = {
-            "note", "notes", "overview", "background", "summary", "important",
-            "warning", "example", "examples", "table", "appendix", "reference",
-            "references", "detail", "details", "description", "context",
-            "tier",
-        }
-        # Format 4: ##### T0.1: Title  (dot-numbered tier tasks, e.g. @fix_plan.md)
-        if not task_match and current_priority:
-            tier_task_match = re.match(r"#{2,5}\s*(T\d+\.\d+)[:\s]+(.+)", line)
-            if tier_task_match:
-                task_counter += 1
-                task_number = task_counter
-                title_part = f"{tier_task_match.group(1)}: {tier_task_match.group(2).strip()}"
-                task_match = True
-
-        if not task_match and current_priority:
-            plain_match = re.match(r"####\s+([A-Z][^#].{5,})", line)  # At least 6 chars, starts with capital
-            if plain_match and not plain_match.group(1).startswith("**"):  # Not bold text
-                title_candidate = plain_match.group(1).strip()
-                first_word = title_candidate.split()[0].lower().rstrip(":")
-                # Require multiple words and exclude known non-task header keywords
-                if " " in title_candidate and first_word not in _NON_TASK_HEADERS:
-                    task_counter += 1
-                    task_number = task_counter
-                    title_part = title_candidate
-                    task_match = True
-
-        if task_match and task_number and title_part and current_priority:
-            if current_task:
-                # Before appending, check if task is complete based on subtasks
-                # A task is complete if it has subtasks and ALL are checked
-                if not current_task.is_complete and current_task.completed_subtasks:
-                    if not current_task.subtasks:  # No unchecked subtasks remain
-                        current_task.is_complete = True
-                tasks.append(current_task)
-
-            # Check if complete: "COMPLETE" in title, or checkmark emoji
-            is_complete = (
-                "COMPLETE" in title_part.upper() or
-                "✅" in title_part or
-                "✓" in title_part
-            )
-
-            # Clean title (remove checkmarks and COMPLETE markers)
-            title = re.sub(r"\s*[✅✓]\s*", "", title_part).strip()
-            title = re.sub(r"\s*COMPLETE\s*", "", title, flags=re.IGNORECASE).strip()
-
-            current_task = FixPlanTask(
-                task_id=_generate_task_id(task_number, title),
-                task_number=task_number,
-                title=title,
-                priority=current_priority,
-                section=current_section,
-                is_complete=is_complete,
-                subtasks=[],
-                completed_subtasks=[],
-            )
-
-        # Check for subtasks (- [ ] or - [x])
-        if current_task:
-            subtask_match = re.match(r"-\s*\[([ x])\]\s*(.+)", line)
-            if subtask_match:
-                is_checked = subtask_match.group(1).lower() == "x"
-                subtask_text = subtask_match.group(2).strip()
-
-                if is_checked:
-                    current_task.completed_subtasks.append(subtask_text)
-                else:
-                    current_task.subtasks.append(subtask_text)
-
-    # Don't forget the last task
-    if current_task:
-        # Check if task is complete based on subtasks
-        if not current_task.is_complete and current_task.completed_subtasks:
-            if not current_task.subtasks:  # No unchecked subtasks remain
-                current_task.is_complete = True
-        tasks.append(current_task)
-
-    return tasks
+# Backward-compatible re-exports from fix_plan_parser
+from chiefwiggum.fix_plan_parser import _slugify, _generate_task_id, parse_fix_plan  # noqa: F401
 
 
 async def sync_tasks_from_fix_plan(fix_plan_path: str | Path, project: str | None = None) -> int:
@@ -266,41 +79,73 @@ async def sync_tasks_from_fix_plan(fix_plan_path: str | Path, project: str | Non
         now = datetime.now()
 
         for task in tasks:
+            # Use file_paths for category inference if available, fall back to subtask text
+            category_input = task.file_paths or (task.subtasks + task.completed_subtasks)
+            category = infer_task_category(category_input, task.title)
+
+            # Serialize new fields as JSON
+            code_blocks_json = json.dumps(task.code_blocks) if task.code_blocks else None
+            file_paths_json = json.dumps(task.file_paths) if task.file_paths else None
+            depends_on_json = json.dumps(task.depends_on) if task.depends_on else None
+
+            # Try to find existing task by task_id first
             cursor = await conn.execute(
                 "SELECT task_id, status FROM task_claims WHERE task_id = ?",
                 (task.task_id,)
             )
             existing = await cursor.fetchone()
 
+            # If not found by task_id, try stable_id (handles title renames)
+            if not existing and task.stable_id:
+                cursor = await conn.execute(
+                    "SELECT task_id, status FROM task_claims WHERE stable_id = ?",
+                    (task.stable_id,)
+                )
+                existing = await cursor.fetchone()
+                if existing:
+                    old_task_id = existing[0]
+                    logger.info(f"Task renamed: {old_task_id} -> {task.task_id} (stable_id: {task.stable_id})")
+                    await conn.execute(
+                        "UPDATE task_claims SET task_id = ?, task_title = ? WHERE task_id = ?",
+                        (task.task_id, task.title, old_task_id)
+                    )
+
             if existing:
                 existing_status = existing[1]
-                # Always infer and update category for existing tasks
-                category = infer_task_category(task.subtasks + task.completed_subtasks, task.title)
 
                 if task.is_complete and existing_status != TaskClaimStatus.COMPLETED.value:
                     await conn.execute(
                         """UPDATE task_claims
-                           SET status = ?, category = ?, updated_at = ?
+                           SET status = ?, category = ?, updated_at = ?,
+                               stable_id = ?, description = ?, code_blocks_json = ?,
+                               file_paths_json = ?, depends_on_json = ?, source_line = ?
                            WHERE task_id = ?""",
-                        (TaskClaimStatus.COMPLETED.value, category.value, now, task.task_id)
+                        (TaskClaimStatus.COMPLETED.value, category.value, now,
+                         task.stable_id, task.description, code_blocks_json,
+                         file_paths_json, depends_on_json, task.source_line,
+                         task.task_id)
                     )
                 else:
-                    # Update category even if status unchanged
                     await conn.execute(
                         """UPDATE task_claims
-                           SET category = ?, updated_at = ?
+                           SET category = ?, updated_at = ?,
+                               stable_id = ?, description = ?, code_blocks_json = ?,
+                               file_paths_json = ?, depends_on_json = ?, source_line = ?
                            WHERE task_id = ?""",
-                        (category.value, now, task.task_id)
+                        (category.value, now,
+                         task.stable_id, task.description, code_blocks_json,
+                         file_paths_json, depends_on_json, task.source_line,
+                         task.task_id)
                     )
             else:
                 status = TaskClaimStatus.COMPLETED.value if task.is_complete else TaskClaimStatus.PENDING.value
-                # Infer category from task title and subtasks
-                category = infer_task_category(task.subtasks + task.completed_subtasks, task.title)
                 await conn.execute(
                     """INSERT INTO task_claims
-                       (task_id, task_title, task_priority, task_section, project, status, created_at, category)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (task.task_id, task.title, task.priority.value, task.section, project, status, now, category.value)
+                       (task_id, task_title, task_priority, task_section, project, status, created_at, category,
+                        stable_id, description, code_blocks_json, file_paths_json, depends_on_json, source_line)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (task.task_id, task.title, task.priority.value, task.section, project, status, now, category.value,
+                     task.stable_id, task.description, code_blocks_json, file_paths_json, depends_on_json, task.source_line)
                 )
 
         await conn.commit()
@@ -3747,12 +3592,16 @@ async def sync_tasks_with_grading(
 
             description = "\n".join(description_parts)
 
-            # Generate task-specific prompt
+            # Generate task-specific prompt with enriched data
             context = {
                 'repo_path': str(repo_path),
                 'project_name': project,
-                'related_files': [],  # TODO: Use codebase search
-                'patterns': {}  # TODO: Extract patterns from existing code
+                'related_files': task.file_paths or [],
+                'file_paths': task.file_paths or [],
+                'patterns': {},
+                'description': task.description or '',
+                'code_blocks': task.code_blocks or [],
+                'depends_on': task.depends_on or [],
             }
             prompt = generate_task_prompt(task.task_id, description, context)
 

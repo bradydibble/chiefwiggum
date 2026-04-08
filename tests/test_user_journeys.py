@@ -551,9 +551,9 @@ class TestSpawnWorkflowJourney:
             model=ClaudeModel.SONNET,
         )
 
-        with patch("chiefwiggum.tui.can_spawn_ralph", new_callable=AsyncMock) as mock_can_spawn, \
-             patch("chiefwiggum.tui.spawn_ralph_with_task_claim", new_callable=AsyncMock) as mock_spawn, \
-             patch("chiefwiggum.tui.generate_ralph_id") as mock_gen_id:
+        with patch("chiefwiggum.tui.handlers.can_spawn_ralph", new_callable=AsyncMock) as mock_can_spawn, \
+             patch("chiefwiggum.tui.handlers.spawn_ralph_with_task_claim", new_callable=AsyncMock) as mock_spawn, \
+             patch("chiefwiggum.tui.handlers.generate_ralph_id") as mock_gen_id:
 
             mock_can_spawn.return_value = (True, "Ready")
             # spawn_ralph_with_task_claim returns (success, message, task_id)
@@ -730,7 +730,7 @@ class TestCommandBarDisplay:
     def test_command_bar_shows_critical_keys_in_source(self):
         """Command bar source includes critical keys like 'n' for New."""
 
-        tui_path = Path(__file__).parent.parent / "chiefwiggum" / "tui.py"
+        tui_path = Path(__file__).parent.parent / "chiefwiggum" / "tui" / "panels.py"
         source = tui_path.read_text()
 
         # In create_command_bar for NORMAL mode
@@ -738,8 +738,8 @@ class TestCommandBarDisplay:
         assert 'text.append("n", style="cyan")' in source
         assert 'text.append(" New  ", style="dim")' in source
 
-        # Check that 'p' Project is present (in tier 3 commands)
-        assert '"p"' in source and '"Project"' in source
+        # Check that 'p' Project is mentioned (in tier 3 comments)
+        assert "p Project" in source
 
 
 # =============================================================================
@@ -753,7 +753,7 @@ class TestStatusMessageTimeout:
     def test_status_message_timeout_is_8_seconds(self):
         """Status message timeout should be 8 seconds (not 5)."""
 
-        tui_path = Path(__file__).parent.parent / "chiefwiggum" / "tui.py"
+        tui_path = Path(__file__).parent.parent / "chiefwiggum" / "tui" / "panels.py"
         source = tui_path.read_text()
 
         # Check that the timeout is 8 seconds

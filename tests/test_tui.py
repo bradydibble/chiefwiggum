@@ -167,7 +167,7 @@ class TestModeTransitions:
     def test_all_spawn_modes_in_update_dashboard_tuple(self):
         """SPAWN_CATEGORY must be in the mode tuple - catches the bug we fixed."""
         # Read the source file and parse to find the tuple
-        tui_path = Path(__file__).parent.parent / "chiefwiggum" / "tui.py"
+        tui_path = Path(__file__).parent.parent / "chiefwiggum" / "tui" / "dashboard.py"
         source = tui_path.read_text()
 
         # The critical line is the elif that handles spawn modes in update_dashboard
@@ -195,7 +195,7 @@ class TestModeTransitions:
 
     def test_all_spawn_modes_in_command_bar_tuple(self):
         """All spawn modes must be in command bar handler."""
-        tui_path = Path(__file__).parent.parent / "chiefwiggum" / "tui.py"
+        tui_path = Path(__file__).parent.parent / "chiefwiggum" / "tui" / "panels.py"
         source = tui_path.read_text()
 
         # In create_command_bar, there's a check for spawn modes
@@ -215,7 +215,7 @@ class TestModeTransitions:
 
     def test_all_spawn_modes_in_handle_command_tuple(self):
         """All spawn modes must be in handle_command."""
-        tui_path = Path(__file__).parent.parent / "chiefwiggum" / "tui.py"
+        tui_path = Path(__file__).parent.parent / "chiefwiggum" / "tui" / "handlers.py"
         source = tui_path.read_text()
 
         # In handle_command, spawn modes are handled together

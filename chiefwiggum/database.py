@@ -236,6 +236,13 @@ async def _run_migrations(conn: aiosqlite.Connection):
         ("merge_strategy", "TEXT"),
         ("merge_attempted_at", "TIMESTAMP"),
         ("merge_error", "TEXT"),
+        # Rich task parsing columns
+        ("stable_id", "TEXT"),
+        ("description", "TEXT"),
+        ("code_blocks_json", "TEXT"),
+        ("file_paths_json", "TEXT"),
+        ("depends_on_json", "TEXT"),
+        ("source_line", "INTEGER"),
     ]
 
     for col_name, col_type in new_task_columns:
@@ -253,6 +260,7 @@ async def _run_migrations(conn: aiosqlite.Connection):
         "CREATE INDEX IF NOT EXISTS idx_task_claims_retry ON task_claims(next_retry_at)",
         "CREATE INDEX IF NOT EXISTS idx_task_claims_worktree ON task_claims(worktree_path)",
         "CREATE INDEX IF NOT EXISTS idx_task_claims_merge_status ON task_claims(merge_status)",
+        "CREATE INDEX IF NOT EXISTS idx_task_claims_stable_id ON task_claims(stable_id)",
     ]
     for index_sql in migration_indexes:
         try:
@@ -321,6 +329,24 @@ async def _run_migrations(conn: aiosqlite.Connection):
             try:
                 await conn.execute(f"ALTER TABLE task_history ADD COLUMN {col_name} {col_type}")
                 logger.info(f"Added cost tracking column {col_name} to task_history")
+            except Exception as e:
+                logger.debug(f"Column {col_name} may already exist: {e}")
+
+    # Check tasks table columns for rich parsing data
+    cursor = await conn.execute("PRAGMA table_info(tasks)")
+    existing_tasks_columns = {row[1] for row in await cursor.fetchall()}
+
+    new_tasks_columns = [
+        ("code_blocks_json", "TEXT"),
+        ("file_paths_json", "TEXT"),
+        ("stable_id", "TEXT"),
+    ]
+
+    for col_name, col_type in new_tasks_columns:
+        if col_name not in existing_tasks_columns:
+            try:
+                await conn.execute(f"ALTER TABLE tasks ADD COLUMN {col_name} {col_type}")
+                logger.info(f"Added column {col_name} to tasks")
             except Exception as e:
                 logger.debug(f"Column {col_name} may already exist: {e}")
 

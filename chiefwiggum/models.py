@@ -191,8 +191,18 @@ class FixPlanTask(BaseModel):
     is_complete: bool = False
     subtasks: list[str] = Field(default_factory=list)
     completed_subtasks: list[str] = Field(default_factory=list)
-    # File paths for category inference
+    # File paths for category inference (extracted from description)
     file_paths: list[str] = Field(default_factory=list)
+    # Position-based stable ID that survives title renames (e.g., "s1-t3")
+    stable_id: str | None = None
+    # Multi-line body text between task header and subtasks
+    description: str = ""
+    # Fenced code blocks from the task description
+    code_blocks: list[str] = Field(default_factory=list)
+    # Dependency references (task IDs this task depends on)
+    depends_on: list[str] = Field(default_factory=list)
+    # Line number in source file where task header appears
+    source_line: int | None = None
 
 
 class TaskHistory(BaseModel):
