@@ -48,5 +48,8 @@ logs/
 # Claude sessions
 .claude-sessions/
 
+# Claude local settings (personal dev environment)
+.claude/settings.local.json
+
 # Backup files
 *.backup*

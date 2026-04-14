@@ -44,8 +44,8 @@ chiefwiggum = "chiefwiggum.cli:main"
 wig = "chiefwiggum.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/bdibble/chiefwiggum"
-Repository = "https://github.com/bdibble/chiefwiggum"
+Homepage = "https://github.com/bradydibble/chiefwiggum"
+Repository = "https://github.com/bradydibble/chiefwiggum"
 
 [tool.hatch.build.targets.wheel]
 packages = ["chiefwiggum"]
