@@ -105,20 +105,14 @@ def update_task_completion_marker(
         logger.warning(f"@fix_plan.md not found at {fix_plan_path}")
         return False
 
+    # Use a stable lock file so that the atomic rename of the main file
+    # doesn't cause threads to lock different inodes and race each other.
+    lock_path = fix_plan_path.with_suffix(".md.lock")
     try:
-        # Read the file with exclusive lock
-        with open(fix_plan_path, "r+", encoding="utf-8") as f:
-            # Acquire exclusive lock
+        with open(lock_path, "w") as lock_f:
+            fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
             try:
-                fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                logger.warning(
-                    f"Could not acquire lock on {fix_plan_path} - another process is updating it"
-                )
-                return False
-
-            try:
-                content = f.read()
+                content = fix_plan_path.read_text(encoding="utf-8")
                 lines = content.splitlines(keepends=True)
 
                 # Find the task line
@@ -138,23 +132,17 @@ def update_task_completion_marker(
                 )
 
                 if mark_complete and has_marker:
-                    logger.debug(
-                        f"Task {task_id} already marked complete in {fix_plan_path}"
-                    )
+                    logger.debug(f"Task {task_id} already marked complete in {fix_plan_path}")
                     return True  # Already marked, no change needed
 
                 if not mark_complete and not has_marker:
-                    logger.debug(
-                        f"Task {task_id} already unmarked in {fix_plan_path}"
-                    )
+                    logger.debug(f"Task {task_id} already unmarked in {fix_plan_path}")
                     return True  # Already unmarked, no change needed
 
                 # Update the line
                 if mark_complete:
-                    # Add completion marker
                     new_line = _strip_completion_marker(current_line) + COMPLETE_MARKER
                 else:
-                    # Remove completion marker
                     new_line = _strip_completion_marker(current_line)
 
                 # Preserve the original line ending
@@ -173,15 +161,13 @@ def update_task_completion_marker(
                     dir=fix_plan_path.parent, prefix=".fix_plan_", suffix=".tmp"
                 )
                 try:
+                    import os
+
                     with open(temp_fd, "w", encoding="utf-8") as temp_f:
                         temp_f.writelines(lines)
                         temp_f.flush()
-                        # Ensure data is written to disk
-                        import os
-
                         os.fsync(temp_f.fileno())
 
-                    # Atomic rename
                     shutil.move(temp_path, fix_plan_path)
                     logger.info(
                         f"Updated task {task_id} in {fix_plan_path} (complete={mark_complete})"
@@ -189,7 +175,6 @@ def update_task_completion_marker(
                     return True
 
                 except Exception as e:
-                    # Clean up temp file on error
                     try:
                         Path(temp_path).unlink(missing_ok=True)
                     except Exception:
@@ -197,8 +182,7 @@ def update_task_completion_marker(
                     raise e
 
             finally:
-                # Release lock
-                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
 
     except Exception as e:
         logger.error(f"Error updating {fix_plan_path} for task {task_id}: {e}")

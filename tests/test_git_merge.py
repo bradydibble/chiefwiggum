@@ -3,10 +3,11 @@
 Tests git auto-merge with conflict detection.
 """
 
-import pytest
 import subprocess
 import tempfile
 from pathlib import Path
+
+import pytest
 
 from chiefwiggum.git_merge import attempt_merge, detect_conflicts
 
@@ -199,7 +200,7 @@ async def test_detect_conflicts(temp_git_repo):
     )
 
     # Start merge but don't complete it
-    result = subprocess.run(
+    subprocess.run(
         ["git", "merge", "feature-1"],
         cwd=temp_git_repo,
         capture_output=True

@@ -6,8 +6,8 @@ and database queries during UI rendering.
 """
 
 import time
-from typing import Any, Dict, Optional, Callable
 from threading import Lock
+from typing import Any, Callable, Dict, Optional
 
 
 class TTLCache:

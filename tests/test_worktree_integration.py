@@ -5,10 +5,11 @@ Uses real git repositories and commands (not mocks) for accurate validation.
 """
 
 import asyncio
-import pytest
 import subprocess
 import tempfile
 from pathlib import Path
+
+import pytest
 
 from chiefwiggum.git_merge import attempt_merge
 from chiefwiggum.worktree_manager import (

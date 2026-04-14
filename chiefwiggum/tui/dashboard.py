@@ -9,12 +9,10 @@ import asyncio
 import logging
 import time
 from datetime import datetime
-from typing import Any, Optional
 
 from rich import box
 from rich.layout import Layout
 from rich.panel import Panel
-from rich.table import Table
 from rich.text import Text
 
 from chiefwiggum import (
@@ -28,22 +26,7 @@ from chiefwiggum import (
 )
 from chiefwiggum.coordination import (
     get_all_instance_progress_cached,
-    invalidate_progress_cache,
     list_graded_tasks,
-)
-from chiefwiggum.models import (
-    RalphInstanceStatus,
-    TaskClaimStatus,
-    TaskPriority,
-    TaskSortOrder,
-)
-from chiefwiggum.spawner import (
-    cleanup_dead_ralphs,
-    get_running_ralphs,
-    read_ralph_log,
-    read_ralph_status,
-    get_process_health_cached,
-    invalidate_process_health_cache,
 )
 from chiefwiggum.icons import (
     BG_HEADER,
@@ -56,41 +39,49 @@ from chiefwiggum.icons import (
     COLOR_WARNING,
     ICON_DAEMON,
 )
-from chiefwiggum.tui.state import (
-    InstanceDetailTab,
-    RenderState,
-    TUIMode,
-    TUIState,
-    ViewFocus,
+from chiefwiggum.models import (
+    RalphInstanceStatus,
+    TaskClaimStatus,
+    TaskPriority,
+    TaskSortOrder,
 )
-from chiefwiggum.tui.helpers import compute_data_hash, format_age, create_progress_bar
-from chiefwiggum.tui.panels import (
-    create_instances_table,
-    create_tasks_table,
-    create_graded_tasks_table,
-    create_stats_panel,
-    generate_alerts,
-    create_alerts_panel,
-    create_layout,
-    create_help_panel,
-    create_stats_view_panel,
-    create_error_detail_panel,
-    create_spawn_panel,
-    create_log_view_panel,
-    create_history_panel,
-    create_settings_panel,
-    create_search_panel,
-    create_task_detail_panel,
-    create_bulk_action_panel,
-    create_log_stream_panel,
-    create_confirm_panel,
-    create_reconcile_panel,
-    create_cleanup_panel,
-    create_command_bar,
+from chiefwiggum.spawner import (
+    cleanup_dead_ralphs,
+    get_running_ralphs,
+    read_ralph_log,
 )
+from chiefwiggum.tui.helpers import compute_data_hash
 from chiefwiggum.tui.instance_detail import (
     create_instance_detail_panel,
     create_instance_error_detail_overlay,
+)
+from chiefwiggum.tui.panels import (
+    create_alerts_panel,
+    create_bulk_action_panel,
+    create_cleanup_panel,
+    create_command_bar,
+    create_confirm_panel,
+    create_error_detail_panel,
+    create_graded_tasks_table,
+    create_help_panel,
+    create_history_panel,
+    create_instances_table,
+    create_log_stream_panel,
+    create_log_view_panel,
+    create_reconcile_panel,
+    create_search_panel,
+    create_settings_panel,
+    create_spawn_panel,
+    create_stats_panel,
+    create_task_detail_panel,
+    create_tasks_table,
+    generate_alerts,
+)
+from chiefwiggum.tui.state import (
+    InstanceDetailTab,
+    TUIMode,
+    TUIState,
+    ViewFocus,
 )
 
 logger = logging.getLogger(__name__)
@@ -196,7 +187,6 @@ async def update_display_only(layout: Layout, state: TUIState) -> None:
 async def update_dashboard(layout: Layout, state: TUIState) -> None:
     """Update all dashboard components."""
     # Clean up dead/zombie Ralph processes
-    from chiefwiggum.spawner import cleanup_dead_ralphs
     cleaned = cleanup_dead_ralphs()
     if cleaned:
         state.status_message = f"Cleaned up {len(cleaned)} dead Ralph(s): {', '.join(r[:12] for r in cleaned)}"
@@ -221,7 +211,6 @@ async def update_dashboard(layout: Layout, state: TUIState) -> None:
 
     # Fetch master data in parallel (3 queries instead of 6, run concurrently)
     # Also fetch graded tasks for Ralph Loop Alignment
-    from chiefwiggum.coordination import list_graded_tasks
     all_instances, all_tasks, graded_tasks = await asyncio.gather(
         list_all_instances(),
         list_all_tasks(),
@@ -300,8 +289,6 @@ async def update_dashboard(layout: Layout, state: TUIState) -> None:
     tasks_display_hash = f"{tasks_base_hash}:{state.show_all_tasks}:{state.project_filter}:{state.sort_order}:{state.task_scroll_offset}:{state.bulk_mode_active}:{len(state.selected_task_ids)}"
 
     # Check if display state actually changed
-    instances_changed = instances_display_hash != state.render_state.previous_instances_hash
-    tasks_changed = tasks_display_hash != state.render_state.previous_tasks_hash
     alerts_changed = alerts_hash != state.render_state.previous_alerts_hash
 
     # Update stored hashes

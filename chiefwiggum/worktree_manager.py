@@ -8,7 +8,6 @@ import asyncio
 import logging
 import re
 import subprocess
-from datetime import datetime
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -269,7 +268,7 @@ async def list_active_worktrees(project_path: Path) -> list[dict]:
     except subprocess.TimeoutExpired:
         logger.warning("Git worktree list timed out")
         return []
-    except Exception as e:
+    except Exception:
         logger.exception("Error listing worktrees")
         return []
 
@@ -310,7 +309,7 @@ async def cleanup_stale_worktrees(
             success, msg = await cleanup_worktree(ralph_dir, force=True)
             results.append((ralph_dir, success, msg))
 
-    except Exception as e:
+    except Exception:
         logger.exception("Error cleaning up stale worktrees")
 
     return results
@@ -376,6 +375,6 @@ async def get_worktree_status(worktree_path: Path) -> dict | None:
             "behind": behind
         }
 
-    except Exception as e:
+    except Exception:
         logger.exception(f"Error getting worktree status for {worktree_path}")
         return None

@@ -138,7 +138,7 @@ def parse_fix_plan(path: str | Path) -> list[FixPlanTask]:
 
         # Format 3: #### Title (no number, just header under a Tier section)
         # Must be a multi-word title to avoid matching section headers, notes, etc.
-        _NON_TASK_HEADERS = {
+        _non_task_headers = {
             "note", "notes", "overview", "background", "summary", "important",
             "warning", "example", "examples", "table", "appendix", "reference",
             "references", "detail", "details", "description", "context",
@@ -159,7 +159,7 @@ def parse_fix_plan(path: str | Path) -> list[FixPlanTask]:
                 title_candidate = plain_match.group(1).strip()
                 first_word = title_candidate.split()[0].lower().rstrip(":")
                 # Require multiple words and exclude known non-task header keywords
-                if " " in title_candidate and first_word not in _NON_TASK_HEADERS:
+                if " " in title_candidate and first_word not in _non_task_headers:
                     task_counter += 1
                     task_number = task_counter
                     title_part = title_candidate

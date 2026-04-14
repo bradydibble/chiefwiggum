@@ -15,10 +15,11 @@ import pytest
 from chiefwiggum import (
     CLAIM_EXPIRY_MINUTES,
     HEARTBEAT_STALE_MINUTES,
+    RalphInstanceStatus,
     TaskClaimStatus,
     TaskPriority,
-    RalphInstanceStatus,
     claim_task,
+    complete_and_claim_next,
     complete_task,
     extend_claim,
     fail_task,
@@ -36,14 +37,12 @@ from chiefwiggum import (
     shutdown_instance,
     sync_tasks_from_fix_plan,
     verify_claim_before_commit,
-    complete_and_claim_next,
 )
 from chiefwiggum.coordination import (
     _generate_task_id,
     _slugify,
     parse_fix_plan,
 )
-
 
 # =============================================================================
 # Test Fixtures
@@ -694,8 +693,8 @@ class TestTaskAssignmentStrategies:
     @pytest.mark.asyncio
     async def test_get_assigned_categories_matches_ralph_prefix(self):
         """get_assigned_categories returns categories for matching prefix."""
-        from chiefwiggum.coordination import get_assigned_categories
         from chiefwiggum.config import set_category_assignments
+        from chiefwiggum.coordination import get_assigned_categories
 
         # Set up category assignments
         set_category_assignments({
@@ -746,8 +745,8 @@ class TestAutoScaling:
     @pytest.mark.asyncio
     async def test_should_spawn_ralph_respects_threshold(self, sample_fix_plan_file):
         """should_spawn_ralph respects spawn threshold config."""
-        from chiefwiggum.coordination import should_spawn_ralph
         from chiefwiggum.config import set_auto_scaling_config
+        from chiefwiggum.coordination import should_spawn_ralph
 
         await sync_tasks_from_fix_plan(sample_fix_plan_file, project="test")
 
@@ -784,8 +783,8 @@ class TestAutoScaling:
     @pytest.mark.asyncio
     async def test_cleanup_idle_ralphs_skips_when_pending_tasks(self, sample_fix_plan_file):
         """cleanup_idle_ralphs doesn't cleanup when tasks are pending."""
-        from chiefwiggum.coordination import cleanup_idle_ralphs
         from chiefwiggum.config import set_auto_scaling_config
+        from chiefwiggum.coordination import cleanup_idle_ralphs
 
         await sync_tasks_from_fix_plan(sample_fix_plan_file, project="test")
         set_auto_scaling_config({"auto_cleanup_enabled": True})
@@ -917,7 +916,6 @@ This is the only task
     @pytest.mark.asyncio
     async def test_complete_and_claim_next_updates_instance_task(self, sample_fix_plan_file):
         """Test that complete_and_claim_next() updates Ralph instance's current_task_id."""
-        from chiefwiggum.database import get_connection
 
         await sync_tasks_from_fix_plan(sample_fix_plan_file, project="test")
         ralph_id = "test-ralph-instance-update"

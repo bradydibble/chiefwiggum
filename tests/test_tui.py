@@ -12,7 +12,6 @@ Tests cover:
 import time
 from pathlib import Path
 
-
 from chiefwiggum.models import (
     ClaudeModel,
     TaskCategory,
@@ -27,7 +26,6 @@ from chiefwiggum.tui import (
     handle_normal_mode,
     handle_spawn,
 )
-
 
 # =============================================================================
 # TestDiscoverFixPlanProjects
@@ -903,6 +901,7 @@ class TestOverlayToggleBehavior:
     def test_help_closes_with_h_key(self):
         """h should close help mode (toggle behavior)."""
         import asyncio
+
         from chiefwiggum.tui import handle_command
 
         loop = asyncio.new_event_loop()
@@ -917,6 +916,7 @@ class TestOverlayToggleBehavior:
     def test_help_closes_with_question_mark(self):
         """? should close help mode (toggle behavior)."""
         import asyncio
+
         from chiefwiggum.tui import handle_command
 
         loop = asyncio.new_event_loop()
@@ -931,6 +931,7 @@ class TestOverlayToggleBehavior:
     def test_stats_closes_with_t_key(self):
         """t should close stats mode (toggle behavior)."""
         import asyncio
+
         from chiefwiggum.tui import handle_command
 
         loop = asyncio.new_event_loop()
@@ -945,6 +946,7 @@ class TestOverlayToggleBehavior:
     def test_error_detail_closes_with_e_key(self):
         """e should close error detail mode (toggle behavior)."""
         import asyncio
+
         from chiefwiggum.tui import handle_command
 
         loop = asyncio.new_event_loop()
@@ -959,6 +961,7 @@ class TestOverlayToggleBehavior:
     def test_log_view_closes_with_l_key(self):
         """l should close log view mode (toggle behavior)."""
         import asyncio
+
         from chiefwiggum.tui import handle_command
 
         loop = asyncio.new_event_loop()
@@ -970,9 +973,10 @@ class TestOverlayToggleBehavior:
         assert state.mode == TUIMode.NORMAL
         loop.close()
 
-    def test_history_closes_with_H_key(self):
+    def test_history_closes_with_H_key(self):  # noqa: N802
         """H should close history mode (toggle behavior)."""
         import asyncio
+
         from chiefwiggum.tui import handle_command
 
         loop = asyncio.new_event_loop()
@@ -987,6 +991,7 @@ class TestOverlayToggleBehavior:
     def test_task_detail_closes_with_d_key(self):
         """d should close task detail mode (toggle behavior)."""
         import asyncio
+
         from chiefwiggum.tui import handle_command
 
         loop = asyncio.new_event_loop()
@@ -1001,6 +1006,7 @@ class TestOverlayToggleBehavior:
     def test_log_stream_closes_with_v_key(self):
         """v should close log stream mode (toggle behavior)."""
         import asyncio
+
         from chiefwiggum.tui import handle_command
 
         loop = asyncio.new_event_loop()
@@ -1015,6 +1021,7 @@ class TestOverlayToggleBehavior:
     def test_overlays_close_with_q_key(self):
         """q should close all overlay modes."""
         import asyncio
+
         from chiefwiggum.tui import handle_command
 
         loop = asyncio.new_event_loop()
@@ -1039,6 +1046,7 @@ class TestOverlayToggleBehavior:
     def test_overlays_close_with_escape(self):
         """Escape should close all overlay modes."""
         import asyncio
+
         from chiefwiggum.tui import handle_command
 
         loop = asyncio.new_event_loop()
@@ -1063,6 +1071,7 @@ class TestOverlayToggleBehavior:
     def test_overlays_ignore_other_keys(self):
         """Other keys should be ignored in overlay modes (not close them)."""
         import asyncio
+
         from chiefwiggum.tui import handle_command
 
         loop = asyncio.new_event_loop()

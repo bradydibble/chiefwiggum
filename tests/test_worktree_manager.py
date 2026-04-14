@@ -3,10 +3,11 @@
 Tests git worktree lifecycle management.
 """
 
-import pytest
 import subprocess
 import tempfile
 from pathlib import Path
+
+import pytest
 
 from chiefwiggum.worktree_manager import (
     cleanup_stale_worktrees,

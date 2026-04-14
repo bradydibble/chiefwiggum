@@ -6,16 +6,15 @@ prevent concurrent write conflicts.
 """
 
 import fcntl
-import tempfile
-from pathlib import Path
-import pytest
 import threading
 import time
 
+import pytest
+
 from chiefwiggum.fix_plan_writer import (
-    update_task_completion_marker,
     check_task_marked_complete,
     create_backup,
+    update_task_completion_marker,
 )
 
 
@@ -202,34 +201,51 @@ class TestConcurrentUpdates:
     """Tests for file locking and concurrent update handling."""
 
     def test_update_task_completion_marker_concurrent_updates(self, sample_fix_plan):
-        """Test that concurrent updates are handled via file locking."""
-        # Hold a lock on the file
-        with open(sample_fix_plan, 'r+') as f:
-            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        """Test that concurrent updates are serialized via file locking.
 
-            # Try to update from another "process" (should fail due to lock)
+        The implementation uses a separate .lock file so that the atomic rename
+        of the main file doesn't break lock continuity. When a lock is held,
+        the update blocks until the lock is released, then succeeds.
+        """
+        lock_path = sample_fix_plan.with_suffix(".md.lock")
+        lock_held = threading.Event()
+        release_lock = threading.Event()
+
+        def hold_lock():
+            with open(lock_path, "w") as lf:
+                fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+                lock_held.set()
+                release_lock.wait(timeout=2)
+
+        holder = threading.Thread(target=hold_lock)
+        holder.start()
+        lock_held.wait(timeout=2)  # Wait until lock is held by holder thread
+
+        update_result = []
+
+        def do_update():
             success = update_task_completion_marker(
                 fix_plan_path=sample_fix_plan,
                 task_id="task-22",
                 task_number=22,
-                mark_complete=True
+                mark_complete=True,
             )
+            update_result.append(success)
 
-            # Should fail because lock is held
-            assert success is False
+        updater = threading.Thread(target=do_update)
+        updater.start()
+        time.sleep(0.05)  # Give updater time to block on the lock
 
-            # Release lock
-            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        # Update should still be blocked
+        assert not update_result
 
-        # Now try again without lock - should succeed
-        success = update_task_completion_marker(
-            fix_plan_path=sample_fix_plan,
-            task_id="task-22",
-            task_number=22,
-            mark_complete=True
-        )
+        # Release the lock — updater should now proceed and succeed
+        release_lock.set()
+        updater.join(timeout=2)
+        holder.join(timeout=2)
 
-        assert success is True
+        assert update_result == [True]
+        assert "### 22. File Processing Workflow ✓" in sample_fix_plan.read_text()
 
     def test_update_task_completion_marker_threaded_updates(self, sample_fix_plan):
         """Test that file locking prevents corruption during concurrent updates.

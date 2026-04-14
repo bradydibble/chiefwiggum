@@ -17,10 +17,10 @@ from typing import Any
 from chiefwiggum.cache import progress_data_cache
 from chiefwiggum.database import get_connection, get_setting
 from chiefwiggum.fix_plan_writer import update_task_completion_marker
+from chiefwiggum.git_merge import attempt_merge
 from chiefwiggum.git_verifier import verify_commit_in_repo
 from chiefwiggum.models import (
     ErrorCategory,
-    FixPlanTask,
     RalphConfig,
     RalphInstance,
     RalphInstanceStatus,
@@ -38,7 +38,6 @@ from chiefwiggum.worktree_manager import (
     create_worktree,
     get_worktree_branch_name,
 )
-from chiefwiggum.git_merge import attempt_merge
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +48,7 @@ PRIORITY_ORDER = [TaskPriority.HIGH, TaskPriority.MEDIUM, TaskPriority.LOWER, Ta
 
 
 # Backward-compatible re-exports from fix_plan_parser
-from chiefwiggum.fix_plan_parser import _slugify, _generate_task_id, parse_fix_plan  # noqa: F401
+from chiefwiggum.fix_plan_parser import _generate_task_id, _slugify, parse_fix_plan  # noqa: E402, F401
 
 
 async def sync_tasks_from_fix_plan(fix_plan_path: str | Path, project: str | None = None) -> int:
@@ -953,8 +952,8 @@ async def check_ralph_completions() -> list[dict]:
                         # Generate and write new prompt to the same path
                         if prompt_path and project:
                             try:
-                                from chiefwiggum.spawner import generate_task_prompt, write_ralph_status
                                 from chiefwiggum.models import TaskClaim, TaskClaimStatus
+                                from chiefwiggum.spawner import generate_task_prompt, write_ralph_status
 
                                 # Build TaskClaim for prompt generation
                                 new_task = TaskClaim(
@@ -3560,7 +3559,7 @@ async def sync_tasks_with_grading(
         }
     """
     from chiefwiggum.prompt_generator import generate_task_prompt
-    from chiefwiggum.prompt_grader import grade_prompt, get_grade_letter
+    from chiefwiggum.prompt_grader import get_grade_letter, grade_prompt
 
     tasks = parse_fix_plan(fix_plan_path)
     if not tasks:

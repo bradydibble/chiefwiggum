@@ -8,8 +8,8 @@ import logging
 from datetime import datetime, timedelta
 from typing import Optional
 
-from chiefwiggum.monitoring import get_completion_metrics, get_detection_stats
 from chiefwiggum.database import get_connection
+from chiefwiggum.monitoring import get_completion_metrics, get_detection_stats
 
 logger = logging.getLogger(__name__)
 

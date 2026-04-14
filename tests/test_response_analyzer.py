@@ -4,10 +4,11 @@ This module tests the critical parsing logic that detects when Ralph has
 completed a task by analyzing the RALPH_STATUS block in Ralph's log output.
 """
 
-import pytest
 from pathlib import Path
-import tempfile
-from chiefwiggum.spawner import check_task_completion, get_ralph_log_path
+
+import pytest
+
+from chiefwiggum.spawner import check_task_completion
 
 
 @pytest.fixture

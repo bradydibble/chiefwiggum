@@ -4,30 +4,28 @@ These tests verify the complete flow: spawn → claim → work → complete → 
 """
 
 import os
+
 import pytest
-from pathlib import Path
-from datetime import datetime
 
 from chiefwiggum import (
-    init_db,
-    reset_db,
-    sync_tasks_from_fix_plan,
-    register_ralph_instance,
     claim_task,
     complete_and_claim_next,
     get_ralph_instance,
     get_task_claim,
-)
-from chiefwiggum.spawner import (
-    get_ralph_log_path,
-    check_task_completion,
-    write_ralph_status,
-)
-from chiefwiggum.fix_plan_writer import (
-    update_task_completion_marker,
-    check_task_marked_complete,
+    init_db,
+    register_ralph_instance,
+    reset_db,
+    sync_tasks_from_fix_plan,
 )
 from chiefwiggum.database import get_connection
+from chiefwiggum.fix_plan_writer import (
+    check_task_marked_complete,
+    update_task_completion_marker,
+)
+from chiefwiggum.spawner import (
+    check_task_completion,
+    get_ralph_log_path,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -441,7 +439,7 @@ VERIFICATION: Task complete but forgot to commit
         assert commit_sha is None  # No commit SHA provided
 
         # Can still complete without commit SHA
-        next_task = await complete_and_claim_next(
+        await complete_and_claim_next(
             ralph_id=ralph_id,
             task_id=task_id,
             project="test",

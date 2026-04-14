@@ -151,11 +151,11 @@ def generate_task_prompt(
     # Tests Required section
     prompt += "## Tests Required\n"
     test_name = _generate_test_name(title)
-    prompt += f"```python\n"
+    prompt += "```python\n"
     prompt += f"def {test_name}():\n"
-    prompt += f"    # TODO: Implement test\n"
-    prompt += f"    pass\n"
-    prompt += f"```\n\n"
+    prompt += "    # TODO: Implement test\n"
+    prompt += "    pass\n"
+    prompt += "```\n\n"
 
     # Success criteria
     prompt += "## Success\n"

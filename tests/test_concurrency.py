@@ -7,8 +7,6 @@ handling race conditions, claim expiry, database locking, and failure scenarios.
 import asyncio
 import os
 from datetime import datetime, timedelta
-from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 
@@ -16,7 +14,6 @@ from chiefwiggum import (
     CLAIM_EXPIRY_MINUTES,
     HEARTBEAT_STALE_MINUTES,
     TaskClaimStatus,
-    TaskPriority,
     claim_task,
     complete_and_claim_next,
     complete_task,
@@ -35,7 +32,6 @@ from chiefwiggum import (
     sync_tasks_from_fix_plan,
 )
 from chiefwiggum.database import get_connection
-
 
 # =============================================================================
 # Test Fixtures
@@ -940,7 +936,7 @@ class TestStressScenarios:
             claim_task("ralph-7"),
             heartbeat("ralph-3"),
         ]
-        results2 = await asyncio.gather(*operations_wave2)
+        await asyncio.gather(*operations_wave2)
 
         # Wave 3: Extend and complete the originally claimed tasks
         operations_wave3 = []
@@ -976,7 +972,7 @@ class TestDatabaseIntegrity:
             await register_ralph_instance(ralph_id)
 
         # All claim simultaneously
-        claims = await asyncio.gather(*[claim_task(ralph_id) for ralph_id in ralph_ids])
+        await asyncio.gather(*[claim_task(ralph_id) for ralph_id in ralph_ids])
 
         # Check database for duplicates
         conn = await get_connection()
@@ -1021,7 +1017,7 @@ class TestDatabaseIntegrity:
             ]
         )
 
-        new_claims = await asyncio.gather(*[claim_task(ralph_id) for ralph_id in ralph_ids])
+        await asyncio.gather(*[claim_task(ralph_id) for ralph_id in ralph_ids])
 
         # Final count should match initial
         conn = await get_connection()
@@ -1042,7 +1038,7 @@ class TestDatabaseIntegrity:
         for ralph_id in ralph_ids:
             await register_ralph_instance(ralph_id)
 
-        claims = await asyncio.gather(*[claim_task(ralph_id) for ralph_id in ralph_ids])
+        await asyncio.gather(*[claim_task(ralph_id) for ralph_id in ralph_ids])
 
         # Make ralph-2 crash
         conn = await get_connection()

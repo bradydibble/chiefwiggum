@@ -5,16 +5,28 @@ re-exported here to maintain backward compatibility with existing imports.
 """
 
 # State classes and enums
-from chiefwiggum.tui.state import (
-    Alert,
-    AlertType,
-    InstanceDetailTab,
-    RenderState,
-    SettingsSection,
-    SpawnConfig,
-    TUIMode,
-    TUIState,
-    ViewFocus,
+# Main entry point
+from chiefwiggum.tui.app import run_tui
+
+# Dashboard update functions
+from chiefwiggum.tui.dashboard import (
+    update_dashboard,
+    update_display_only,
+)
+
+# Input handlers
+from chiefwiggum.tui.handlers import (
+    handle_bulk_operations,
+    handle_bulk_task_action,
+    handle_command,
+    handle_instance_detail,
+    handle_normal_mode,
+    handle_project_filter,
+    handle_release,
+    handle_search,
+    handle_settings,
+    handle_shutdown,
+    handle_spawn,
 )
 
 # Helper functions
@@ -26,8 +38,17 @@ from chiefwiggum.tui.helpers import (
     format_age,
     get_current_project,
     invalidate_error_indicator_cache,
-    _get_error_indicator,
-    _get_error_indicator_cached,
+)
+
+# Instance detail panel functions
+from chiefwiggum.tui.instance_detail import (
+    create_instance_dashboard_content,
+    create_instance_detail_panel,
+    create_instance_error_detail_overlay,
+    create_instance_errors_content,
+    create_instance_history_content,
+    create_instance_logs_content,
+    create_instance_tab_bar,
 )
 
 # Panel render functions
@@ -56,41 +77,17 @@ from chiefwiggum.tui.panels import (
     generate_alerts,
     get_help_lines,
 )
-
-# Instance detail panel functions
-from chiefwiggum.tui.instance_detail import (
-    create_instance_dashboard_content,
-    create_instance_detail_panel,
-    create_instance_error_detail_overlay,
-    create_instance_errors_content,
-    create_instance_history_content,
-    create_instance_logs_content,
-    create_instance_tab_bar,
+from chiefwiggum.tui.state import (
+    Alert,
+    AlertType,
+    InstanceDetailTab,
+    RenderState,
+    SettingsSection,
+    SpawnConfig,
+    TUIMode,
+    TUIState,
+    ViewFocus,
 )
-
-# Input handlers
-from chiefwiggum.tui.handlers import (
-    handle_bulk_operations,
-    handle_bulk_task_action,
-    handle_command,
-    handle_instance_detail,
-    handle_normal_mode,
-    handle_project_filter,
-    handle_release,
-    handle_search,
-    handle_settings,
-    handle_shutdown,
-    handle_spawn,
-)
-
-# Dashboard update functions
-from chiefwiggum.tui.dashboard import (
-    update_dashboard,
-    update_display_only,
-)
-
-# Main entry point
-from chiefwiggum.tui.app import run_tui
 
 __all__ = [
     # State

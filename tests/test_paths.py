@@ -10,13 +10,13 @@ import pytest
 from chiefwiggum.paths import (
     APP_NAME,
     ChiefWiggumPaths,
+    _get_fallback_xdg_dirs,
+    _get_legacy_dir,
+    _should_use_legacy,
     get_migration_status,
     get_paths,
     migrate_to_xdg,
     reset_paths_cache,
-    _get_legacy_dir,
-    _get_fallback_xdg_dirs,
-    _should_use_legacy,
 )
 
 

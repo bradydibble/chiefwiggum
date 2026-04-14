@@ -130,13 +130,13 @@ class TestRalphLifecycle:
     @pytest.mark.asyncio
     async def test_spawn_creates_pid_file(self, test_db, test_project_dir, mock_ralph_data_dir):
         """Spawning Ralph creates a PID file."""
-        from chiefwiggum.spawner import (
-            spawn_ralph_daemon,
-            is_ralph_running,
-            stop_ralph_daemon,
-            generate_ralph_id,
-        )
         from chiefwiggum.models import RalphConfig
+        from chiefwiggum.spawner import (
+            generate_ralph_id,
+            is_ralph_running,
+            spawn_ralph_daemon,
+            stop_ralph_daemon,
+        )
 
         ralph_id = generate_ralph_id("test")
 
@@ -181,14 +181,14 @@ class TestRalphLifecycle:
     @pytest.mark.asyncio
     async def test_stop_ralph_cleans_up(self, test_db, test_project_dir, mock_ralph_data_dir):
         """Stopping Ralph cleans up PID file and logs stop."""
+        from chiefwiggum.models import RalphConfig
         from chiefwiggum.spawner import (
+            generate_ralph_id,
+            get_ralph_log_path,
+            is_ralph_running,
             spawn_ralph_daemon,
             stop_ralph_daemon,
-            is_ralph_running,
-            get_ralph_log_path,
-            generate_ralph_id,
         )
-        from chiefwiggum.models import RalphConfig
 
         ralph_id = generate_ralph_id("test-stop")
 
@@ -264,10 +264,11 @@ class TestZombieRecovery:
     @pytest.mark.asyncio
     async def test_stuck_detection_triggers_recovery(self, test_db, mock_ralph_data_dir):
         """Stuck detection properly identifies unresponsive instances."""
+        import json
+
         from chiefwiggum.spawner import (
             is_ralph_stuck,
         )
-        import json
 
         ralph_id = "test-stuck-detection"
 
@@ -313,14 +314,14 @@ class TestTaskClaimingIntegration:
     async def test_handle_stuck_releases_task(self, test_db, mock_ralph_data_dir, test_project_dir):
         """handle_stuck_ralph releases claimed task back to pending."""
         from chiefwiggum import (
-            sync_tasks_from_fix_plan,
+            TaskClaimStatus,
             claim_task,
             get_task_claim,
             register_ralph_instance,
-            TaskClaimStatus,
+            sync_tasks_from_fix_plan,
         )
-        from chiefwiggum.spawner import handle_stuck_ralph
         from chiefwiggum.coordination import _update_instance_task
+        from chiefwiggum.spawner import handle_stuck_ralph
 
         ralph_id = "test-stuck-release"
 
@@ -367,8 +368,8 @@ class TestHealthMonitoringIntegration:
     async def test_activity_monitoring_with_real_process(self, mock_ralph_data_dir):
         """Activity monitoring works with real process."""
         from chiefwiggum.spawner import (
-            get_ralph_activity,
             get_process_health,
+            get_ralph_activity,
             write_ralph_status,
         )
 
@@ -411,14 +412,14 @@ class TestHealthMonitoringIntegration:
     @pytest.mark.asyncio
     async def test_full_health_check_cycle(self, test_db, mock_ralph_data_dir):
         """Full health check cycle with multiple indicators."""
+        from chiefwiggum import register_ralph_instance
         from chiefwiggum.spawner import (
-            is_ralph_stuck,
-            get_ralph_activity,
             get_process_health,
+            get_ralph_activity,
             get_status_staleness,
+            is_ralph_stuck,
             write_ralph_status,
         )
-        from chiefwiggum import register_ralph_instance
 
         ralph_id = "test-full-health"
 

@@ -12,10 +12,10 @@ from chiefwiggum.config import get_config_value, get_view_state, load_config_on_
 from chiefwiggum.keyboard import KeyboardListener
 from chiefwiggum.models import TaskCategory, TaskSortOrder
 from chiefwiggum.spawner import get_running_ralphs
-from chiefwiggum.tui.state import TUIMode, TUIState, ViewFocus
-from chiefwiggum.tui.panels import create_layout
 from chiefwiggum.tui.dashboard import update_dashboard, update_display_only
 from chiefwiggum.tui.handlers import handle_command
+from chiefwiggum.tui.panels import create_layout
+from chiefwiggum.tui.state import TUIMode, TUIState, ViewFocus
 
 
 def run_tui(debug: bool = False):
@@ -24,7 +24,7 @@ def run_tui(debug: bool = False):
     load_config_on_startup()
 
     # Check for orphaned tmux sessions and auto-cleanup
-    from chiefwiggum.spawner import find_orphaned_tmux_sessions, cleanup_orphaned_tmux_sessions
+    from chiefwiggum.spawner import cleanup_orphaned_tmux_sessions, find_orphaned_tmux_sessions
     orphans = find_orphaned_tmux_sessions()
     if orphans:
         cleanup_orphaned_tmux_sessions()
@@ -74,7 +74,7 @@ def run_tui(debug: bool = False):
     try:
         keyboard.start()
 
-        with Live(layout, console=console, refresh_per_second=4, screen=True) as live:
+        with Live(layout, console=console, refresh_per_second=4, screen=True):
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
 

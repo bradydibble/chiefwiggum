@@ -318,6 +318,7 @@ def mark_complete_command(task_id: str, commit: str | None, ralph_id: str | None
         wig mark-complete task-1 --ralph-id ralph-123 --commit HEAD
     """
     import subprocess
+
     from rich.console import Console
 
     console = Console()
@@ -985,6 +986,7 @@ def update(check: bool):
         console.print("🔍 Verifying installation...")
         try:
             import importlib
+
             import chiefwiggum
             importlib.reload(chiefwiggum)
             console.print(f"[green]✓[/green] Updated to version {chiefwiggum.__version__}\n")

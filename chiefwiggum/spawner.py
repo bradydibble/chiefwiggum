@@ -380,6 +380,7 @@ def generate_prompt_for_task(task_id: str, fix_plan_path: str | Path | None = No
         ValueError: If task_id is invalid or task not found
     """
     import asyncio
+
     from chiefwiggum.coordination import get_task_claim
 
     # Validate task_id parameter
@@ -1333,7 +1334,7 @@ async def handle_stuck_ralph(ralph_id: str, reason: str) -> dict:
         - terminated: bool - whether process was terminated
         - message: str - summary message
     """
-    from chiefwiggum.coordination import release_claim, get_ralph_instance, update_instance_status
+    from chiefwiggum.coordination import get_ralph_instance, release_claim, update_instance_status
 
     result = {
         "task_released": False,
@@ -1834,10 +1835,10 @@ async def spawn_ralph_with_task_claim(
         Tuple of (success, message, task_id) - task_id is None on failure
     """
     from chiefwiggum.coordination import (
-        claim_task,
-        sync_tasks_from_fix_plan,
-        register_ralph_instance_with_config,
         _update_instance_task,
+        claim_task,
+        register_ralph_instance_with_config,
+        sync_tasks_from_fix_plan,
     )
 
     # Load ralph loop settings defaults from config
@@ -1857,8 +1858,9 @@ async def spawn_ralph_with_task_claim(
     fix_plan_path = Path(fix_plan_path).resolve()
 
     # Check daily cost budget if configured
-    from chiefwiggum.coordination import get_cost_stats
     from datetime import datetime
+
+    from chiefwiggum.coordination import get_cost_stats
     cost_budget_daily = loop_settings.get("cost_budget_daily")
     if cost_budget_daily:
         try:
@@ -2027,8 +2029,9 @@ async def spawn_ralph_for_graded_task(
     logger.info(f"[SPAWN_GRADED] Prompt written to: {prompt_path}")
 
     # Update task status to active and claim it
-    from chiefwiggum.database import get_connection
     from datetime import datetime
+
+    from chiefwiggum.database import get_connection
 
     conn = await get_connection()
     try:

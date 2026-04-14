@@ -43,7 +43,7 @@ class TestErrorClassification:
     """Test error classification for auto-retry (US5, US6)."""
 
     def test_classify_transient_errors(self):
-        from chiefwiggum import classify_error, ErrorCategory
+        from chiefwiggum import ErrorCategory, classify_error
 
         assert classify_error("Rate limit exceeded") == ErrorCategory.TRANSIENT
         assert classify_error("Error 429: Too Many Requests") == ErrorCategory.TRANSIENT
@@ -51,34 +51,34 @@ class TestErrorClassification:
         assert classify_error("Service temporarily unavailable") == ErrorCategory.TRANSIENT
 
     def test_classify_timeout_errors(self):
-        from chiefwiggum import classify_error, ErrorCategory
+        from chiefwiggum import ErrorCategory, classify_error
 
         assert classify_error("Request timeout") == ErrorCategory.TIMEOUT
         assert classify_error("Operation timed out") == ErrorCategory.TIMEOUT
         assert classify_error("Deadline exceeded") == ErrorCategory.TIMEOUT
 
     def test_classify_permission_errors(self):
-        from chiefwiggum import classify_error, ErrorCategory
+        from chiefwiggum import ErrorCategory, classify_error
 
         assert classify_error("Permission denied") == ErrorCategory.PERMISSION
         assert classify_error("Error 401: Unauthorized") == ErrorCategory.PERMISSION
         assert classify_error("Error 403: Forbidden") == ErrorCategory.PERMISSION
 
     def test_classify_conflict_errors(self):
-        from chiefwiggum import classify_error, ErrorCategory
+        from chiefwiggum import ErrorCategory, classify_error
 
         assert classify_error("Merge conflict in file.py") == ErrorCategory.CONFLICT
         assert classify_error("Cannot merge branches") == ErrorCategory.CONFLICT
 
     def test_classify_code_errors(self):
-        from chiefwiggum import classify_error, ErrorCategory
+        from chiefwiggum import ErrorCategory, classify_error
 
         assert classify_error("SyntaxError: invalid syntax") == ErrorCategory.CODE_ERROR
         assert classify_error("Build failed with errors") == ErrorCategory.CODE_ERROR
         assert classify_error("Traceback (most recent call last)") == ErrorCategory.CODE_ERROR
 
     def test_classify_unknown_errors(self):
-        from chiefwiggum import classify_error, ErrorCategory
+        from chiefwiggum import ErrorCategory, classify_error
 
         assert classify_error("Something went wrong") == ErrorCategory.UNKNOWN
 
@@ -87,20 +87,20 @@ class TestTaskCategoryInference:
     """Test task category inference from file paths (US4)."""
 
     def test_infer_ux_category(self):
-        from chiefwiggum import infer_task_category, TaskCategory
+        from chiefwiggum import TaskCategory, infer_task_category
 
         assert infer_task_category(["src/components/Button.tsx"]) == TaskCategory.UX
         assert infer_task_category(["templates/index.html"]) == TaskCategory.UX
         assert infer_task_category(["static/style.css"]) == TaskCategory.UX
 
     def test_infer_api_category(self):
-        from chiefwiggum import infer_task_category, TaskCategory
+        from chiefwiggum import TaskCategory, infer_task_category
 
         assert infer_task_category(["src/api/users.py"]) == TaskCategory.API
         assert infer_task_category(["routes/auth.py"]) == TaskCategory.API
 
     def test_infer_testing_category(self):
-        from chiefwiggum import infer_task_category, TaskCategory
+        from chiefwiggum import TaskCategory, infer_task_category
 
         # Tests directory
         assert infer_task_category(["tests/test_api.py"]) == TaskCategory.TESTING
@@ -110,26 +110,26 @@ class TestTaskCategoryInference:
         assert cat in TaskCategory
 
     def test_infer_database_category(self):
-        from chiefwiggum import infer_task_category, TaskCategory
+        from chiefwiggum import TaskCategory, infer_task_category
 
         assert infer_task_category(["migrations/001_initial.py"]) == TaskCategory.DATABASE
         assert infer_task_category(["models/user.py"]) == TaskCategory.DATABASE
 
     def test_infer_infra_category(self):
-        from chiefwiggum import infer_task_category, TaskCategory
+        from chiefwiggum import TaskCategory, infer_task_category
 
         assert infer_task_category(["scripts/deploy.sh"]) == TaskCategory.INFRA
         assert infer_task_category(["docker/Dockerfile"]) == TaskCategory.INFRA
         assert infer_task_category([".github/workflows/ci.yml"]) == TaskCategory.INFRA
 
     def test_infer_general_category(self):
-        from chiefwiggum import infer_task_category, TaskCategory
+        from chiefwiggum import TaskCategory, infer_task_category
 
         assert infer_task_category(["README.md"]) == TaskCategory.GENERAL
         assert infer_task_category([]) == TaskCategory.GENERAL
 
     def test_infer_from_title(self):
-        from chiefwiggum import infer_task_category, TaskCategory
+        from chiefwiggum import TaskCategory, infer_task_category
 
         assert infer_task_category([], "Fix UI component styling") == TaskCategory.UX
         assert infer_task_category([], "Add API endpoint for users") == TaskCategory.API
@@ -142,10 +142,10 @@ class TestPauseResumeOperations:
     @pytest.mark.asyncio
     async def test_pause_instance(self, temp_db):
         from chiefwiggum import (
-            register_ralph_instance,
-            pause_instance,
-            get_ralph_instance,
             RalphInstanceStatus,
+            get_ralph_instance,
+            pause_instance,
+            register_ralph_instance,
         )
 
         ralph_id = "test-ralph-pause"
@@ -166,11 +166,11 @@ class TestPauseResumeOperations:
     @pytest.mark.asyncio
     async def test_resume_instance(self, temp_db):
         from chiefwiggum import (
-            register_ralph_instance,
-            pause_instance,
-            resume_instance,
-            get_ralph_instance,
             RalphInstanceStatus,
+            get_ralph_instance,
+            pause_instance,
+            register_ralph_instance,
+            resume_instance,
         )
 
         ralph_id = "test-ralph-resume"
@@ -188,10 +188,10 @@ class TestPauseResumeOperations:
     @pytest.mark.asyncio
     async def test_pause_all_instances(self, temp_db):
         from chiefwiggum import (
-            register_ralph_instance,
-            pause_all_instances,
-            list_all_instances,
             RalphInstanceStatus,
+            list_all_instances,
+            pause_all_instances,
+            register_ralph_instance,
         )
 
         # Register multiple instances
@@ -211,10 +211,10 @@ class TestPauseResumeOperations:
     @pytest.mark.asyncio
     async def test_stop_all_instances(self, temp_db):
         from chiefwiggum import (
+            RalphInstanceStatus,
+            list_all_instances,
             register_ralph_instance,
             stop_all_instances,
-            list_all_instances,
-            RalphInstanceStatus,
         )
 
         # Register multiple instances
@@ -273,12 +273,12 @@ class TestRalphConfig:
     @pytest.mark.asyncio
     async def test_register_with_config(self, temp_db):
         from chiefwiggum import (
-            register_ralph_instance_with_config,
-            get_ralph_instance,
+            ClaudeModel,
             RalphConfig,
             TargetingConfig,
-            ClaudeModel,
             TaskPriority,
+            get_ralph_instance,
+            register_ralph_instance_with_config,
         )
 
         config = RalphConfig(
@@ -307,11 +307,11 @@ class TestRalphConfig:
     @pytest.mark.asyncio
     async def test_update_config(self, temp_db):
         from chiefwiggum import (
+            ClaudeModel,
+            RalphConfig,
+            get_ralph_instance,
             register_ralph_instance,
             update_ralph_config,
-            get_ralph_instance,
-            RalphConfig,
-            ClaudeModel,
         )
 
         await register_ralph_instance("update-ralph")
@@ -334,12 +334,12 @@ class TestFailTaskWithRetry:
     @pytest.mark.asyncio
     async def test_transient_error_schedules_retry(self, temp_db):
         from chiefwiggum import (
-            sync_tasks_from_fix_plan,
+            ErrorCategory,
+            TaskClaimStatus,
             claim_task,
             fail_task_with_retry,
             get_task_claim,
-            ErrorCategory,
-            TaskClaimStatus,
+            sync_tasks_from_fix_plan,
         )
 
         # Create a test task
@@ -374,12 +374,12 @@ class TestFailTaskWithRetry:
     @pytest.mark.asyncio
     async def test_code_error_no_retry(self, temp_db):
         from chiefwiggum import (
-            sync_tasks_from_fix_plan,
+            ErrorCategory,
+            TaskClaimStatus,
             claim_task,
             fail_task_with_retry,
             get_task_claim,
-            ErrorCategory,
-            TaskClaimStatus,
+            sync_tasks_from_fix_plan,
         )
 
         # Create a test task

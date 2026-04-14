@@ -9,15 +9,12 @@ Tests cover:
 - Crash recovery
 """
 
-import asyncio
 import os
 from datetime import datetime, timedelta
-from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from chiefwiggum import (
-    CLAIM_EXPIRY_MINUTES,
     HEARTBEAT_STALE_MINUTES,
     ErrorCategory,
     RalphInstanceStatus,
@@ -37,7 +34,6 @@ from chiefwiggum.coordination import (
     fail_task_with_retry,
     process_retry_tasks,
 )
-
 
 # =============================================================================
 # Test Fixtures
@@ -182,7 +178,6 @@ class TestRetryLogic:
     @pytest.mark.asyncio
     async def test_transient_error_retries_with_backoff(self, sample_fix_plan_file):
         """Test transient errors retry with exponential backoff."""
-        from chiefwiggum.database import get_connection
 
         await sync_tasks_from_fix_plan(sample_fix_plan_file, project="test")
         await register_ralph_instance("ralph-1")
@@ -665,8 +660,7 @@ class TestCrashRecovery:
         await sync_tasks_from_fix_plan(sample_fix_plan_file, project="test")
         await register_ralph_instance("ralph-1")
 
-        result = await claim_task("ralph-1", project="test")
-        task_id = result["task_id"]
+        await claim_task("ralph-1", project="test")
 
         # Make instance stale
         from chiefwiggum.database import get_connection

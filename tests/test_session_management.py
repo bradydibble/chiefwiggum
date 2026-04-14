@@ -16,15 +16,12 @@ import os
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
-from unittest.mock import MagicMock, patch, mock_open
 
 import pytest
 
 from chiefwiggum.spawner import (
     get_ralph_session_path,
-    _get_ralph_data_dir,
 )
-
 
 # =============================================================================
 # Test Fixtures
@@ -267,7 +264,7 @@ class TestSessionCorruption:
 
         # Attempt to load - should fail gracefully
         try:
-            data = json.loads(session_path.read_text())
+            json.loads(session_path.read_text())
             pytest.fail("Should have raised JSONDecodeError")
         except json.JSONDecodeError:
             # Expected behavior
@@ -283,7 +280,7 @@ class TestSessionCorruption:
 
         # Attempt to load - should fail gracefully
         try:
-            data = json.loads(session_path.read_text())
+            json.loads(session_path.read_text())
             pytest.fail("Should have raised JSONDecodeError for empty file")
         except json.JSONDecodeError:
             # Expected behavior

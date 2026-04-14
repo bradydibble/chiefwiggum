@@ -6,22 +6,20 @@ Rich rendering or the main TUI class.
 
 import hashlib
 import json
-import os
-import time
 from pathlib import Path
 from typing import Any
 
 from chiefwiggum.cache import error_indicator_cache
-from chiefwiggum.config import get_config_value, get_view_state, save_view_state
-from chiefwiggum.spawner import read_ralph_status
+from chiefwiggum.config import get_config_value, save_view_state
 from chiefwiggum.icons import (
-    ICON_ERROR_PERMISSION,
     ICON_ERROR_API,
-    ICON_ERROR_TOOL,
     ICON_ERROR_GENERAL,
-    PROGRESS_FILLED,
+    ICON_ERROR_PERMISSION,
+    ICON_ERROR_TOOL,
     PROGRESS_EMPTY,
+    PROGRESS_FILLED,
 )
+from chiefwiggum.spawner import read_ralph_status
 from chiefwiggum.tui.state import TUIState
 
 

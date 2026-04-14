@@ -5,14 +5,10 @@ for the TUI dashboard. They are pure rendering functions with no side effects
 beyond reading configuration and system state.
 """
 
-import asyncio
 import time
 from datetime import datetime
-from pathlib import Path
-from typing import Any, Optional
 
 from rich import box
-from rich.console import Console
 from rich.layout import Layout
 from rich.panel import Panel
 from rich.table import Table
@@ -25,34 +21,28 @@ from chiefwiggum.config import (
     get_default_model,
     get_default_timeout,
     get_max_ralphs,
-    get_quickstart_defaults,
     get_ralph_loop_settings,
     get_ralph_permissions,
     get_task_assignment_strategy,
-    get_config_value,
-)
-from chiefwiggum.models import (
-    ClaudeModel,
-    ErrorCategory,
-    RalphInstanceStatus,
-    TargetingConfig,
-    TaskCategory,
-    TaskClaimStatus,
-    TaskPriority,
-    TaskSortOrder,
-)
-from chiefwiggum.spawner import (
-    can_spawn_ralph,
-    get_process_health_cached,
-    get_running_ralphs,
-    read_ralph_log,
-    read_ralph_status,
 )
 from chiefwiggum.icons import (
+    BORDER_ALERTS,
+    BORDER_ERROR,
+    # Background colors
+    BORDER_OVERLAY,
+    BORDER_SPAWN,
+    BORDER_STATS,
+    COLOR_ALERT_CRITICAL,
+    COLOR_ALERT_WARNING,
+    COLOR_ERROR,
+    COLOR_OVERDUE,
+    COLOR_WARNING,
     # Icons
     ICON_ACTIVE,
+    # Error icons
+    ICON_ALERT_CRITICAL,
+    ICON_ALERT_WARNING,
     ICON_CRASHED,
-    ICON_DAEMON,
     ICON_DONE,
     ICON_FAILED,
     ICON_HIGH,
@@ -66,61 +56,37 @@ from chiefwiggum.icons import (
     ICON_RETRY,
     ICON_SELECTED,
     ICON_STALE,
+    ICON_STALL,
     ICON_STOPPED,
     ICON_WORKING,
-    ICON_STALL,
-    # Error icons
-    ICON_ERROR_PERMISSION,
-    ICON_ERROR_API,
-    ICON_ERROR_TOOL,
-    ICON_ERROR_GENERAL,
-    # Alert icons
-    ICON_ALERT_CRITICAL,
-    ICON_ALERT_WARNING,
     # Progress/capacity chars
-    PROGRESS_FILLED,
-    PROGRESS_EMPTY,
     SEP_VERTICAL,
-    SPINNER,
-    SPINNER_BARS,
-    # Semantic colors
-    COLOR_SUCCESS,
-    COLOR_WARNING,
-    COLOR_ERROR,
-    COLOR_ACCENT,
-    COLOR_MUTED,
-    COLOR_ALERT_CRITICAL,
-    COLOR_ALERT_WARNING,
-    COLOR_OVERDUE,
-    # Background colors
-    BG_HEADER,
-    # Border colors
-    BORDER_INSTANCES,
-    BORDER_TASKS,
-    BORDER_OVERLAY,
-    BORDER_ERROR,
-    BORDER_SPAWN,
-    BORDER_STATS,
-    BORDER_ALERTS,
     # Styles
     STYLE_ACTIVE,
+    STYLE_HIGHLIGHT,
     STYLE_IDLE,
     STYLE_STALE,
-    STYLE_HIGHLIGHT,
     STYLE_TABLE_ROW_EVEN,
 )
-from chiefwiggum.tui.state import (
-    TUIState,
-    TUIMode,
-    SpawnConfig,
-    ViewFocus,
-    AlertType,
-    Alert,
-    SettingsSection,
-    InstanceDetailTab,
-    RenderState,
+from chiefwiggum.models import (
+    ErrorCategory,
+    RalphInstanceStatus,
+    TaskCategory,
+    TaskClaimStatus,
+    TaskSortOrder,
 )
-from chiefwiggum.tui.helpers import format_age, create_progress_bar, _get_error_indicator_cached
+from chiefwiggum.spawner import (
+    get_process_health_cached,
+    read_ralph_log,
+)
+from chiefwiggum.tui.helpers import _get_error_indicator_cached, create_progress_bar, format_age
+from chiefwiggum.tui.state import (
+    Alert,
+    AlertType,
+    TUIMode,
+    TUIState,
+    ViewFocus,
+)
 
 
 def create_instances_table(instances: list, show_all: bool = False, selected_idx: int | None = None, progress_data: dict | None = None) -> Table:
@@ -407,7 +373,7 @@ def create_graded_tasks_table(
         selected_idx: Currently selected task index
         expanded: Whether to expand task column width
     """
-    from chiefwiggum.prompt_grader import get_grade_letter, get_grade_color
+    from chiefwiggum.prompt_grader import get_grade_letter
 
     title = f"Graded Task Queue ({offset + 1}-{min(offset + limit, len(tasks))} of {len(tasks)})" if tasks else "Graded Task Queue (Empty)"
     table = Table(title=title, expand=True, box=box.ROUNDED)
@@ -1771,8 +1737,8 @@ def create_reconcile_panel(reconcile_result: dict | None) -> Panel:
 
 async def create_cleanup_panel() -> Panel:
     """Create cleanup confirmation panel showing what will be cleaned up."""
-    from chiefwiggum.coordination import get_idle_ralphs
     from chiefwiggum.config import get_auto_scaling_config
+    from chiefwiggum.coordination import get_idle_ralphs
 
     config = get_auto_scaling_config()
     idle_timeout = config.get("auto_cleanup_idle_minutes", 30)

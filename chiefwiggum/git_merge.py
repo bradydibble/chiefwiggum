@@ -53,7 +53,7 @@ async def detect_conflicts(repo_path: Path) -> list[str]:
     except subprocess.TimeoutExpired:
         logger.warning("Git diff timed out while detecting conflicts")
         return []
-    except Exception as e:
+    except Exception:
         logger.exception("Error detecting conflicts")
         return []
 
@@ -137,7 +137,7 @@ async def attempt_merge(
                 )
 
             # Fast-forward failed, try regular merge
-            logger.info(f"Fast-forward failed, attempting regular merge")
+            logger.info("Fast-forward failed, attempting regular merge")
             result = subprocess.run(
                 ["git", "merge", "--no-ff", worktree_branch, "-m",
                  f"Merge {worktree_branch} into {target_branch}"],
@@ -407,6 +407,6 @@ async def _get_head_sha(repo_path: Path) -> str | None:
 
         return None
 
-    except Exception as e:
+    except Exception:
         logger.exception("Error getting HEAD SHA")
         return None

@@ -13,19 +13,19 @@ from rich.panel import Panel
 from rich.text import Text
 
 from chiefwiggum.icons import (
+    BORDER_ERROR,
+    BORDER_INSTANCES,
     ICON_ACTIVE,
     ICON_CRASHED,
     ICON_DONE,
+    ICON_ERROR_API,
+    ICON_ERROR_GENERAL,
+    ICON_ERROR_PERMISSION,
+    ICON_ERROR_TOOL,
     ICON_IDLE,
     ICON_PAUSED,
     ICON_STALE,
     ICON_STOPPED,
-    ICON_ERROR_PERMISSION,
-    ICON_ERROR_API,
-    ICON_ERROR_TOOL,
-    ICON_ERROR_GENERAL,
-    BORDER_ERROR,
-    BORDER_INSTANCES,
 )
 from chiefwiggum.models import (
     ErrorCategory,
@@ -57,7 +57,7 @@ def create_instance_tab_bar(active_tab: int) -> Text:
 
 def create_instance_dashboard_content(instance, state: TUIState, current_task, process_health: dict | None = None, status_staleness: dict | None = None, skip_health_checks: bool = False) -> Text:
     """Create dashboard content for instance detail view."""
-    from chiefwiggum.spawner import get_process_health, get_status_staleness, read_ralph_status
+    from chiefwiggum.spawner import get_status_staleness, read_ralph_status
 
     text = Text()
 
@@ -144,7 +144,7 @@ def create_instance_dashboard_content(instance, state: TUIState, current_task, p
         activity = {"log_age_seconds": None, "is_responsive": False}
         has_issues = True  # Dead instances always have issues
     else:
-        from chiefwiggum.spawner import is_ralph_stuck, get_ralph_activity
+        from chiefwiggum.spawner import get_ralph_activity, is_ralph_stuck
         timeout_mins = instance.config.timeout_minutes if instance.config else 30
         is_stuck, stuck_reason = is_ralph_stuck(instance.ralph_id, timeout_mins)
         activity = get_ralph_activity(instance.ralph_id)

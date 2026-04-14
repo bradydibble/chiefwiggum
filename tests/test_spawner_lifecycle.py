@@ -18,20 +18,19 @@ from unittest.mock import patch
 import pytest
 
 from chiefwiggum.spawner import (
-    get_process_health,
-    get_status_staleness,
-    get_ralph_activity,
-    is_ralph_stuck,
-    reap_zombie_ralph,
-    cleanup_dead_ralphs,
-    write_ralph_status,
-    read_ralph_status,
-    is_ralph_running,
-    get_ralph_status_path,
-    get_ralph_log_path,
     check_task_completion,
+    cleanup_dead_ralphs,
+    get_process_health,
+    get_ralph_activity,
+    get_ralph_log_path,
+    get_ralph_status_path,
+    get_status_staleness,
+    is_ralph_running,
+    is_ralph_stuck,
+    read_ralph_status,
+    reap_zombie_ralph,
+    write_ralph_status,
 )
-
 
 # =============================================================================
 # Test Fixtures
@@ -499,8 +498,9 @@ class TestHandleStuckRalph:
     @pytest.mark.asyncio
     async def test_handle_stuck_terminates_process(self, mock_ralph_data_dir, running_process):
         """handle_stuck_ralph terminates the stuck process."""
-        from chiefwiggum.spawner import handle_stuck_ralph
         from unittest.mock import AsyncMock
+
+        from chiefwiggum.spawner import handle_stuck_ralph
 
         ralph_id = "test-stuck"
 
@@ -525,8 +525,9 @@ class TestHandleStuckRalph:
     @pytest.mark.asyncio
     async def test_handle_stuck_writes_status(self, mock_ralph_data_dir):
         """handle_stuck_ralph writes crashed status."""
-        from chiefwiggum.spawner import handle_stuck_ralph
         from unittest.mock import AsyncMock
+
+        from chiefwiggum.spawner import handle_stuck_ralph
 
         ralph_id = "test-stuck-status"
 

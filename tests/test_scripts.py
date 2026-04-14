@@ -4,7 +4,6 @@ import os
 from pathlib import Path
 from unittest import mock
 
-
 from chiefwiggum.scripts import get_ralph_loop_path, get_scripts_dir
 
 

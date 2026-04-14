@@ -37,12 +37,11 @@ from chiefwiggum.config import (
     set_config_value,
     set_default_model,
     set_max_ralphs,
+    set_quickstart_defaults,
     set_ralph_loop_setting,
     set_ralph_permission,
-    set_quickstart_defaults,
     set_task_assignment_strategy,
 )
-
 
 # =============================================================================
 # Test Fixtures

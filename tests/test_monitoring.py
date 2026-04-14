@@ -1,26 +1,27 @@
 """Tests for monitoring and alerts modules."""
 
 import os
-import pytest
 from datetime import datetime, timedelta
 
-from chiefwiggum import init_db, reset_db, sync_tasks_from_fix_plan, register_ralph_instance
+import pytest
+
+from chiefwiggum import init_db, reset_db
+from chiefwiggum.alerts import (
+    check_commit_sha_health,
+    check_completion_health,
+    check_ralph_health,
+    format_alerts_summary,
+    get_all_alerts,
+    has_critical_alerts,
+)
+from chiefwiggum.database import get_connection
 from chiefwiggum.monitoring import (
     CompletionMetrics,
+    format_metrics_summary,
     get_completion_metrics,
     get_detection_stats,
     get_ralph_completion_stats,
-    format_metrics_summary,
 )
-from chiefwiggum.alerts import (
-    check_completion_health,
-    check_commit_sha_health,
-    check_ralph_health,
-    get_all_alerts,
-    has_critical_alerts,
-    format_alerts_summary,
-)
-from chiefwiggum.database import get_connection
 
 
 @pytest.fixture(autouse=True)

@@ -8,7 +8,6 @@ import logging
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any
 
 from chiefwiggum import (
     list_all_tasks,
@@ -790,7 +789,7 @@ async def handle_settings(key: str, state: TUIState) -> None:
 
 async def handle_bulk_task_action(key: str, state: TUIState) -> None:
     """Handle bulk action menu."""
-    from chiefwiggum import release_claim, list_all_tasks
+    from chiefwiggum import list_all_tasks, release_claim
     from chiefwiggum.database import get_connection
 
     if key == "ESCAPE":
@@ -944,7 +943,7 @@ async def handle_instance_detail(key: str, state: TUIState) -> None:
             state.status_message_time = time.time()
 
     elif key == "K":  # Kill stuck instance & offer restart (uppercase K to avoid j/k scroll conflict)
-        from chiefwiggum.spawner import is_ralph_stuck, handle_stuck_ralph
+        from chiefwiggum.spawner import handle_stuck_ralph, is_ralph_stuck
 
         # Check if instance is actually stuck
         is_stuck, reason = is_ralph_stuck(instance.ralph_id)
