@@ -45,6 +45,12 @@ logs/
 .env.local
 *.env
 
+# Local secret/token files — never commit these
+tokens.md
+secrets.md
+*.key
+*.pem
+
 # Claude sessions
 .claude-sessions/
 
