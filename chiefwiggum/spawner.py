@@ -38,6 +38,22 @@ def _get_status_dir() -> Path:
     return get_paths().status_dir
 
 
+def _load_dotenv_into(env: dict, dotenv_path: Path) -> None:
+    """Load .env file into env dict without overriding existing vars."""
+    if not dotenv_path.exists():
+        return
+    with open(dotenv_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and key not in env:  # don't override existing env vars
+                env[key] = value
+
+
 def _validate_spawn_requirements() -> tuple[bool, str]:
     """Synchronous validation of spawn requirements.
 
@@ -54,6 +70,8 @@ def _validate_spawn_requirements() -> tuple[bool, str]:
     # Check 1: API key
     if not os.environ.get("ANTHROPIC_API_KEY"):
         return (False, "ANTHROPIC_API_KEY not set. Export the key or check your environment.")
+    if not os.environ.get("ANTHROPIC_API_KEY", "").startswith("sk-ant-"):
+        return (False, "ANTHROPIC_API_KEY appears invalid (must start with sk-ant-). Update via Settings (S).")
 
     # Check 2: Claude CLI available
     if shutil.which("claude") is None:
@@ -1678,6 +1696,9 @@ def spawn_ralph_daemon(
         # Without explicit env=, daemon processes (start_new_session=True) may not
         # inherit environment variables reliably on all systems
         spawn_env = os.environ.copy()
+        # Load project .env so ralphs get project-level env vars (e.g. ANTHROPIC_API_KEY).
+        # Existing os.environ values take precedence.
+        _load_dotenv_into(spawn_env, working_dir / ".env")
         logger.info(f"[SPAWN] Executing: {' '.join(cmd[:3])}...")  # First 3 parts of command
         logger.info(f"[SPAWN] ANTHROPIC_API_KEY in spawn_env: {bool(spawn_env.get('ANTHROPIC_API_KEY'))}")
         process = subprocess.Popen(
@@ -2440,6 +2461,8 @@ async def can_spawn_ralph() -> tuple[bool, str]:
     # Check 1: API key
     if not os.environ.get("ANTHROPIC_API_KEY"):
         return (False, "ANTHROPIC_API_KEY not set. Press 'S' for Settings.")
+    if not os.environ.get("ANTHROPIC_API_KEY", "").startswith("sk-ant-"):
+        return (False, "ANTHROPIC_API_KEY appears invalid (must start with sk-ant-). Update via Settings (S).")
 
     # Check 2: Claude CLI available
     if shutil.which("claude") is None:

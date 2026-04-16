@@ -813,7 +813,7 @@ class TestHelpPanelCompleteness:
 
     def test_help_panel_has_search_viewing_section(self):
         """Help panel includes Search & Viewing section."""
-        help_panel = create_help_panel()
+        help_panel = create_help_panel(offset=0, visible_lines=100)
         help_text = str(help_panel.renderable)
 
         assert "Search" in help_text and "Viewing" in help_text
