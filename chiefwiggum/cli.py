@@ -782,6 +782,76 @@ def show_paths():
         console.print("[dim]Run 'chiefwiggum migrate' to move to XDG-compliant locations[/dim]")
 
 
+@main.group()
+def config():
+    """Manage ChiefWiggum configuration.
+
+    Settings are stored in a single user-level config file and apply
+    to all projects on this machine. No per-project configuration needed.
+    """
+
+
+@config.command("set-key")
+@click.argument("api_key")
+def config_set_key(api_key: str):
+    """Set the Anthropic API key (stored once, used across all projects).
+
+    Example:
+        chiefwiggum config set-key sk-ant-...
+    """
+    from rich.console import Console
+
+    from chiefwiggum.config import get_config_path, set_api_key, validate_api_key
+
+    console = Console()
+
+    if not api_key.startswith("sk-ant-"):
+        console.print("[red]Error:[/red] Key must start with sk-ant-")
+        raise SystemExit(1)
+
+    ok, msg = validate_api_key(api_key)
+    if not ok and "format" not in msg.lower():
+        console.print(f"[yellow]Warning:[/yellow] {msg}")
+
+    set_api_key(api_key)
+    console.print(f"[green]API key saved[/green] → {get_config_path()}")
+    console.print("[dim]All future ralph spawns on this machine will use this key.[/dim]")
+
+
+@config.command("show")
+def config_show():
+    """Show current configuration (secrets redacted)."""
+    from rich.console import Console
+    from rich.table import Table
+
+    from chiefwiggum.config import get_api_key, get_config_path, load_config
+
+    console = Console()
+    cfg = load_config()
+    api_key = get_api_key()
+
+    table = Table(title=f"Config: {get_config_path()}")
+    table.add_column("Setting", style="cyan")
+    table.add_column("Value", style="green")
+
+    # Show API key status without revealing it
+    if api_key and api_key.startswith("sk-ant-"):
+        key_display = f"{api_key[:12]}...{api_key[-4:]} ✓"
+    elif api_key:
+        key_display = "[red]set but invalid format[/red]"
+    else:
+        key_display = "[red]not set — run: chiefwiggum config set-key sk-ant-...[/red]"
+
+    table.add_row("anthropic_api_key", key_display)
+
+    skip = {"anthropic_api_key", "view_state", "category_assignments"}
+    for k, v in sorted(cfg.items()):
+        if k not in skip:
+            table.add_row(k, str(v))
+
+    console.print(table)
+
+
 @main.command()
 def verify():
     """Verify ChiefWiggum installation and dependencies."""

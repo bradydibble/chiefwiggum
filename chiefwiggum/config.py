@@ -22,6 +22,11 @@ def _get_config_file() -> Path:
     """Get the config file path."""
     return get_paths().config_path
 
+
+def get_config_path() -> Path:
+    """Return the path to the user-level config file."""
+    return _get_config_file()
+
 # Default configuration
 DEFAULT_CONFIG = {
     # Existing
