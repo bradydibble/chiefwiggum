@@ -332,7 +332,7 @@ analyze_response() {
             [[ "${VERBOSE_PROGRESS:-}" == "true" ]] && echo "DEBUG: Validated variables - loop=$loop_number, files=$files_modified, conf=$confidence_score" >&2
 
             # Write analysis results for JSON path using jq for safe construction
-            if ! jq -n \
+            if jq -n \
                 --argjson loop_number "$loop_number" \
                 --arg timestamp "$(get_iso_timestamp)" \
                 --arg output_file "$output_file" \
@@ -602,7 +602,7 @@ analyze_response() {
     [[ "${VERBOSE_PROGRESS:-}" == "true" ]] && echo "DEBUG: Validated variables (text path) - loop=$loop_number, files=$files_modified, conf=$confidence_score" >&2
 
     # Write analysis results to file (text parsing path) using jq for safe construction
-    if ! jq -n \
+    if jq -n \
         --argjson loop_number "$loop_number" \
         --arg timestamp "$(get_iso_timestamp)" \
         --arg output_file "$output_file" \
