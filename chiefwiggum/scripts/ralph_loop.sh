@@ -1889,9 +1889,39 @@ main() {
         if [[ "$exit_reason" != "" ]]; then
             log_status "SUCCESS" "🏁 Graceful exit triggered: $exit_reason"
 
-            # Release task claim before exiting
+            # Release task claim (idempotent; claim_next_task_for_ralph also releases internally).
             if [[ -n "$RALPH_ID" ]]; then
                 release_current_task "$RALPH_ID" || true
+            fi
+
+            # Self-chain: before marking the ralph completed and exiting, try to claim the
+            # next pending task. Without this, hitting the graceful-exit path (e.g.
+            # "Multiple completion signals") leaves remaining tasks idle until a TUI/daemon
+            # spawns a replacement — and the TUI is often dead (laptop sleep, terminal close).
+            if [[ "$SINGLE_TASK_MODE" != "true" && -n "$RALPH_ID" ]]; then
+                log_status "INFO" "📋 Checking for next task before project_complete exit..."
+                local chain_claim_result
+                chain_claim_result=$(claim_next_task_for_ralph "$RALPH_ID")
+                local chain_claim_success
+                chain_claim_success=$(echo "$chain_claim_result" | jq -r '.success' 2>/dev/null)
+                local chain_new_task_id
+                chain_new_task_id=$(echo "$chain_claim_result" | jq -r '.task_id' 2>/dev/null)
+
+                if [[ "$chain_claim_success" == "true" && -n "$chain_new_task_id" && "$chain_new_task_id" != "null" ]]; then
+                    if generate_task_prompt_for_file "$RALPH_ID" "$chain_new_task_id" "$PROMPT_FILE"; then
+                        log_status "SUCCESS" "🔄 Chaining to next task: $chain_new_task_id"
+                        reset_session "chain_next_task"
+                        # Reset exit signals so the next task starts fresh and doesn't
+                        # immediately re-trigger completion_signals from residual state.
+                        echo '{"test_only_loops": [], "done_signals": [], "completion_indicators": []}' > "$EXIT_SIGNALS_FILE"
+                        continue
+                    else
+                        log_status "WARN" "⚠️ Failed to generate prompt for $chain_new_task_id; releasing and exiting"
+                        release_current_task "$RALPH_ID" || true
+                    fi
+                else
+                    log_status "INFO" "🏁 No more tasks available; exiting as planned"
+                fi
             fi
 
             reset_session "project_complete"
