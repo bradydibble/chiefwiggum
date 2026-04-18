@@ -192,6 +192,39 @@ async def init_db():
             CREATE INDEX IF NOT EXISTS idx_tasks_grade ON tasks(grade);
             CREATE INDEX IF NOT EXISTS idx_tasks_ralph ON tasks(claimed_by_ralph_id);
             CREATE INDEX IF NOT EXISTS idx_tasks_created ON tasks(created_at);
+
+            -- Spawn Requests: Durable TUI/CLI → daemon intent channel.
+            -- TUI or CLI inserts a row; the chiefwiggum daemon picks it up on
+            -- its next reconcile tick and actually spawns the ralph process.
+            -- Lets the TUI die freely without losing user intent.
+            CREATE TABLE IF NOT EXISTS spawn_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_path TEXT NOT NULL,
+                fix_plan_path TEXT,
+                task_id TEXT,                        -- NULL = claim next available
+                priority INTEGER DEFAULT 0,          -- higher runs first
+                requested_by TEXT,                   -- 'tui' | 'cli' | 'daemon-reconcile'
+                requested_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                consumed_at TIMESTAMP,               -- NULL until daemon acts
+                spawned_ralph_id TEXT,
+                error TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_spawn_requests_pending
+                ON spawn_requests(consumed_at, priority DESC, requested_at);
+
+            -- Cancel Requests: same pattern, for explicit ralph termination.
+            CREATE TABLE IF NOT EXISTS cancel_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ralph_id TEXT NOT NULL,
+                requested_by TEXT,
+                requested_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                consumed_at TIMESTAMP,
+                error TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_cancel_requests_pending
+                ON cancel_requests(consumed_at, requested_at);
         """)
 
         # Run migrations for existing databases
@@ -362,6 +395,8 @@ async def reset_db():
             DELETE FROM system_settings;
             DELETE FROM fix_plan_sources;
             DELETE FROM tasks;
+            DELETE FROM spawn_requests;
+            DELETE FROM cancel_requests;
         """)
         await conn.commit()
         logger.info("Database reset complete")

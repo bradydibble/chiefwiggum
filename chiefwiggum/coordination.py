@@ -3880,3 +3880,175 @@ async def on_ralph_exit(ralph_id: str, exit_code: int, task_id: str | None = Non
         logger.info(f"[EXIT_HANDLER] Ralph {ralph_id} shutdown")
     except Exception as e:
         logger.warning(f"[EXIT_HANDLER] Failed to shutdown {ralph_id}: {e}")
+
+
+# ============================================================================
+# Daemon intent helpers
+# ----------------------------------------------------------------------------
+# These sit between the TUI/CLI (which write intent) and the chiefwiggum
+# daemon (which consumes intent and actually spawns/kills ralphs). The
+# database is the communication channel — no direct IPC — so intents survive
+# the TUI dying, the daemon restarting, and laptop sleep.
+# ============================================================================
+
+
+async def enqueue_spawn_request(
+    project_path: str,
+    fix_plan_path: str | None = None,
+    task_id: str | None = None,
+    priority: int = 0,
+    requested_by: str = "cli",
+) -> int:
+    """Insert a spawn_requests row and return its id.
+
+    The daemon picks it up on its next reconcile tick.
+    """
+    conn = await get_connection()
+    try:
+        cursor = await conn.execute(
+            """INSERT INTO spawn_requests
+                 (project_path, fix_plan_path, task_id, priority, requested_by)
+               VALUES (?, ?, ?, ?, ?)""",
+            (project_path, fix_plan_path, task_id, priority, requested_by),
+        )
+        await conn.commit()
+        return cursor.lastrowid
+    finally:
+        await conn.close()
+
+
+async def enqueue_cancel_request(
+    ralph_id: str,
+    requested_by: str = "cli",
+) -> int:
+    """Insert a cancel_requests row and return its id."""
+    conn = await get_connection()
+    try:
+        cursor = await conn.execute(
+            """INSERT INTO cancel_requests (ralph_id, requested_by)
+               VALUES (?, ?)""",
+            (ralph_id, requested_by),
+        )
+        await conn.commit()
+        return cursor.lastrowid
+    finally:
+        await conn.close()
+
+
+async def fetch_pending_spawn_requests(limit: int = 10) -> list[dict[str, Any]]:
+    """Return oldest-first pending spawn requests (highest priority first within each age)."""
+    conn = await get_connection()
+    try:
+        cursor = await conn.execute(
+            """SELECT id, project_path, fix_plan_path, task_id, priority,
+                      requested_by, requested_at
+               FROM spawn_requests
+               WHERE consumed_at IS NULL
+               ORDER BY priority DESC, requested_at ASC
+               LIMIT ?""",
+            (limit,),
+        )
+        rows = await cursor.fetchall()
+        return [
+            {
+                "id": row[0],
+                "project_path": row[1],
+                "fix_plan_path": row[2],
+                "task_id": row[3],
+                "priority": row[4],
+                "requested_by": row[5],
+                "requested_at": row[6],
+            }
+            for row in rows
+        ]
+    finally:
+        await conn.close()
+
+
+async def fetch_pending_cancel_requests(limit: int = 10) -> list[dict[str, Any]]:
+    """Return oldest-first pending cancel requests."""
+    conn = await get_connection()
+    try:
+        cursor = await conn.execute(
+            """SELECT id, ralph_id, requested_by, requested_at
+               FROM cancel_requests
+               WHERE consumed_at IS NULL
+               ORDER BY requested_at ASC
+               LIMIT ?""",
+            (limit,),
+        )
+        rows = await cursor.fetchall()
+        return [
+            {
+                "id": row[0],
+                "ralph_id": row[1],
+                "requested_by": row[2],
+                "requested_at": row[3],
+            }
+            for row in rows
+        ]
+    finally:
+        await conn.close()
+
+
+async def mark_spawn_request_consumed(
+    request_id: int,
+    spawned_ralph_id: str | None = None,
+    error: str | None = None,
+) -> None:
+    """Mark a spawn_request as consumed so it isn't picked up again."""
+    conn = await get_connection()
+    try:
+        await conn.execute(
+            """UPDATE spawn_requests
+               SET consumed_at = CURRENT_TIMESTAMP,
+                   spawned_ralph_id = ?,
+                   error = ?
+               WHERE id = ?""",
+            (spawned_ralph_id, error, request_id),
+        )
+        await conn.commit()
+    finally:
+        await conn.close()
+
+
+async def mark_cancel_request_consumed(
+    request_id: int,
+    error: str | None = None,
+) -> None:
+    """Mark a cancel_request as consumed."""
+    conn = await get_connection()
+    try:
+        await conn.execute(
+            """UPDATE cancel_requests
+               SET consumed_at = CURRENT_TIMESTAMP,
+                   error = ?
+               WHERE id = ?""",
+            (error, request_id),
+        )
+        await conn.commit()
+    finally:
+        await conn.close()
+
+
+async def count_pending_intents() -> dict[str, int]:
+    """Return {'spawn': N, 'cancel': M} counts of pending intents.
+
+    Used by `wig daemon status` to report queue depth without pulling rows.
+    """
+    conn = await get_connection()
+    try:
+        spawn_cursor = await conn.execute(
+            "SELECT COUNT(*) FROM spawn_requests WHERE consumed_at IS NULL"
+        )
+        spawn_row = await spawn_cursor.fetchone()
+        cancel_cursor = await conn.execute(
+            "SELECT COUNT(*) FROM cancel_requests WHERE consumed_at IS NULL"
+        )
+        cancel_row = await cancel_cursor.fetchone()
+        return {
+            "spawn": spawn_row[0] if spawn_row else 0,
+            "cancel": cancel_row[0] if cancel_row else 0,
+        }
+    finally:
+        await conn.close()

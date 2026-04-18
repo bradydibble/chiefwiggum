@@ -1102,5 +1102,76 @@ def update(check: bool):
     console.print("\n[dim]Run 'wig verify' to verify the installation[/dim]")
 
 
+@main.group()
+def daemon():
+    """Background reconciler that spawns/cancels ralphs from intent queue.
+
+    The daemon is what makes chiefwiggum keep working after you close the TUI.
+    The TUI writes spawn_requests rows; the daemon consumes them and actually
+    spawns ralph_loop processes. Run under launchd (see `wig service install`)
+    so it survives crashes and reboots.
+    """
+    pass
+
+
+@daemon.command("start")
+@click.option("--foreground", is_flag=True, help="Run in foreground (don't detach). Required when launchd runs us.")
+@click.option("--tick", type=int, default=15, show_default=True, help="Reconcile interval in seconds.")
+def daemon_start(foreground: bool, tick: int):
+    """Start the chiefwiggum daemon."""
+    import sys
+
+    from chiefwiggum.daemon import start_daemon
+
+    run_async(init_db())
+    sys.exit(start_daemon(foreground=foreground, tick_seconds=tick))
+
+
+@daemon.command("stop")
+@click.option("--timeout", type=float, default=10.0, show_default=True, help="Seconds to wait for graceful exit.")
+def daemon_stop(timeout: float):
+    """Stop the chiefwiggum daemon (SIGTERM, SIGKILL on timeout)."""
+    from rich.console import Console
+
+    from chiefwiggum.daemon import stop_daemon
+
+    console = Console()
+    ok, msg = stop_daemon(timeout_seconds=timeout)
+    if ok:
+        console.print(f"[green]✓[/green] {msg}")
+    else:
+        console.print(f"[yellow]![/yellow] {msg}")
+
+
+@daemon.command("status")
+@click.option("--format", "-f", "output_format", type=click.Choice(["text", "json"]), default="text", show_default=True)
+def daemon_status_cmd(output_format: str):
+    """Show daemon running state and queue depth."""
+    import json
+
+    from chiefwiggum.daemon import daemon_status
+
+    run_async(init_db())
+    info = run_async(daemon_status())
+
+    if output_format == "json":
+        # Use click.echo (no line wrapping) since paths may contain spaces.
+        click.echo(json.dumps(info, indent=2, default=str))
+        return
+
+    from rich.console import Console
+    console = Console()
+    running = info["running"]
+    pid = info["pid"]
+    if running:
+        console.print(f"[green]● running[/green] (pid={pid})")
+    else:
+        console.print("[red]○ not running[/red]")
+    console.print(f"  pid file: {info['pid_file']}")
+    console.print(f"  log file: {info['log_file']}")
+    console.print(f"  pending spawn_requests:  {info['pending_spawn_requests']}")
+    console.print(f"  pending cancel_requests: {info['pending_cancel_requests']}")
+
+
 if __name__ == "__main__":
     main()
