@@ -119,6 +119,63 @@ class TestCancelRequests:
         assert await fetch_pending_cancel_requests() == []
 
 
+class TestConfigPassthrough:
+    """The TUI encodes RalphConfig/TargetingConfig as JSON into the intent row
+    so the daemon can reconstruct them and honor the user's wizard choices."""
+
+    @pytest.mark.asyncio
+    async def test_config_and_targeting_json_round_trip(self):
+        from chiefwiggum.coordination import fetch_pending_spawn_requests
+        from chiefwiggum.models import (
+            ClaudeModel,
+            RalphConfig,
+            TargetingConfig,
+            TaskCategory,
+            TaskPriority,
+        )
+
+        ralph_config = RalphConfig(
+            model=ClaudeModel.OPUS,
+            no_continue=True,
+            session_expiry_hours=48,
+            max_calls_per_hour=200,
+        )
+        targeting = TargetingConfig(
+            project="tian",
+            priority_min=TaskPriority.HIGH,
+            categories=[TaskCategory.TESTING],
+        )
+
+        await enqueue_spawn_request(
+            project_path="tian",
+            requested_by="tui",
+            config_json=ralph_config.model_dump_json(),
+            targeting_json=targeting.model_dump_json(),
+        )
+        pending = await fetch_pending_spawn_requests()
+        assert len(pending) == 1
+        assert pending[0]["config_json"] is not None
+        assert pending[0]["targeting_json"] is not None
+
+        restored_config = RalphConfig.model_validate_json(pending[0]["config_json"])
+        restored_targeting = TargetingConfig.model_validate_json(pending[0]["targeting_json"])
+        assert restored_config.model == ClaudeModel.OPUS
+        assert restored_config.session_expiry_hours == 48
+        assert restored_config.max_calls_per_hour == 200
+        assert restored_targeting.project == "tian"
+        assert restored_targeting.priority_min == TaskPriority.HIGH
+        assert restored_targeting.categories == [TaskCategory.TESTING]
+
+    @pytest.mark.asyncio
+    async def test_missing_config_json_is_none(self):
+        from chiefwiggum.coordination import fetch_pending_spawn_requests
+
+        await enqueue_spawn_request(project_path="demo")
+        pending = await fetch_pending_spawn_requests()
+        assert pending[0]["config_json"] is None
+        assert pending[0]["targeting_json"] is None
+
+
 class TestCountPendingIntents:
     @pytest.mark.asyncio
     async def test_empty_queues_return_zeros(self):

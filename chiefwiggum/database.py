@@ -207,7 +207,9 @@ async def init_db():
                 requested_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 consumed_at TIMESTAMP,               -- NULL until daemon acts
                 spawned_ralph_id TEXT,
-                error TEXT
+                error TEXT,
+                config_json TEXT,                    -- RalphConfig.model_dump_json (optional)
+                targeting_json TEXT                  -- TargetingConfig.model_dump_json (optional)
             );
 
             CREATE INDEX IF NOT EXISTS idx_spawn_requests_pending
@@ -380,6 +382,17 @@ async def _run_migrations(conn: aiosqlite.Connection):
             try:
                 await conn.execute(f"ALTER TABLE tasks ADD COLUMN {col_name} {col_type}")
                 logger.info(f"Added column {col_name} to tasks")
+            except Exception as e:
+                logger.debug(f"Column {col_name} may already exist: {e}")
+
+    # spawn_requests: config/targeting passthrough for TUI intents (Phase 4)
+    cursor = await conn.execute("PRAGMA table_info(spawn_requests)")
+    existing_spawn_columns = {row[1] for row in await cursor.fetchall()}
+    for col_name, col_type in [("config_json", "TEXT"), ("targeting_json", "TEXT")]:
+        if col_name not in existing_spawn_columns:
+            try:
+                await conn.execute(f"ALTER TABLE spawn_requests ADD COLUMN {col_name} {col_type}")
+                logger.info(f"Added column {col_name} to spawn_requests")
             except Exception as e:
                 logger.debug(f"Column {col_name} may already exist: {e}")
 

@@ -552,14 +552,16 @@ class TestSpawnWorkflowJourney:
 
         with patch("chiefwiggum.tui.handlers.can_spawn_ralph", new_callable=AsyncMock) as mock_can_spawn, \
              patch("chiefwiggum.tui.handlers.spawn_ralph_with_task_claim", new_callable=AsyncMock) as mock_spawn, \
-             patch("chiefwiggum.tui.handlers.generate_ralph_id") as mock_gen_id:
+             patch("chiefwiggum.tui.handlers.generate_ralph_id") as mock_gen_id, \
+             patch("chiefwiggum.daemon.is_daemon_running", return_value=(False, None)):
 
             mock_can_spawn.return_value = (True, "Ready")
             # spawn_ralph_with_task_claim returns (success, message, task_id)
             mock_spawn.return_value = (True, "Spawned successfully", "task-123")
             mock_gen_id.return_value = "test-ralph-123"
 
-            # Press Enter to confirm spawn
+            # Press Enter to confirm spawn — daemon is forced off so we exercise
+            # the direct-spawn fallback path.
             loop.run_until_complete(handle_spawn("\r", state))
 
             # Verify spawn_ralph_with_task_claim was called (handles registration internally)

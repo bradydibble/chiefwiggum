@@ -106,6 +106,68 @@ class TestReconcileTick:
         assert fake_spawn.await_count == 2
         assert stats.spawns_executed == 2
 
+    @pytest.mark.asyncio
+    async def test_tui_config_and_targeting_forward_to_spawner(self):
+        """When the TUI passes config_json/targeting_json, the daemon should
+        deserialize them and hand the real Pydantic objects to the spawner."""
+        from chiefwiggum.models import (
+            ClaudeModel,
+            RalphConfig,
+            TargetingConfig,
+            TaskCategory,
+            TaskPriority,
+        )
+
+        stats = DaemonStats()
+        ralph_config = RalphConfig(model=ClaudeModel.OPUS, session_expiry_hours=72)
+        targeting = TargetingConfig(
+            project="tian",
+            priority_min=TaskPriority.HIGH,
+            categories=[TaskCategory.TESTING],
+        )
+        await enqueue_spawn_request(
+            project_path="tian",
+            requested_by="tui",
+            config_json=ralph_config.model_dump_json(),
+            targeting_json=targeting.model_dump_json(),
+        )
+
+        fake_spawn = AsyncMock(return_value=(True, "ok", "task-1"))
+        with patch("chiefwiggum.daemon.spawn_ralph_with_task_claim", fake_spawn):
+            await _process_spawn_requests(stats)
+
+        assert fake_spawn.await_count == 1
+        call_kwargs = fake_spawn.await_args.kwargs
+        passed_config: RalphConfig = call_kwargs["config"]
+        passed_targeting: TargetingConfig = call_kwargs["targeting"]
+        assert isinstance(passed_config, RalphConfig)
+        assert passed_config.model == ClaudeModel.OPUS
+        assert passed_config.session_expiry_hours == 72
+        assert isinstance(passed_targeting, TargetingConfig)
+        assert passed_targeting.project == "tian"
+        assert passed_targeting.priority_min == TaskPriority.HIGH
+        assert passed_targeting.categories == [TaskCategory.TESTING]
+
+    @pytest.mark.asyncio
+    async def test_malformed_config_json_falls_back_to_defaults(self):
+        stats = DaemonStats()
+        await enqueue_spawn_request(
+            project_path="tian",
+            requested_by="tui",
+            config_json="{not valid json",
+            targeting_json="also bad",
+        )
+
+        fake_spawn = AsyncMock(return_value=(True, "ok", None))
+        with patch("chiefwiggum.daemon.spawn_ralph_with_task_claim", fake_spawn):
+            await _process_spawn_requests(stats)
+
+        # Should still spawn; bad config_json just means config=None (defaults).
+        assert fake_spawn.await_count == 1
+        call_kwargs = fake_spawn.await_args.kwargs
+        assert call_kwargs["config"] is None
+        assert call_kwargs["targeting"] is None
+
 
 class TestDaemonProcess:
     """Exercises start_daemon/stop_daemon via an actual subprocess.

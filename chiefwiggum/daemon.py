@@ -119,6 +119,7 @@ def _remove_pid_file() -> None:
 async def _process_spawn_requests(stats: DaemonStats) -> None:
     """Consume pending spawn_requests and actually spawn the ralphs."""
     from chiefwiggum.cli import generate_ralph_id  # local import: avoid cycle at import time
+    from chiefwiggum.models import RalphConfig, TargetingConfig
 
     requests = await fetch_pending_spawn_requests(limit=10)
     for req in requests:
@@ -126,6 +127,27 @@ async def _process_spawn_requests(stats: DaemonStats) -> None:
         fix_plan_path = req["fix_plan_path"]
         if not fix_plan_path:
             fix_plan_path = str(Path(project) / "fix_plan.md")
+
+        # Deserialize optional config/targeting passed through from the TUI.
+        config: RalphConfig | None = None
+        if req.get("config_json"):
+            try:
+                config = RalphConfig.model_validate_json(req["config_json"])
+            except Exception:
+                logger.exception(
+                    "[DAEMON] spawn_request id=%s: bad config_json, using defaults",
+                    req["id"],
+                )
+
+        targeting: TargetingConfig | None = None
+        if req.get("targeting_json"):
+            try:
+                targeting = TargetingConfig.model_validate_json(req["targeting_json"])
+            except Exception:
+                logger.exception(
+                    "[DAEMON] spawn_request id=%s: bad targeting_json, using defaults",
+                    req["id"],
+                )
 
         ralph_id = generate_ralph_id(Path(project).name)
         logger.info(
@@ -137,6 +159,8 @@ async def _process_spawn_requests(stats: DaemonStats) -> None:
                 ralph_id=ralph_id,
                 project=project,
                 fix_plan_path=fix_plan_path,
+                config=config,
+                targeting=targeting,
             )
             if success:
                 stats.spawns_executed += 1

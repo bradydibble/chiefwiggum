@@ -3898,18 +3898,32 @@ async def enqueue_spawn_request(
     task_id: str | None = None,
     priority: int = 0,
     requested_by: str = "cli",
+    config_json: str | None = None,
+    targeting_json: str | None = None,
 ) -> int:
     """Insert a spawn_requests row and return its id.
 
-    The daemon picks it up on its next reconcile tick.
+    The daemon picks it up on its next reconcile tick. `config_json` and
+    `targeting_json` are optional serialized `RalphConfig`/`TargetingConfig`
+    strings — pass them when the caller (usually the TUI) wants specific
+    model/priority/category choices to propagate through the daemon.
     """
     conn = await get_connection()
     try:
         cursor = await conn.execute(
             """INSERT INTO spawn_requests
-                 (project_path, fix_plan_path, task_id, priority, requested_by)
-               VALUES (?, ?, ?, ?, ?)""",
-            (project_path, fix_plan_path, task_id, priority, requested_by),
+                 (project_path, fix_plan_path, task_id, priority, requested_by,
+                  config_json, targeting_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                project_path,
+                fix_plan_path,
+                task_id,
+                priority,
+                requested_by,
+                config_json,
+                targeting_json,
+            ),
         )
         await conn.commit()
         return cursor.lastrowid
@@ -3941,7 +3955,7 @@ async def fetch_pending_spawn_requests(limit: int = 10) -> list[dict[str, Any]]:
     try:
         cursor = await conn.execute(
             """SELECT id, project_path, fix_plan_path, task_id, priority,
-                      requested_by, requested_at
+                      requested_by, requested_at, config_json, targeting_json
                FROM spawn_requests
                WHERE consumed_at IS NULL
                ORDER BY priority DESC, requested_at ASC
@@ -3958,6 +3972,8 @@ async def fetch_pending_spawn_requests(limit: int = 10) -> list[dict[str, Any]]:
                 "priority": row[4],
                 "requested_by": row[5],
                 "requested_at": row[6],
+                "config_json": row[7],
+                "targeting_json": row[8],
             }
             for row in rows
         ]

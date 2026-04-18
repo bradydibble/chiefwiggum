@@ -477,7 +477,6 @@ async def handle_spawn(key: str, state: TUIState) -> None:
                 state.mode = TUIMode.NORMAL
                 return
 
-            ralph_id = generate_ralph_id(config.project[:8])
             ralph_config = RalphConfig(
                 model=config.model,
                 no_continue=not config.session_continuity,  # Invert for internal use
@@ -489,18 +488,41 @@ async def handle_spawn(key: str, state: TUIState) -> None:
                 categories=config.categories,
             )
 
-            # Use task-aware spawning - claims a task and spawns with focused prompt
-            success, message, task_id = await spawn_ralph_with_task_claim(
-                ralph_id=ralph_id,
-                project=config.project,
-                fix_plan_path=config.fix_plan_path,
-                config=ralph_config,
-                targeting=targeting,
-            )
+            # Route through the chiefwiggum daemon when it's running: the TUI
+            # inserts a spawn_request row, the daemon executes it on its next
+            # tick. The TUI can then die freely without losing the spawn. Fall
+            # back to direct spawn when the daemon is down so the TUI still
+            # works in bare-metal operation.
+            from chiefwiggum.coordination import enqueue_spawn_request
+            from chiefwiggum.daemon import is_daemon_running
 
-            # spawn_ralph_with_task_claim already registers in database
+            daemon_running, daemon_pid = is_daemon_running()
+            if daemon_running:
+                req_id = await enqueue_spawn_request(
+                    project_path=config.project,
+                    fix_plan_path=config.fix_plan_path,
+                    priority=0,
+                    requested_by="tui",
+                    config_json=ralph_config.model_dump_json(),
+                    targeting_json=targeting.model_dump_json(),
+                )
+                state.status_message = (
+                    f"Spawn requested (id={req_id}); daemon pid={daemon_pid} will execute on next tick"
+                )
+            else:
+                ralph_id = generate_ralph_id(config.project[:8])
+                success, message, task_id = await spawn_ralph_with_task_claim(
+                    ralph_id=ralph_id,
+                    project=config.project,
+                    fix_plan_path=config.fix_plan_path,
+                    config=ralph_config,
+                    targeting=targeting,
+                )
+                state.status_message = (
+                    f"{message} (daemon not running — spawned directly; "
+                    "run `wig service install` for walk-away reliability)"
+                )
 
-            state.status_message = message
             state.status_message_time = time.time()
             state.mode = TUIMode.NORMAL
 
@@ -1098,7 +1120,6 @@ async def handle_command(key: str, state: TUIState) -> bool:
             model = ClaudeModel(model_str)
             timeout = defaults.get("timeout_minutes", 30)
 
-            ralph_id = generate_ralph_id(project[:8])
             ralph_config = RalphConfig(model=model, timeout_minutes=timeout)
             targeting = TargetingConfig(
                 project=project,
@@ -1106,22 +1127,39 @@ async def handle_command(key: str, state: TUIState) -> bool:
                 categories=[],  # All categories
             )
 
-            # Use task-aware spawning that claims a task and generates focused prompt
-            success, message, task_id = await spawn_ralph_with_task_claim(
-                ralph_id=ralph_id,
-                project=project,
-                fix_plan_path=str(fix_plan_path),
-                config=ralph_config,
-                targeting=targeting,
-            )
+            # Prefer the daemon route for the same durability reasons as the
+            # wizard spawn. Falls back to direct spawning when the daemon is
+            # not running.
+            from chiefwiggum.coordination import enqueue_spawn_request
+            from chiefwiggum.daemon import is_daemon_running
 
-            if success:
-                if task_id:
-                    state.status_message = f"Quickstart: {message} (Task: {task_id})"
-                else:
-                    state.status_message = f"Quickstart: {message}"
+            daemon_running, _ = is_daemon_running()
+            if daemon_running:
+                req_id = await enqueue_spawn_request(
+                    project_path=project,
+                    fix_plan_path=str(fix_plan_path),
+                    priority=0,
+                    requested_by="tui-quickstart",
+                    config_json=ralph_config.model_dump_json(),
+                    targeting_json=targeting.model_dump_json(),
+                )
+                state.status_message = f"Quickstart: spawn requested (id={req_id}) for {project}"
             else:
-                state.status_message = f"Quickstart failed: {message}"
+                ralph_id = generate_ralph_id(project[:8])
+                success, message, task_id = await spawn_ralph_with_task_claim(
+                    ralph_id=ralph_id,
+                    project=project,
+                    fix_plan_path=str(fix_plan_path),
+                    config=ralph_config,
+                    targeting=targeting,
+                )
+                if success:
+                    if task_id:
+                        state.status_message = f"Quickstart: {message} (Task: {task_id})"
+                    else:
+                        state.status_message = f"Quickstart: {message}"
+                else:
+                    state.status_message = f"Quickstart failed: {message}"
             state.status_message_time = time.time()
             return False
 
