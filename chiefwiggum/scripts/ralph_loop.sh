@@ -1901,7 +1901,10 @@ main() {
             if [[ "$SINGLE_TASK_MODE" != "true" && -n "$RALPH_ID" ]]; then
                 log_status "INFO" "📋 Checking for next task before project_complete exit..."
                 local chain_claim_result
-                chain_claim_result=$(claim_next_task_for_ralph "$RALPH_ID")
+                # Defensive `|| true`: if the helper ever regresses to a
+                # non-zero return, we still capture its JSON stdout instead of
+                # letting `set -e` kill the script at the assignment line.
+                chain_claim_result=$(claim_next_task_for_ralph "$RALPH_ID" || true)
                 local chain_claim_success
                 chain_claim_success=$(echo "$chain_claim_result" | jq -r '.success' 2>/dev/null)
                 local chain_new_task_id
@@ -2246,12 +2249,12 @@ claim_next_task_for_ralph() {
     # Validation
     if [[ -z "$ralph_id" ]]; then
         echo '{"success":false,"task_id":"","verified":false,"reason":"invalid_ralph_id","queue_empty":false}'
-        return 1
+        return 0
     fi
 
     if ! command -v wig &>/dev/null; then
         echo '{"success":false,"task_id":"","verified":false,"reason":"wig_not_found","queue_empty":false}'
-        return 1
+        return 0
     fi
 
     # Release any existing task first
@@ -2309,13 +2312,13 @@ claim_next_task_for_ralph() {
             # Claim succeeded but no task assigned after all retries - queue likely empty
             log_status "WARN" "Claim succeeded but no task assigned after verification retries"
             echo '{"success":false,"task_id":"","verified":false,"reason":"no_task_after_claim","queue_empty":true}'
-            return 1
+            return 0
         else
             # Check if error indicates no tasks available
             if echo "$claim_output" | grep -qi "no tasks available\|queue empty\|no available tasks"; then
                 log_status "INFO" "Queue is empty (no tasks available)"
                 echo '{"success":false,"task_id":"","verified":false,"reason":"queue_empty","queue_empty":true}'
-                return 1
+                return 0
             fi
 
             # Retry with exponential backoff
@@ -2330,7 +2333,7 @@ claim_next_task_for_ralph() {
     # All claim attempts failed
     log_status "ERROR" "Failed to claim task after $max_claim_attempts attempts"
     echo '{"success":false,"task_id":"","verified":false,"reason":"claim_failed","queue_empty":false}'
-    return 1
+    return 0
 }
 
 # Get current task ID for Ralph instance
