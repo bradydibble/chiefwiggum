@@ -310,13 +310,20 @@ def set_max_ralphs(limit: int) -> bool:
 def load_config_on_startup() -> None:
     """Load configuration and set environment variables on startup.
 
-    Call this when the TUI starts to apply saved settings.
+    Call this when the TUI or daemon starts to apply saved settings.
+
+    Only injects ANTHROPIC_API_KEY if it looks like a real Anthropic key
+    (sk-ant- prefix). Otherwise we skip it — a placeholder like "new-api-key"
+    would otherwise override the user's real auth and cause confusing
+    "invalid key" errors in the spawned ralph.
     """
     config = load_config()
 
     # Set API key in environment if present in config but not in env
-    if not os.environ.get("ANTHROPIC_API_KEY") and config.get("anthropic_api_key"):
-        os.environ["ANTHROPIC_API_KEY"] = config["anthropic_api_key"]
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        configured_key = config.get("anthropic_api_key", "")
+        if configured_key and configured_key.startswith("sk-ant-"):
+            os.environ["ANTHROPIC_API_KEY"] = configured_key
 
 
 # ============================================================================

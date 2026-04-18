@@ -68,10 +68,16 @@ def _validate_spawn_requirements() -> tuple[bool, str]:
         Tuple of (can_spawn, reason)
     """
     # Check 1: API key
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        return (False, "ANTHROPIC_API_KEY not set. Export the key or check your environment.")
-    if not os.environ.get("ANTHROPIC_API_KEY", "").startswith("sk-ant-"):
-        return (False, "ANTHROPIC_API_KEY appears invalid (must start with sk-ant-). Update via Settings (S).")
+    # If ANTHROPIC_API_KEY is set at all, require a real `sk-ant-` prefix — this
+    # catches placeholder values like "new-api-key" that would otherwise be
+    # forwarded into the spawned ralph and fail at the Claude CLI boundary.
+    # If the env var is NOT set, allow the spawn to proceed: Claude Code also
+    # supports `claude login` (OAuth / stored session tokens) which doesn't
+    # require ANTHROPIC_API_KEY at all. The real auth check happens in the
+    # spawned process.
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if api_key and not api_key.startswith("sk-ant-"):
+        return (False, "ANTHROPIC_API_KEY appears invalid (must start with sk-ant-). Unset it or set a real key.")
 
     # Check 2: Claude CLI available
     if shutil.which("claude") is None:
@@ -2458,11 +2464,10 @@ async def can_spawn_ralph() -> tuple[bool, str]:
     Returns:
         Tuple of (can_spawn, reason)
     """
-    # Check 1: API key
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        return (False, "ANTHROPIC_API_KEY not set. Press 'S' for Settings.")
-    if not os.environ.get("ANTHROPIC_API_KEY", "").startswith("sk-ant-"):
-        return (False, "ANTHROPIC_API_KEY appears invalid (must start with sk-ant-). Update via Settings (S).")
+    # Check 1: API key (soft-require — empty is OK when using `claude login`)
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if api_key and not api_key.startswith("sk-ant-"):
+        return (False, "ANTHROPIC_API_KEY appears invalid (must start with sk-ant-). Unset it or set a real key.")
 
     # Check 2: Claude CLI available
     if shutil.which("claude") is None:

@@ -1145,13 +1145,16 @@ def daemon_stop(timeout: float):
 
 @main.command("spawn")
 @click.argument("project")
-@click.option("--fix-plan", "-f", help="Path to @fix_plan.md (defaults to <project>/fix_plan.md).")
+@click.option("--fix-plan", "-f", help="Path to @fix_plan.md (defaults to auto-detect in <project-dir>).")
 @click.option("--task-id", "-t", help="Specific task ID to spawn on (default: daemon claims next).")
 @click.option("--priority", "-p", type=int, default=0, show_default=True, help="Queue priority; higher goes first.")
 @click.option("--wait", is_flag=True, help="Block until the daemon consumes this request.")
 @click.option("--timeout", type=float, default=30.0, show_default=True, help="Seconds to wait in --wait mode.")
 def spawn_cmd(project: str, fix_plan: str | None, task_id: str | None, priority: int, wait: bool, timeout: float):
     """Enqueue a ralph spawn request for the chiefwiggum daemon to execute.
+
+    PROJECT can be either a project name (e.g. `tian`) — in which case we look
+    for `~/claudecode/<name>/@fix_plan.md` — or a path to the project directory.
 
     The CLI writes a row to the `spawn_requests` table; the daemon picks it up
     on its next reconcile tick and actually spawns the ralph process. This
@@ -1173,11 +1176,41 @@ def spawn_cmd(project: str, fix_plan: str | None, task_id: str | None, priority:
     console = Console()
     run_async(init_db())
 
-    project_path = str(Path(project).expanduser().resolve())
-    fix_plan_path = fix_plan or str(Path(project_path) / "fix_plan.md")
+    # Resolve project input to (project_name, project_dir).
+    # - If the input exists as a directory, use that directory; project name = basename.
+    # - Else treat it as a bare project name and look under ~/claudecode/<name>/.
+    raw = Path(project).expanduser()
+    if raw.exists() and raw.is_dir():
+        project_dir = raw.resolve()
+        project_name = project_dir.name
+    else:
+        project_name = project
+        project_dir = (Path.home() / "claudecode" / project_name).resolve()
+        if not project_dir.is_dir():
+            console.print(
+                f"[red]✗ project directory not found:[/red] {project_dir}\n"
+                f"[dim]Pass an explicit path, e.g. `wig spawn /path/to/{project_name}`[/dim]"
+            )
+            return
+
+    if fix_plan:
+        fix_plan_path = str(Path(fix_plan).expanduser().resolve())
+    else:
+        # Ralph convention is `@fix_plan.md`; some projects use bare `fix_plan.md`.
+        for candidate in ("@fix_plan.md", "fix_plan.md"):
+            candidate_path = project_dir / candidate
+            if candidate_path.exists():
+                fix_plan_path = str(candidate_path)
+                break
+        else:
+            console.print(
+                f"[red]✗ no fix plan found in {project_dir} "
+                "(looked for @fix_plan.md and fix_plan.md)[/red]"
+            )
+            return
 
     req_id = run_async(enqueue_spawn_request(
-        project_path=project_path,
+        project_path=project_name,
         fix_plan_path=fix_plan_path,
         task_id=task_id,
         priority=priority,

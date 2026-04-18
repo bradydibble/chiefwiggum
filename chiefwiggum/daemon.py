@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
+from chiefwiggum.config import load_config_on_startup
 from chiefwiggum.coordination import (
     count_pending_intents,
     fetch_pending_cancel_requests,
@@ -213,6 +214,11 @@ async def run_forever(tick_seconds: int = DEFAULT_TICK_SECONDS) -> None:
             pass
 
     await init_db()
+    # Load ~/.chiefwiggum/config.yaml into os.environ so launchd-spawned daemons
+    # (which don't inherit the user's shell env) still see ANTHROPIC_API_KEY and
+    # other config-derived vars. Children spawned via subprocess.Popen inherit
+    # this env.
+    load_config_on_startup()
     logger.info("[DAEMON] Started (pid=%s, tick=%ss)", os.getpid(), tick_seconds)
 
     while not stop_event.is_set():

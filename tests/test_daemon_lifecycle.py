@@ -207,10 +207,17 @@ class TestWigSpawnCli:
     def _wig_cmd(self) -> list[str]:
         return [sys.executable, "-m", "chiefwiggum.cli"]
 
+    def _make_fake_project(self, tmp_path: Path, name: str = "demo") -> Path:
+        project_dir = tmp_path / name
+        project_dir.mkdir()
+        (project_dir / "@fix_plan.md").write_text("# Demo\n")
+        return project_dir
+
     def test_wig_spawn_enqueues_when_daemon_is_down(self, isolated_env):
+        project_dir = self._make_fake_project(isolated_env, "demo-a")
         env = os.environ.copy()
         result = subprocess.run(
-            [*self._wig_cmd(), "spawn", "/tmp/does-not-matter", "--priority", "3"],
+            [*self._wig_cmd(), "spawn", str(project_dir), "--priority", "3"],
             env=env,
             capture_output=True,
             text=True,
@@ -223,9 +230,10 @@ class TestWigSpawnCli:
         assert "daemon is NOT running" in result.stdout
 
     def test_wig_spawn_specific_task_id(self, isolated_env):
+        project_dir = self._make_fake_project(isolated_env, "demo-b")
         env = os.environ.copy()
         result = subprocess.run(
-            [*self._wig_cmd(), "spawn", "/tmp/demo", "--task-id", "task-7"],
+            [*self._wig_cmd(), "spawn", str(project_dir), "--task-id", "task-7"],
             env=env,
             capture_output=True,
             text=True,
@@ -233,11 +241,26 @@ class TestWigSpawnCli:
         )
         assert result.returncode == 0, result.stderr
 
-        # Verify the row landed with the right task_id.
+        # Verify the row landed with the right task_id and project NAME (not full path).
         async def _check():
             pending = await fetch_pending_spawn_requests()
             assert len(pending) == 1
             assert pending[0]["task_id"] == "task-7"
             assert pending[0]["requested_by"] == "cli"
+            # spawn_cmd should strip the full path down to the project directory basename.
+            assert pending[0]["project_path"] == "demo-b"
 
         asyncio.run(_check())
+
+    def test_wig_spawn_missing_project_dir_errors(self, isolated_env):
+        env = os.environ.copy()
+        result = subprocess.run(
+            [*self._wig_cmd(), "spawn", "no-such-project-anywhere"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        # Command runs without exception but reports the missing dir.
+        assert result.returncode == 0
+        assert "project directory not found" in result.stdout
