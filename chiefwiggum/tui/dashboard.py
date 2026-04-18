@@ -37,7 +37,6 @@ from chiefwiggum.icons import (
     COLOR_MUTED,
     COLOR_SUCCESS,
     COLOR_WARNING,
-    ICON_DAEMON,
 )
 from chiefwiggum.models import (
     RalphInstanceStatus,
@@ -211,11 +210,25 @@ async def update_dashboard(layout: Layout, state: TUIState) -> None:
 
     # Fetch master data in parallel (3 queries instead of 6, run concurrently)
     # Also fetch graded tasks for Ralph Loop Alignment
-    all_instances, all_tasks, graded_tasks = await asyncio.gather(
+    from chiefwiggum.coordination import (
+        count_pending_intents,
+        count_recent_intent_errors,
+    )
+    from chiefwiggum.daemon import is_daemon_running
+
+    all_instances, all_tasks, graded_tasks, intents, recent_err = await asyncio.gather(
         list_all_instances(),
         list_all_tasks(),
         list_graded_tasks(),
+        count_pending_intents(),
+        count_recent_intent_errors(),
     )
+
+    # Refresh the daemon snapshot fields on TUIState (rendered by stats panel).
+    state.daemon_running, state.daemon_pid = is_daemon_running()
+    state.daemon_pending_spawn = intents["spawn"]
+    state.daemon_pending_cancel = intents["cancel"]
+    state.daemon_recent_errors = recent_err
 
     # Store graded tasks in state
     state.graded_tasks = graded_tasks

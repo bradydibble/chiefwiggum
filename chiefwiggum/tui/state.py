@@ -218,3 +218,9 @@ class TUIState:
     render_state: RenderState = field(default_factory=RenderState)
     # Layout structure cache
     cached_layout_structure: Optional[str] = None
+    # Daemon observability (refreshed in update_dashboard)
+    daemon_running: bool = False
+    daemon_pid: Optional[int] = None
+    daemon_pending_spawn: int = 0
+    daemon_pending_cancel: int = 0
+    daemon_recent_errors: int = 0

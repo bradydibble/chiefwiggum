@@ -192,3 +192,42 @@ class TestCountPendingIntents:
 
         counts = await count_pending_intents()
         assert counts == {"spawn": 2, "cancel": 1}
+
+
+class TestIntentErrors:
+    @pytest.mark.asyncio
+    async def test_recent_errors_empty_by_default(self):
+        from chiefwiggum.coordination import (
+            count_recent_intent_errors,
+            fetch_recent_intent_errors,
+        )
+        assert await count_recent_intent_errors() == 0
+        assert await fetch_recent_intent_errors() == []
+
+    @pytest.mark.asyncio
+    async def test_consumed_without_error_is_not_counted(self):
+        from chiefwiggum.coordination import count_recent_intent_errors
+
+        req_id = await enqueue_spawn_request(project_path="/tmp/demo")
+        await mark_spawn_request_consumed(req_id, spawned_ralph_id="host-ok")
+        assert await count_recent_intent_errors() == 0
+
+    @pytest.mark.asyncio
+    async def test_failed_spawn_and_cancel_are_both_counted(self):
+        from chiefwiggum.coordination import (
+            count_recent_intent_errors,
+            fetch_recent_intent_errors,
+        )
+
+        sp_id = await enqueue_spawn_request(project_path="/tmp/demo")
+        await mark_spawn_request_consumed(sp_id, error="no fix_plan")
+        cn_id = await enqueue_cancel_request(ralph_id="host-zzz")
+        await mark_cancel_request_consumed(cn_id, error="ralph not running")
+
+        assert await count_recent_intent_errors() == 2
+        rows = await fetch_recent_intent_errors()
+        kinds = {r["kind"] for r in rows}
+        assert kinds == {"spawn", "cancel"}
+        errors = {r["error"] for r in rows}
+        assert "no fix_plan" in errors
+        assert "ralph not running" in errors

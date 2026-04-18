@@ -4068,3 +4068,64 @@ async def count_pending_intents() -> dict[str, int]:
         }
     finally:
         await conn.close()
+
+
+async def count_recent_intent_errors(minutes: int = 10) -> int:
+    """Return count of spawn/cancel requests consumed in the last N minutes
+    that recorded an error. Used by the TUI to flag daemon trouble.
+    """
+    conn = await get_connection()
+    try:
+        cursor = await conn.execute(
+            f"""SELECT
+                    (SELECT COUNT(*) FROM spawn_requests
+                       WHERE error IS NOT NULL
+                         AND consumed_at >= datetime('now', '-{int(minutes)} minutes'))
+                  + (SELECT COUNT(*) FROM cancel_requests
+                       WHERE error IS NOT NULL
+                         AND consumed_at >= datetime('now', '-{int(minutes)} minutes'))
+            """
+        )
+        row = await cursor.fetchone()
+        return row[0] if row else 0
+    finally:
+        await conn.close()
+
+
+async def fetch_recent_intent_errors(limit: int = 5, minutes: int = 60) -> list[dict[str, Any]]:
+    """Return the most recent errored intents (newest first). For TUI drill-down.
+
+    Each row includes `kind` ('spawn' | 'cancel'), `id`, `error`, `consumed_at`,
+    plus `project_path`/`ralph_id` as appropriate.
+    """
+    conn = await get_connection()
+    try:
+        cursor = await conn.execute(
+            f"""
+            SELECT 'spawn' AS kind, id, project_path AS target, error, consumed_at
+              FROM spawn_requests
+             WHERE error IS NOT NULL
+               AND consumed_at >= datetime('now', '-{int(minutes)} minutes')
+            UNION ALL
+            SELECT 'cancel' AS kind, id, ralph_id AS target, error, consumed_at
+              FROM cancel_requests
+             WHERE error IS NOT NULL
+               AND consumed_at >= datetime('now', '-{int(minutes)} minutes')
+            ORDER BY consumed_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        rows = await cursor.fetchall()
+        return [
+            {
+                "kind": row[0],
+                "id": row[1],
+                "target": row[2],
+                "error": row[3],
+                "consumed_at": row[4],
+            }
+            for row in rows
+        ]
+    finally:
+        await conn.close()

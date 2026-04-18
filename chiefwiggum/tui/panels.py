@@ -476,7 +476,33 @@ def create_stats_panel(instances: list, tasks: list, state: TUIState) -> Panel:
 
     text = Text()
 
-    # Notification badges at start with icons (softer colors)
+    # Daemon indicator — the thing that actually keeps ralphs running when the
+    # TUI is dead. If it's not running, user needs to know immediately.
+    from chiefwiggum.icons import ICON_DAEMON
+    if getattr(state, "daemon_running", False):
+        text.append(f" {ICON_DAEMON} ", style="bold green")
+        text.append("daemon ", style="dim")
+        pending_spawn = getattr(state, "daemon_pending_spawn", 0)
+        pending_cancel = getattr(state, "daemon_pending_cancel", 0)
+        if pending_spawn or pending_cancel:
+            parts = []
+            if pending_spawn:
+                parts.append(f"{pending_spawn} spawn")
+            if pending_cancel:
+                parts.append(f"{pending_cancel} cancel")
+            text.append(f"({' + '.join(parts)} pending)", style="cyan")
+        else:
+            text.append("(idle)", style="dim")
+        recent_err = getattr(state, "daemon_recent_errors", 0)
+        if recent_err:
+            text.append(f"  {ICON_ALERT_WARNING} {recent_err} recent intent error(s)", style="bold yellow")
+    else:
+        text.append(f" {ICON_DAEMON} daemon down ", style=f"bold white on {COLOR_ERROR}")
+        text.append("— `wig service install` to enable walk-away", style="dim")
+
+    text.append(f"  {SEP_VERTICAL}  ", style="dim")
+
+    # Notification badges (softer colors)
     if failed_count > 0:
         text.append(f" {ICON_FAILED} {failed_count} FAILED ", style=f"bold white on {COLOR_ERROR}")
         text.append(f"  {SEP_VERTICAL}  ", style="dim")
