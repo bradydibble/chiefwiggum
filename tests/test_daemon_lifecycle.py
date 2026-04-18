@@ -201,3 +201,43 @@ class TestDaemonProcess:
             except subprocess.TimeoutExpired:
                 first.kill()
                 first.wait(timeout=5)
+
+
+class TestWigSpawnCli:
+    def _wig_cmd(self) -> list[str]:
+        return [sys.executable, "-m", "chiefwiggum.cli"]
+
+    def test_wig_spawn_enqueues_when_daemon_is_down(self, isolated_env):
+        env = os.environ.copy()
+        result = subprocess.run(
+            [*self._wig_cmd(), "spawn", "/tmp/does-not-matter", "--priority", "3"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert result.returncode == 0, result.stderr
+        # Either "enqueued" header fires regardless of daemon state.
+        assert "spawn_request enqueued" in result.stdout
+        # Warning about daemon not running should appear.
+        assert "daemon is NOT running" in result.stdout
+
+    def test_wig_spawn_specific_task_id(self, isolated_env):
+        env = os.environ.copy()
+        result = subprocess.run(
+            [*self._wig_cmd(), "spawn", "/tmp/demo", "--task-id", "task-7"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert result.returncode == 0, result.stderr
+
+        # Verify the row landed with the right task_id.
+        async def _check():
+            pending = await fetch_pending_spawn_requests()
+            assert len(pending) == 1
+            assert pending[0]["task_id"] == "task-7"
+            assert pending[0]["requested_by"] == "cli"
+
+        asyncio.run(_check())

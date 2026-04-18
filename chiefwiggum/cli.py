@@ -1143,6 +1143,73 @@ def daemon_stop(timeout: float):
         console.print(f"[yellow]![/yellow] {msg}")
 
 
+@main.command("spawn")
+@click.argument("project")
+@click.option("--fix-plan", "-f", help="Path to @fix_plan.md (defaults to <project>/fix_plan.md).")
+@click.option("--task-id", "-t", help="Specific task ID to spawn on (default: daemon claims next).")
+@click.option("--priority", "-p", type=int, default=0, show_default=True, help="Queue priority; higher goes first.")
+@click.option("--wait", is_flag=True, help="Block until the daemon consumes this request.")
+@click.option("--timeout", type=float, default=30.0, show_default=True, help="Seconds to wait in --wait mode.")
+def spawn_cmd(project: str, fix_plan: str | None, task_id: str | None, priority: int, wait: bool, timeout: float):
+    """Enqueue a ralph spawn request for the chiefwiggum daemon to execute.
+
+    The CLI writes a row to the `spawn_requests` table; the daemon picks it up
+    on its next reconcile tick and actually spawns the ralph process. This
+    means you can `wig spawn` from any shell, close the terminal, and the
+    spawn still happens. If the daemon isn't running, the request will sit
+    pending until it starts — use `wig daemon start` or `wig service install`
+    first for unattended operation.
+    """
+    import time as _time
+
+    from rich.console import Console
+
+    from chiefwiggum.coordination import (
+        enqueue_spawn_request,
+        fetch_pending_spawn_requests,
+    )
+    from chiefwiggum.daemon import is_daemon_running
+
+    console = Console()
+    run_async(init_db())
+
+    project_path = str(Path(project).expanduser().resolve())
+    fix_plan_path = fix_plan or str(Path(project_path) / "fix_plan.md")
+
+    req_id = run_async(enqueue_spawn_request(
+        project_path=project_path,
+        fix_plan_path=fix_plan_path,
+        task_id=task_id,
+        priority=priority,
+        requested_by="cli",
+    ))
+
+    running, pid = is_daemon_running()
+    if running:
+        console.print(f"[green]✓ spawn_request enqueued[/green] (id={req_id}, daemon pid={pid})")
+    else:
+        console.print(
+            f"[yellow]! spawn_request enqueued[/yellow] (id={req_id}) — "
+            "daemon is NOT running; start it with [cyan]wig daemon start[/cyan] "
+            "or install as a service with [cyan]wig service install[/cyan]."
+        )
+
+    if not wait:
+        return
+
+    deadline = _time.monotonic() + timeout
+    while _time.monotonic() < deadline:
+        pending_ids = {r["id"] for r in run_async(fetch_pending_spawn_requests(limit=100))}
+        if req_id not in pending_ids:
+            console.print(f"[green]✓ consumed by daemon[/green] (request {req_id})")
+            return
+        _time.sleep(0.5)
+
+    console.print(
+        f"[yellow]! timeout waiting for daemon to consume request {req_id}[/yellow]"
+    )
+
+
 @daemon.command("status")
 @click.option("--format", "-f", "output_format", type=click.Choice(["text", "json"]), default="text", show_default=True)
 def daemon_status_cmd(output_format: str):
@@ -1171,6 +1238,115 @@ def daemon_status_cmd(output_format: str):
     console.print(f"  log file: {info['log_file']}")
     console.print(f"  pending spawn_requests:  {info['pending_spawn_requests']}")
     console.print(f"  pending cancel_requests: {info['pending_cancel_requests']}")
+
+
+@main.group()
+def service():
+    """Install chiefwiggum daemon as a launchd user agent (macOS).
+
+    `wig service install` is the one-command setup for walk-away reliability:
+    it renders a launchd plist referencing your current `chiefwiggum` binary,
+    loads it with launchctl, and launchd takes over from there — starting the
+    daemon at login and auto-restarting it if it crashes. No terminal needed.
+    """
+    pass
+
+
+@service.command("install")
+def service_install():
+    """Install and load the chiefwiggum launchd user agent."""
+    from rich.console import Console
+
+    from chiefwiggum.service import install, is_supported
+
+    console = Console()
+    if not is_supported():
+        console.print(
+            "[yellow]! wig service is macOS-only today[/yellow]\n"
+            "On Linux, run `wig daemon start` under a systemd user-unit "
+            "(template support is planned)."
+        )
+        return
+
+    result = install()
+    if result.installed:
+        console.print(f"[green]✓ {result.message}[/green]")
+        console.print(f"[dim]plist: {result.plist_path}[/dim]")
+        console.print("[dim]The daemon will start now and on every login.[/dim]")
+    else:
+        console.print(f"[red]✗ {result.message}[/red]")
+
+
+@service.command("uninstall")
+def service_uninstall():
+    """Unload the agent and remove the plist."""
+    from rich.console import Console
+
+    from chiefwiggum.service import is_supported, uninstall
+
+    console = Console()
+    if not is_supported():
+        console.print("[yellow]! wig service is macOS-only today[/yellow]")
+        return
+
+    result = uninstall()
+    color = "green" if "Unloaded" in result.message else "yellow"
+    console.print(f"[{color}]{result.message}[/{color}]")
+
+
+@service.command("status")
+@click.option("--format", "-f", "output_format", type=click.Choice(["text", "json"]), default="text", show_default=True)
+def service_status(output_format: str):
+    """Show launchd agent state + daemon state."""
+    import json
+
+    from rich.console import Console
+
+    from chiefwiggum.service import is_supported, status
+
+    if not is_supported():
+        msg = "wig service is macOS-only today"
+        if output_format == "json":
+            click.echo(json.dumps({"supported": False, "message": msg}, indent=2))
+        else:
+            Console().print(f"[yellow]! {msg}[/yellow]")
+        return
+
+    info = status()
+    if output_format == "json":
+        click.echo(json.dumps(info, indent=2, default=str))
+        return
+
+    console = Console()
+    plist_ok = info["plist_installed"]
+    loaded = info["launchd_loaded"]
+    running = info["daemon_running"]
+    pid = info["daemon_pid"]
+
+    console.print(f"[bold]{info['label']}[/bold]")
+    console.print(f"  plist installed: {'[green]yes[/green]' if plist_ok else '[red]no[/red]'}")
+    console.print(f"  launchd loaded:  {'[green]yes[/green]' if loaded else '[red]no[/red]'}")
+    if running:
+        console.print(f"  daemon process:  [green]running[/green] (pid={pid})")
+    else:
+        console.print("  daemon process:  [red]not running[/red]")
+    console.print(f"[dim]plist: {info['plist_path']}[/dim]")
+
+
+@service.command("restart")
+def service_restart():
+    """Ask launchd to restart the daemon (kickstart -k)."""
+    from rich.console import Console
+
+    from chiefwiggum.service import is_supported, restart
+
+    console = Console()
+    if not is_supported():
+        console.print("[yellow]! wig service is macOS-only today[/yellow]")
+        return
+    result = restart()
+    color = "green" if result.installed and "failed" not in result.message else "yellow"
+    console.print(f"[{color}]{result.message}[/{color}]")
 
 
 if __name__ == "__main__":

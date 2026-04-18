@@ -59,11 +59,14 @@ packages = ["chiefwiggum"]
 "chiefwiggum/scripts/lib/profiler.sh" = "chiefwiggum/scripts/lib/profiler.sh"
 "chiefwiggum/scripts/lib/token_estimator.sh" = "chiefwiggum/scripts/lib/token_estimator.sh"
 "chiefwiggum/scripts/lib/cost_tracker.sh" = "chiefwiggum/scripts/lib/cost_tracker.sh"
+# launchd plist template, rendered at `wig service install` time
+"chiefwiggum/resources/com.chiefwiggum.daemon.plist" = "chiefwiggum/resources/com.chiefwiggum.daemon.plist"
 
 [tool.hatch.build.targets.sdist]
 include = [
     "chiefwiggum/**/*.py",
     "chiefwiggum/**/*.sh",
+    "chiefwiggum/**/*.plist",
     "tests/**/*.py",
     "README.md",
     "pyproject.toml",
