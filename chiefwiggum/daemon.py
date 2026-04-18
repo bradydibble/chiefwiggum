@@ -29,15 +29,21 @@ from pathlib import Path
 from chiefwiggum.config import load_config_on_startup
 from chiefwiggum.coordination import (
     count_pending_intents,
+    enqueue_spawn_request,
     fetch_pending_cancel_requests,
     fetch_pending_spawn_requests,
     mark_cancel_request_consumed,
     mark_spawn_request_consumed,
     mark_stale_instances_crashed,
+    projects_needing_ralphs,
 )
 from chiefwiggum.database import init_db
 from chiefwiggum.paths import get_paths
-from chiefwiggum.spawner import spawn_ralph_with_task_claim, stop_ralph_daemon
+from chiefwiggum.spawner import (
+    cleanup_dead_ralphs,
+    spawn_ralph_with_task_claim,
+    stop_ralph_daemon,
+)
 
 logger = logging.getLogger("chiefwiggum.daemon")
 
@@ -51,6 +57,8 @@ class DaemonStats:
     spawns_executed: int = 0
     cancels_executed: int = 0
     stale_marked_crashed: int = 0
+    autospawned: int = 0
+    dead_ralphs_cleaned: int = 0
     last_tick_at: datetime | None = None
     last_error: str | None = None
 
@@ -118,6 +126,8 @@ def _remove_pid_file() -> None:
 
 async def _process_spawn_requests(stats: DaemonStats) -> None:
     """Consume pending spawn_requests and actually spawn the ralphs."""
+    import uuid
+
     from chiefwiggum.cli import generate_ralph_id  # local import: avoid cycle at import time
     from chiefwiggum.models import RalphConfig, TargetingConfig
 
@@ -149,7 +159,10 @@ async def _process_spawn_requests(stats: DaemonStats) -> None:
                     req["id"],
                 )
 
-        ralph_id = generate_ralph_id(Path(project).name)
+        # Append a short uuid suffix so respawns after a crash get a fresh
+        # ralph_id instead of colliding with the old "crashed" row.
+        suffix = uuid.uuid4().hex[:6]
+        ralph_id = f"{generate_ralph_id(Path(project).name)}-{suffix}"
         logger.info(
             "[DAEMON] Consuming spawn_request id=%s project=%s task_id=%s → ralph=%s",
             req["id"], project, req["task_id"], ralph_id,
@@ -204,16 +217,78 @@ async def _process_cancel_requests(stats: DaemonStats) -> None:
             await mark_cancel_request_consumed(req["id"], error=repr(e))
 
 
+async def _autospawn_for_unattended_projects(stats: DaemonStats) -> None:
+    """Kubernetes-style reconcile: for every project that has pending tasks
+    AND no active/idle ralph, enqueue a spawn_request so a fresh ralph picks
+    up the next task.
+
+    This is the glue that makes "1 task → 1 ralph → exit → next ralph" work
+    without in-process self-chaining. Each ralph is a single-task worker;
+    this loop is what keeps the queue draining.
+    """
+    projects = await projects_needing_ralphs()
+    if not projects:
+        return
+
+    for project in projects:
+        # Skip if we already enqueued a spawn for this project that's still
+        # pending — avoid spamming the queue on each tick while a previous
+        # spawn is still being consumed.
+        pending = await fetch_pending_spawn_requests(limit=50)
+        if any(r["project_path"] == project for r in pending):
+            continue
+
+        logger.info(
+            "[DAEMON] Autospawn: project=%s has pending tasks and no active ralph",
+            project,
+        )
+        # We don't know the fix_plan_path from the DB alone; fall back to the
+        # `~/claudecode/<project>/@fix_plan.md` convention that matches the
+        # TUI and wig spawn behavior.
+        fix_plan_path = str(Path.home() / "claudecode" / project / "@fix_plan.md")
+        if not Path(fix_plan_path).exists():
+            # Try the un-prefixed fallback
+            alt = str(Path.home() / "claudecode" / project / "fix_plan.md")
+            if Path(alt).exists():
+                fix_plan_path = alt
+
+        await enqueue_spawn_request(
+            project_path=project,
+            fix_plan_path=fix_plan_path,
+            priority=0,
+            requested_by="daemon-autospawn",
+        )
+        stats.autospawned += 1
+
+
 async def _tick(stats: DaemonStats) -> None:
     stats.ticks += 1
     stats.last_tick_at = datetime.now()
     try:
+        # 1. Reap dead/zombie ralph processes so stale PID files and
+        # "active" DB rows don't keep their claims locked up.
+        cleaned = cleanup_dead_ralphs()
+        if cleaned:
+            stats.dead_ralphs_cleaned += len(cleaned)
+            logger.info("[DAEMON] Cleaned %s dead ralph process(es): %s",
+                        len(cleaned), ", ".join(cleaned))
+
+        # 2. Heartbeat-based crash detection (for ralphs whose PID file
+        # was also lost).
         n = await mark_stale_instances_crashed()
         if n:
             stats.stale_marked_crashed += n
             logger.info("[DAEMON] Marked %s stale instance(s) crashed", n)
+
+        # 3. Autospawn BEFORE consuming the intent queue, so a crashed
+        # worker gets a fresh spawn_request enqueued and executed in the
+        # same tick instead of waiting another cycle.
+        await _autospawn_for_unattended_projects(stats)
+
+        # 4. Execute the intent queue (user CLI/TUI plus autospawn).
         await _process_spawn_requests(stats)
         await _process_cancel_requests(stats)
+
         stats.last_error = None
     except Exception as e:
         stats.last_error = repr(e)
@@ -376,6 +451,7 @@ async def daemon_status() -> dict[str, object]:
     """Return a dict describing daemon + queue state, safe to JSON-serialize."""
     running, pid = is_daemon_running()
     intents = await count_pending_intents()
+    unattended = await projects_needing_ralphs()
     return {
         "running": running,
         "pid": pid,
@@ -383,4 +459,5 @@ async def daemon_status() -> dict[str, object]:
         "log_file": str(_daemon_log_path()),
         "pending_spawn_requests": intents["spawn"],
         "pending_cancel_requests": intents["cancel"],
+        "projects_needing_ralphs": unattended,
     }

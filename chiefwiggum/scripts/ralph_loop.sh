@@ -39,7 +39,11 @@ CLAUDE_SESSION_FILE=".claude_session_id" # Session ID persistence file
 CLAUDE_MIN_VERSION="2.0.76"              # Minimum required Claude CLI version
 
 # Ralph Loop Alignment (Phase 3)
-SINGLE_TASK_MODE=false                   # If true, exit after completing one task (no auto-claim next)
+SINGLE_TASK_MODE=false                   # If true, the worker exits after its first task.
+                                         # Default: the worker (this script) is long-lived; when one
+                                         # task finishes we reset the Claude session (the "ralph
+                                         # loop") and claim the next task in the queue. Session
+                                         # reset is throwaway; the worker process is not.
 
 # Session management configuration (Phase 1.2)
 # Note: SESSION_EXPIRATION_SECONDS is defined in lib/response_analyzer.sh (86400 = 24 hours)
@@ -1889,21 +1893,24 @@ main() {
         if [[ "$exit_reason" != "" ]]; then
             log_status "SUCCESS" "🏁 Graceful exit triggered: $exit_reason"
 
-            # Release task claim (idempotent; claim_next_task_for_ralph also releases internally).
+            # Release the completed task's claim before deciding whether to
+            # chain: claim_next_task_for_ralph will re-release internally as
+            # well, but doing it here makes the status accurate during the
+            # brief window while we generate the next prompt.
             if [[ -n "$RALPH_ID" ]]; then
                 release_current_task "$RALPH_ID" || true
             fi
 
-            # Self-chain: before marking the ralph completed and exiting, try to claim the
-            # next pending task. Without this, hitting the graceful-exit path (e.g.
-            # "Multiple completion signals") leaves remaining tasks idle until a TUI/daemon
-            # spawns a replacement — and the TUI is often dead (laptop sleep, terminal close).
+            # Worker persistence: the Ralph WORKER (this process) is long-
+            # lived; the Claude session ("ralph loop") is throwaway. When the
+            # current task's session accumulates completion signals, we reset
+            # the session and claim the next task. The worker process stays
+            # alive across task boundaries. Use --single-task to opt out.
             if [[ "$SINGLE_TASK_MODE" != "true" && -n "$RALPH_ID" ]]; then
-                log_status "INFO" "📋 Checking for next task before project_complete exit..."
+                log_status "INFO" "📋 Task done. Worker checking queue for next task..."
                 local chain_claim_result
-                # Defensive `|| true`: if the helper ever regresses to a
-                # non-zero return, we still capture its JSON stdout instead of
-                # letting `set -e` kill the script at the assignment line.
+                # Defensive `|| true` in case the helper ever regresses to a
+                # non-zero return — we still want its JSON stdout.
                 chain_claim_result=$(claim_next_task_for_ralph "$RALPH_ID" || true)
                 local chain_claim_success
                 chain_claim_success=$(echo "$chain_claim_result" | jq -r '.success' 2>/dev/null)
@@ -1912,10 +1919,12 @@ main() {
 
                 if [[ "$chain_claim_success" == "true" && -n "$chain_new_task_id" && "$chain_new_task_id" != "null" ]]; then
                     if generate_task_prompt_for_file "$RALPH_ID" "$chain_new_task_id" "$PROMPT_FILE"; then
-                        log_status "SUCCESS" "🔄 Chaining to next task: $chain_new_task_id"
-                        reset_session "chain_next_task"
-                        # Reset exit signals so the next task starts fresh and doesn't
-                        # immediately re-trigger completion_signals from residual state.
+                        log_status "SUCCESS" "🔄 Worker picked up next task: $chain_new_task_id"
+                        # Kill the old Claude session; next iteration starts a
+                        # fresh one for the new task.
+                        reset_session "next_task_claimed"
+                        # Zero the exit signals so the new task starts with a
+                        # clean slate and doesn't immediately re-exit.
                         echo '{"test_only_loops": [], "done_signals": [], "completion_indicators": []}' > "$EXIT_SIGNALS_FILE"
                         continue
                     else
@@ -1923,14 +1932,14 @@ main() {
                         release_current_task "$RALPH_ID" || true
                     fi
                 else
-                    log_status "INFO" "🏁 No more tasks available; exiting as planned"
+                    log_status "INFO" "🏁 Queue empty; worker exiting."
                 fi
             fi
 
             reset_session "project_complete"
             update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "graceful_exit" "completed" "$exit_reason" '{"category":"none","count":0,"details":[]}' "null" "false" "null"
 
-            log_status "SUCCESS" "🎉 Ralph has completed the project! Final stats:"
+            log_status "SUCCESS" "🎉 Ralph worker finished. Final stats:"
             log_status "INFO" "  - Total loops: $loop_count"
             log_status "INFO" "  - API calls used: $(cat "$CALL_COUNT_FILE")"
             log_status "INFO" "  - Exit reason: $exit_reason"
@@ -2689,7 +2698,13 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         --single-task)
+            # Default; kept for backwards compatibility.
             SINGLE_TASK_MODE=true
+            shift
+            ;;
+        --multi-task)
+            # Escape hatch: old in-process chaining. Deprecated.
+            SINGLE_TASK_MODE=false
             shift
             ;;
         --session-expiry)

@@ -4047,6 +4047,50 @@ async def mark_cancel_request_consumed(
         await conn.close()
 
 
+async def projects_needing_ralphs() -> list[str]:
+    """Return project names where the user has asked for work, there IS
+    pending work, and no worker is currently handling it.
+
+    Semantics of the daemon's auto-respawn role:
+    - A worker (Ralph) is long-lived across tasks. It self-chains from one
+      task to the next by resetting its Claude session. So the autospawn
+      loop is NOT the primary task-progression mechanism — that's the
+      worker itself. This query exists to respawn a worker when it crashes
+      (OOM, bash error, laptop slept and something got wedged, etc.) while
+      there's still pending work on a project the user explicitly spawned
+      for.
+
+    Gate on `spawn_requests EXISTS` so that projects with pending tasks in
+    the DB from a previous life don't silently start working again at
+    daemon boot. Only projects the user has ever explicitly asked to run
+    are candidates.
+    """
+    conn = await get_connection()
+    try:
+        cursor = await conn.execute(
+            """
+            SELECT DISTINCT tc.project
+              FROM task_claims tc
+             WHERE tc.status = 'pending'
+               AND tc.project IS NOT NULL
+               AND tc.project != ''
+               AND EXISTS (
+                   SELECT 1 FROM spawn_requests sr
+                    WHERE sr.project_path = tc.project
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM ralph_instances ri
+                    WHERE ri.project = tc.project
+                      AND ri.status IN ('active', 'idle')
+               )
+            """
+        )
+        rows = await cursor.fetchall()
+        return [row[0] for row in rows if row[0]]
+    finally:
+        await conn.close()
+
+
 async def count_pending_intents() -> dict[str, int]:
     """Return {'spawn': N, 'cancel': M} counts of pending intents.
 
