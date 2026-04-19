@@ -37,6 +37,7 @@ from chiefwiggum.icons import (
     COLOR_MUTED,
     COLOR_SUCCESS,
     COLOR_WARNING,
+    ICON_DAEMON,
 )
 from chiefwiggum.models import (
     RalphInstanceStatus,
