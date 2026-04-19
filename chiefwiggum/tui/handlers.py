@@ -510,7 +510,12 @@ async def handle_spawn(key: str, state: TUIState) -> None:
                     f"Spawn requested (id={req_id}); daemon pid={daemon_pid} will execute on next tick"
                 )
             else:
-                ralph_id = generate_ralph_id(config.project[:8])
+                # Same uuid-suffix trick the daemon uses so a direct spawn
+                # doesn't reuse the ralph_id of a previously-crashed row
+                # (which would clobber its crash history via ON CONFLICT
+                # DO UPDATE and risk stepping on a stale PID file).
+                import uuid as _uuid
+                ralph_id = f"{generate_ralph_id(config.project[:8])}-{_uuid.uuid4().hex[:6]}"
                 success, message, task_id = await spawn_ralph_with_task_claim(
                     ralph_id=ralph_id,
                     project=config.project,
@@ -1145,7 +1150,10 @@ async def handle_command(key: str, state: TUIState) -> bool:
                 )
                 state.status_message = f"Quickstart: spawn requested (id={req_id}) for {project}"
             else:
-                ralph_id = generate_ralph_id(project[:8])
+                # uuid suffix so direct-spawn fallback doesn't collide with a
+                # prior crashed row (ON CONFLICT DO UPDATE would clobber it).
+                import uuid as _uuid
+                ralph_id = f"{generate_ralph_id(project[:8])}-{_uuid.uuid4().hex[:6]}"
                 success, message, task_id = await spawn_ralph_with_task_claim(
                     ralph_id=ralph_id,
                     project=project,

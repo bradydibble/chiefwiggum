@@ -1529,17 +1529,29 @@ def reap_zombie_ralph(ralph_id: str) -> bool:
             return False
 
     except ChildProcessError:
-        # Not our child - can't reap it
-        logger.warning(f"Cannot reap zombie {ralph_id} - not our child process")
+        # Not our child — we can't reap it, but we CAN stop treating it as
+        # an active ralph. Unlink the PID file so cleanup_dead_ralphs
+        # doesn't re-flag the same zombie on every subsequent daemon tick,
+        # and so new spawns with the same ralph_id don't look collision-y.
+        logger.warning(
+            f"Cannot reap zombie {ralph_id} (not our child) — removing its PID file instead"
+        )
+        pid_path = get_ralph_pid_path(ralph_id)
+        try:
+            pid_path.unlink()
+        except FileNotFoundError:
+            pass
 
-        # Still mark it as crashed in status (only if not already terminal)
         write_ralph_status_if_not_terminal(
             ralph_id,
             task_id=None,
             status="crashed",
-            message="Process is zombie (cannot reap - not our child)",
+            message="Process is zombie (not our child; PID file cleared)",
         )
-        return False
+        # Return True: from the caller's perspective we DID clean it up
+        # (the PID file is gone; the zombie will be reaped by init when
+        # its real parent exits). Returning False here made callers loop.
+        return True
 
     except Exception as e:
         logger.error(f"Error reaping zombie {ralph_id}: {e}")

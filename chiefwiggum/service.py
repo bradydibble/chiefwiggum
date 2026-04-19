@@ -62,11 +62,27 @@ def _read_plist_template() -> str:
 def _render_plist(chiefwiggum_bin: Path, state_dir: Path) -> str:
     template = _read_plist_template()
     home = Path.home()
-    # Give launchd a sane PATH; users often have homebrew or pyenv binaries
-    # outside /usr/bin. Prepend the binary's own directory so the chiefwiggum
-    # bin is always discoverable.
+    # Give launchd a sane PATH. launchd-spawned daemons don't inherit a
+    # login shell, so PATH defaults to a minimal /usr/bin:/bin. We build
+    # a superset that covers the places the daemon + its ralph workers
+    # actually need to find binaries (claude, node, npm, git, jq, python).
+    #
+    # The specific shim directories are preferred over system paths so
+    # that pyenv/nvm versions the user chose interactively match what
+    # the daemon runs — otherwise you get "works in terminal, fails in
+    # daemon" confusion.
+    import glob as _glob
+    nvm_bin_globs = sorted(
+        _glob.glob(str(home / ".nvm" / "versions" / "node" / "*" / "bin"))
+    )
+    # Latest nvm version last → wins in PATH ordering below (appears first).
+    nvm_bin_dirs = list(reversed(nvm_bin_globs))
+
     path_entries = [
         str(chiefwiggum_bin.parent),
+        *nvm_bin_dirs,
+        str(home / ".pyenv" / "shims"),
+        str(home / ".local" / "bin"),
         "/opt/homebrew/bin",
         "/usr/local/bin",
         "/usr/bin",

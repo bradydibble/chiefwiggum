@@ -95,6 +95,25 @@ def test_claim_and_complete_flow(runner, fix_plan_path):
     assert result.exit_code == 0
 
 
+def test_complete_exits_nonzero_when_task_not_claimed(runner, fix_plan_path):
+    """Regression: `wig complete` must exit 1 (not 0) when the task isn't
+    claimed by this Ralph — otherwise the worker's shell `$?` check thinks
+    completion succeeded and self-chains on a task that was never marked
+    done, corrupting queue state. Caused a real outage yesterday."""
+    # Sync tasks but DON'T claim — the complete call should fail.
+    runner.invoke(main, ["sync", str(fix_plan_path), "--project", "testproject"])
+
+    result = runner.invoke(
+        main,
+        ["complete", "some-fake-task-id", "--ralph-id", "nobody"],
+    )
+    assert result.exit_code != 0, (
+        "wig complete should return non-zero when task_id isn't claimed by "
+        f"the given ralph_id; output was:\n{result.output}"
+    )
+    assert "Failed to complete" in result.output
+
+
 def test_release_command(runner, fix_plan_path):
     # Sync and claim
     runner.invoke(main, ["sync", str(fix_plan_path), "--project", "testproject"])

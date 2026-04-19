@@ -1496,10 +1496,19 @@ EOF
                                         fi
 
                                         log_status "INFO" "📋 Checking for next task in queue..."
-                                        local next_claimed=$(claim_next_task_for_ralph "$RALPH_ID")
+                                        # claim_next_task_for_ralph echoes a JSON envelope; parse
+                                        # .success with jq. The old `== "true"` check compared
+                                        # against the raw JSON string and never matched, so this
+                                        # auto-recovery path always fell through to "queue empty".
+                                        local next_claimed=$(claim_next_task_for_ralph "$RALPH_ID" || true)
+                                        local next_success=$(echo "$next_claimed" | jq -r '.success' 2>/dev/null)
+                                        local next_task_from_json=$(echo "$next_claimed" | jq -r '.task_id' 2>/dev/null)
 
-                                        if [[ "$next_claimed" == "true" ]]; then
-                                            local new_task_id=$(get_current_task_id "$RALPH_ID")
+                                        if [[ "$next_success" == "true" ]]; then
+                                            local new_task_id="$next_task_from_json"
+                                            if [[ -z "$new_task_id" || "$new_task_id" == "null" ]]; then
+                                                new_task_id=$(get_current_task_id "$RALPH_ID")
+                                            fi
                                             local new_task_title=$(get_task_title "$new_task_id")
 
                                             if [[ -n "$new_task_id" ]]; then
@@ -1757,6 +1766,14 @@ main() {
     # Initialize exit signals ONCE per session (NOT per loop!)
     init_exit_signals_for_session
 
+    # Clear per-loop state files left over from any previous ralph that ran
+    # in this working directory. Without this, the first iteration's
+    # `should_exit_gracefully` check reads a stale `.response_analysis` and
+    # progress-analysis code reads a stale `.last_output_length`, which
+    # muddles the heuristics on what should be a clean first loop.
+    rm -f .response_analysis .json_parse_result .last_output_length .last_error_info
+    rm -f .response_analysis_*  # rolling window of prior loop analyses
+
     log_status "INFO" "Starting main loop..."
     log_status "INFO" "DEBUG: About to enter while loop, loop_count=$loop_count"
     
@@ -1797,9 +1814,13 @@ main() {
                     fi
 
                     log_status "INFO" "📋 Claiming next task..."
-                    local next_claimed=$(claim_next_task_for_ralph "$RALPH_ID")
+                    # claim_next_task_for_ralph echoes JSON; parse .success with jq
+                    # (old `== "true"` test compared to the raw JSON string and
+                    # never matched, so this safety path always "exited").
+                    local next_claimed=$(claim_next_task_for_ralph "$RALPH_ID" || true)
+                    local next_success=$(echo "$next_claimed" | jq -r '.success' 2>/dev/null)
 
-                    if [[ "$next_claimed" == "true" ]]; then
+                    if [[ "$next_success" == "true" ]]; then
                         log_status "SUCCESS" "✅ Claimed next available task"
                         continue
                     else

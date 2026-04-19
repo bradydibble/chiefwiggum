@@ -284,6 +284,11 @@ def complete(task_id: str, ralph_id: str, message: str | None, commit: str | Non
     else:
         console.print(f"[red]Failed to complete:[/red] {task_id}")
         console.print("[dim]Task may not be claimed by this Ralph or is not in_progress[/dim]")
+        # Exit non-zero so ralph_loop's `wig complete` shell check sees the
+        # failure and does NOT proceed to self-chain on a task that wasn't
+        # actually marked complete. Without this, the worker logs
+        # "✅ marked complete" and forges ahead into incorrect chaining.
+        raise SystemExit(1)
 
 
 @main.command("mark-complete")

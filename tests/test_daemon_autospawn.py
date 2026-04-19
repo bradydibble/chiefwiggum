@@ -226,6 +226,41 @@ class TestRespawnOnCrash:
             assert spawned[0] != spawned[1], "W2 must be a fresh ralph_id"
 
 
+class TestAutospawnTTL:
+    """Regression guard: a `wig spawn` that ran a long time ago should NOT
+    keep re-triggering autospawns forever. We gate on requested_at within
+    the last N days (AUTOSPAWN_REQUEST_TTL_DAYS, currently 7). Without
+    this TTL, a user who ran `wig spawn` a month ago and forgot about it
+    would come back to surprise billable work."""
+
+    @pytest.mark.asyncio
+    async def test_stale_spawn_request_does_not_trigger_autospawn(self):
+        from chiefwiggum.coordination import AUTOSPAWN_REQUEST_TTL_DAYS
+        from chiefwiggum.database import get_connection
+
+        await _seed_pending_tasks(1)
+        # Manually insert a spawn_request older than the TTL.
+        conn = await get_connection()
+        try:
+            days_ago = AUTOSPAWN_REQUEST_TTL_DAYS + 3
+            await conn.execute(
+                f"""INSERT INTO spawn_requests
+                     (project_path, requested_by, requested_at, consumed_at)
+                   VALUES ('demo', 'cli',
+                           datetime('now', '-{days_ago} days'),
+                           datetime('now', '-{days_ago} days'))"""
+            )
+            await conn.commit()
+        finally:
+            await conn.close()
+
+        candidates = await projects_needing_ralphs()
+        assert "demo" not in candidates, (
+            "autospawn picked up a project whose only spawn_request is older "
+            "than the TTL — this is the 'month-old wig spawn surprise-restart' bug"
+        )
+
+
 class TestAutospawnDoesNotRunawayUnrequestedProjects:
     """Regression guard: a project with pending tasks in the DB from a
     previous session should NOT get auto-spawned if the user hasn't done

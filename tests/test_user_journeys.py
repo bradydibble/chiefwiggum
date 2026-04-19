@@ -567,7 +567,10 @@ class TestSpawnWorkflowJourney:
             # Verify spawn_ralph_with_task_claim was called (handles registration internally)
             mock_spawn.assert_called_once()
             call_kwargs = mock_spawn.call_args.kwargs
-            assert call_kwargs["ralph_id"] == "test-ralph-123"
+            # TUI fallback now appends a short uuid suffix to the base
+            # ralph_id so it doesn't collide with a prior crashed row.
+            assert call_kwargs["ralph_id"].startswith("test-ralph-123-")
+            assert len(call_kwargs["ralph_id"]) > len("test-ralph-123-")
             assert call_kwargs["project"] == "testproject"
 
         loop.close()

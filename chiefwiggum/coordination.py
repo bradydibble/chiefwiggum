@@ -4047,9 +4047,12 @@ async def mark_cancel_request_consumed(
         await conn.close()
 
 
+AUTOSPAWN_REQUEST_TTL_DAYS = 7
+
+
 async def projects_needing_ralphs() -> list[str]:
-    """Return project names where the user has asked for work, there IS
-    pending work, and no worker is currently handling it.
+    """Return project names where the user has recently asked for work,
+    there IS pending work, and no worker is currently handling it.
 
     Semantics of the daemon's auto-respawn role:
     - A worker (Ralph) is long-lived across tasks. It self-chains from one
@@ -4060,15 +4063,19 @@ async def projects_needing_ralphs() -> list[str]:
       there's still pending work on a project the user explicitly spawned
       for.
 
-    Gate on `spawn_requests EXISTS` so that projects with pending tasks in
-    the DB from a previous life don't silently start working again at
-    daemon boot. Only projects the user has ever explicitly asked to run
-    are candidates.
+    Guards:
+    - `spawn_requests EXISTS` — don't silently start work at daemon boot
+      on a project with stale pending tasks that the user never asked to
+      run in this session.
+    - `requested_at > now - AUTOSPAWN_REQUEST_TTL_DAYS` — after a week of
+      no user action, let the intent expire. A user who ran `wig spawn` a
+      month ago and forgot about it should not come back to a surprise
+      autorun. The user can always re-issue `wig spawn` to renew.
     """
     conn = await get_connection()
     try:
         cursor = await conn.execute(
-            """
+            f"""
             SELECT DISTINCT tc.project
               FROM task_claims tc
              WHERE tc.status = 'pending'
@@ -4077,6 +4084,8 @@ async def projects_needing_ralphs() -> list[str]:
                AND EXISTS (
                    SELECT 1 FROM spawn_requests sr
                     WHERE sr.project_path = tc.project
+                      AND sr.requested_at >=
+                            datetime('now', '-{AUTOSPAWN_REQUEST_TTL_DAYS} days')
                )
                AND NOT EXISTS (
                    SELECT 1 FROM ralph_instances ri
