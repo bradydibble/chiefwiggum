@@ -1326,11 +1326,18 @@ EOF
                     complete_cmd="$complete_cmd --commit \"$completed_commit_sha\""
                 fi
 
-                # Call wig complete to record in database
+                # Call wig complete to record in database.
+                #
+                # CRITICAL: capture both stdout and exit code WITHOUT tripping
+                # `set -e`. The naive `output=$(...); status=$?` pattern dies
+                # at the assignment line when the subshell exits non-zero —
+                # the exact bug that killed workers tian-7498d6 and tian-600616
+                # on 2026-04-18. See the sister fix for claim_next_task_for_ralph
+                # in commit 9912e3a.
                 log_status "INFO" "📤 Reporting task completion to ChiefWiggum..."
-                local complete_output
-                complete_output=$(eval "$complete_cmd" 2>&1)
-                local complete_status=$?
+                local complete_output=""
+                local complete_status=0
+                complete_output=$(eval "$complete_cmd" 2>&1) || complete_status=$?
 
                 if [[ $complete_status -eq 0 ]]; then
                     log_status "SUCCESS" "✅ Task $completed_task_id marked complete in database"
@@ -2297,10 +2304,12 @@ claim_next_task_for_ralph() {
     for claim_attempt in $(seq 1 $max_claim_attempts); do
         log_status "DEBUG" "Claim attempt $claim_attempt/$max_claim_attempts for Ralph $ralph_id"
 
-        # Capture both stdout and stderr
-        local claim_output
-        claim_output=$(wig claim "$ralph_id" 2>&1)
-        local claim_status=$?
+        # Capture both stdout and stderr. The `|| claim_status=$?` dance
+        # lets us capture the exit code without tripping `set -e` when wig
+        # exits non-zero (would otherwise kill the entire worker).
+        local claim_output=""
+        local claim_status=0
+        claim_output=$(wig claim "$ralph_id" 2>&1) || claim_status=$?
 
         if [[ $claim_status -eq 0 ]]; then
             log_status "DEBUG" "Claim succeeded, verifying task assignment..."

@@ -399,6 +399,14 @@ analyze_response() {
         # Parse structured output
         local status=$(grep "STATUS:" "$output_file" | cut -d: -f2 | xargs)
         local exit_sig=$(grep "EXIT_SIGNAL:" "$output_file" | cut -d: -f2 | xargs)
+        # IMPORTANT: also extract TASK_ID and COMMIT from the block. Without
+        # this the downstream `wig complete` call gets no task id from
+        # RALPH_STATUS, and section 1c falls back to scraping the commit
+        # message for `task-N` — which loses the full stable id like
+        # `task-52-verification-steps`. That short id doesn't exist in the DB,
+        # so `wig complete task-52` fails and used to crash the worker.
+        local ralph_status_task_id=$(grep "TASK_ID:" "$output_file" | head -1 | sed 's/.*TASK_ID:\s*//' | tr -d '[:space:]')
+        local ralph_status_commit=$(grep "^[[:space:]]*COMMIT:" "$output_file" | head -1 | sed 's/.*COMMIT:\s*//' | tr -d '[:space:]')
 
         # If EXIT_SIGNAL is explicitly provided, respect it
         if [[ -n "$exit_sig" ]]; then
@@ -416,6 +424,16 @@ analyze_response() {
             has_completion_signal=true
             exit_signal=true
             confidence_score=100
+        fi
+
+        # Propagate the task_id / commit into the outer analysis result so
+        # ralph_loop can call `wig complete $task_id --commit $sha` with the
+        # real stable id Claude reported.
+        if [[ -n "$ralph_status_task_id" && "$ralph_status_task_id" != "null" ]]; then
+            completed_task_id="$ralph_status_task_id"
+            if [[ -n "$ralph_status_commit" && "$ralph_status_commit" != "null" ]]; then
+                completed_commit_sha="$ralph_status_commit"
+            fi
         fi
     # 1b. Legacy fallback: check for TASK_COMPLETE marker (backwards compatibility)
     elif grep -q "TASK_COMPLETE:" "$output_file"; then
