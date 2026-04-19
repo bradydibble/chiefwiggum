@@ -28,16 +28,26 @@ from pathlib import Path
 
 from chiefwiggum.config import load_config_on_startup
 from chiefwiggum.coordination import (
+    complete_task,
     count_pending_intents,
     enqueue_spawn_request,
+    fail_task,
     fetch_pending_cancel_requests,
     fetch_pending_spawn_requests,
     mark_cancel_request_consumed,
     mark_spawn_request_consumed,
     mark_stale_instances_crashed,
     projects_needing_ralphs,
+    release_claim,
+    shutdown_instance,
 )
 from chiefwiggum.database import init_db
+from chiefwiggum.outcome import (
+    WorkerExitStatus,
+    consume_outcome,
+    list_pending_outcomes,
+    read_outcome,
+)
 from chiefwiggum.paths import get_paths
 from chiefwiggum.spawner import (
     cleanup_dead_ralphs,
@@ -59,6 +69,10 @@ class DaemonStats:
     stale_marked_crashed: int = 0
     autospawned: int = 0
     dead_ralphs_cleaned: int = 0
+    outcomes_consumed: int = 0
+    completions_recorded: int = 0
+    failures_recorded: int = 0
+    releases_recorded: int = 0
     last_tick_at: datetime | None = None
     last_error: str | None = None
 
@@ -261,6 +275,81 @@ async def _autospawn_for_unattended_projects(stats: DaemonStats) -> None:
         stats.autospawned += 1
 
 
+async def _process_worker_outcomes(stats: DaemonStats) -> None:
+    """Consume outcome.json files that workers have written on exit.
+
+    This replaces the old worker-initiated `wig complete` / `wig release`
+    shell calls. The worker writes an outcome file; we apply the
+    corresponding DB transition here — idempotently, with proper error
+    handling — and delete the file.
+
+    Failure semantics: any exception while processing a single outcome
+    logs and still consumes the file (otherwise a corrupt outcome would
+    jam the reconcile loop indefinitely). The worker instance is
+    shutdown_instance'd regardless so stale "active" rows don't linger.
+    """
+    outcomes = list_pending_outcomes()
+    if not outcomes:
+        return
+
+    for path in outcomes:
+        oc = read_outcome(path)
+        if oc is None:
+            logger.warning("[DAEMON] dropping unreadable outcome file: %s", path)
+            consume_outcome(path)
+            continue
+
+        logger.info(
+            "[DAEMON] Consuming outcome ralph=%s status=%s task=%s",
+            oc.ralph_id, oc.status.value, oc.task_id,
+        )
+        try:
+            if oc.status is WorkerExitStatus.SUCCESS and oc.task_id:
+                ok = await complete_task(
+                    oc.ralph_id,
+                    oc.task_id,
+                    commit_sha=oc.commit_sha,
+                    message=f"Completed by worker {oc.ralph_id}",
+                )
+                if ok:
+                    stats.completions_recorded += 1
+                else:
+                    # Ownership mismatch or task not found — record as a
+                    # release so the task isn't wedged.
+                    logger.warning(
+                        "[DAEMON] complete_task rejected for ralph=%s task=%s; releasing",
+                        oc.ralph_id, oc.task_id,
+                    )
+                    await release_claim(oc.ralph_id, oc.task_id, reason="daemon-complete-rejected")
+                    stats.releases_recorded += 1
+            elif oc.status is WorkerExitStatus.FAILED and oc.task_id:
+                await fail_task(
+                    oc.ralph_id,
+                    oc.task_id,
+                    error_message=oc.error_message or "worker reported FAILED",
+                )
+                stats.failures_recorded += 1
+            else:
+                # Anything else (NO_TASK / TIMEOUT / CIRCUIT_OPEN / ABORTED
+                # / CRASHED) — release any claim the worker held so the
+                # task is eligible for a fresh worker.
+                if oc.task_id:
+                    await release_claim(oc.ralph_id, oc.task_id, reason=oc.status.value)
+                    stats.releases_recorded += 1
+
+            # Always retire the ralph_instances row — the worker process
+            # has exited by the time it wrote this outcome.
+            try:
+                await shutdown_instance(oc.ralph_id)
+            except Exception:
+                logger.exception("[DAEMON] shutdown_instance failed for %s", oc.ralph_id)
+        except Exception:
+            logger.exception("[DAEMON] error processing outcome %s", path)
+        finally:
+            consume_outcome(path)
+            stats.outcomes_consumed += 1
+
+
 async def _tick(stats: DaemonStats) -> None:
     stats.ticks += 1
     stats.last_tick_at = datetime.now()
@@ -280,12 +369,18 @@ async def _tick(stats: DaemonStats) -> None:
             stats.stale_marked_crashed += n
             logger.info("[DAEMON] Marked %s stale instance(s) crashed", n)
 
-        # 3. Autospawn BEFORE consuming the intent queue, so a crashed
+        # 3. Consume worker outcome files BEFORE autospawn so completed
+        # tasks are cleared out of the pending pool first — prevents the
+        # autospawn from spawning a replacement worker onto a task that
+        # was just completed but whose row hasn't been updated yet.
+        await _process_worker_outcomes(stats)
+
+        # 4. Autospawn BEFORE consuming the intent queue, so a crashed
         # worker gets a fresh spawn_request enqueued and executed in the
         # same tick instead of waiting another cycle.
         await _autospawn_for_unattended_projects(stats)
 
-        # 4. Execute the intent queue (user CLI/TUI plus autospawn).
+        # 5. Execute the intent queue (user CLI/TUI plus autospawn).
         await _process_spawn_requests(stats)
         await _process_cancel_requests(stats)
 

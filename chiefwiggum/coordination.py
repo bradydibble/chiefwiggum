@@ -313,7 +313,13 @@ async def complete_task(
     commit_sha: str | None = None,
     message: str | None = None
 ) -> bool:
-    """Mark a task as completed.
+    """Mark a task as completed. Idempotent.
+
+    If the task is already in a terminal state (completed / failed), this
+    is treated as a no-op success — the caller's intent is achieved.
+    Idempotence matters because the daemon may retry on restart / partial
+    failure, and the old 'AND status=in_progress' gate caused retries to
+    return False and cascade into incorrect "task not claimed" errors.
 
     Args:
         ralph_id: ID of the Ralph instance
@@ -322,19 +328,43 @@ async def complete_task(
         message: Optional completion message
 
     Returns:
-        True if task was marked complete, False if not found or not owned
+        True if the task ended up in 'completed' state (whether this call
+        moved it there or it was already there). False only if the task is
+        not found or is owned by a different Ralph.
     """
     conn = await get_connection()
     try:
         now = datetime.now()
 
-        # Get started_at before updating for history recording
+        # Get started_at before updating for history recording, and check
+        # ownership + current status for idempotence decisions.
         cursor = await conn.execute(
-            "SELECT started_at FROM task_claims WHERE task_id = ? AND claimed_by_ralph_id = ?",
-            (task_id, ralph_id)
+            """SELECT started_at, status, claimed_by_ralph_id
+                 FROM task_claims WHERE task_id = ?""",
+            (task_id,),
         )
         row = await cursor.fetchone()
-        started_at = row[0] if row else None
+        if row is None:
+            logger.warning("complete_task: task_id=%s not found", task_id)
+            return False
+
+        started_at, current_status, current_owner = row[0], row[1], row[2]
+
+        # Idempotence: already completed → treat as success.
+        if current_status == TaskClaimStatus.COMPLETED.value:
+            logger.info(
+                "complete_task: task_id=%s already completed (by %s); returning success",
+                task_id, current_owner,
+            )
+            return True
+
+        # Wrong owner. Don't silently succeed — return False and log.
+        if current_owner and current_owner != ralph_id:
+            logger.warning(
+                "complete_task: task_id=%s is owned by %s, not %s",
+                task_id, current_owner, ralph_id,
+            )
+            return False
 
         cursor = await conn.execute(
             """UPDATE task_claims
@@ -344,8 +374,7 @@ async def complete_task(
                    completed_at = ?,
                    updated_at = ?
                WHERE task_id = ?
-                 AND claimed_by_ralph_id = ?
-                 AND status = 'in_progress'""",
+                 AND claimed_by_ralph_id = ?""",
             (TaskClaimStatus.COMPLETED.value, message, commit_sha, now, now, task_id, ralph_id)
         )
 

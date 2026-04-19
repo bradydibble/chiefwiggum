@@ -38,12 +38,19 @@ CLAUDE_USE_CONTINUE=true                 # Enable session continuity
 CLAUDE_SESSION_FILE=".claude_session_id" # Session ID persistence file
 CLAUDE_MIN_VERSION="2.0.76"              # Minimum required Claude CLI version
 
-# Ralph Loop Alignment (Phase 3)
-SINGLE_TASK_MODE=false                   # If true, the worker exits after its first task.
-                                         # Default: the worker (this script) is long-lived; when one
-                                         # task finishes we reset the Claude session (the "ralph
-                                         # loop") and claim the next task in the queue. Session
-                                         # reset is throwaway; the worker process is not.
+# Worker architecture (2026-04-19):
+# One worker = one task = one process. The worker writes a single
+# outcome.json on exit (via `python3 -m chiefwiggum.outcome_cli`) and
+# the chiefwiggum daemon reads it and performs the idempotent DB
+# transition. No more `wig complete` / `wig claim` shell calls inside
+# the worker; no more in-process self-chaining. When this process
+# exits, the daemon spawns a fresh worker for the next pending task.
+SINGLE_TASK_MODE=true                    # Kept for compatibility; the new model is always
+                                         # single-task-per-process regardless of this flag.
+OUTCOME_WRITTEN=false                    # Set by the code path that writes an outcome.json;
+                                         # crash/signal handlers check this to avoid duplicate
+                                         # writes and to emit a 'crashed' outcome if nothing else
+                                         # wrote one.
 
 # Session management configuration (Phase 1.2)
 # Note: SESSION_EXPIRATION_SECONDS is defined in lib/response_analyzer.sh (86400 = 24 hours)
@@ -1312,7 +1319,10 @@ EOF
         # Log analysis summary
         log_analysis_summary
 
-        # Check for task completion and report to ChiefWiggum
+        # Check for task completion and write the worker's outcome file.
+        # The daemon consumes outcome.json on its next tick and performs the
+        # idempotent state transition (complete_task) in Python — no more
+        # shell `wig complete` + `$(...)` + set -e landmine dance.
         if [[ -f ".response_analysis" && -n "$RALPH_ID" ]]; then
             local completed_task_id=$(jq -r '.analysis.completed_task_id // ""' .response_analysis 2>/dev/null)
             local completed_commit_sha=$(jq -r '.analysis.completed_commit_sha // ""' .response_analysis 2>/dev/null)
@@ -1320,246 +1330,37 @@ EOF
             if [[ -n "$completed_task_id" && "$completed_task_id" != "null" ]]; then
                 log_status "INFO" "📋 Task completion detected: $completed_task_id"
 
-                # Build completion command
-                local complete_cmd="wig complete \"$completed_task_id\" --ralph-id \"$RALPH_ID\""
-                if [[ -n "$completed_commit_sha" && "$completed_commit_sha" != "null" ]]; then
-                    complete_cmd="$complete_cmd --commit \"$completed_commit_sha\""
-                fi
+                # Write the outcome file. outcome_cli never exits non-zero
+                # (even on internal failure) so `set -e` can't kill us here.
+                log_status "INFO" "📤 Writing outcome.json for ChiefWiggum daemon..."
+                OUTCOME_WRITTEN=true
+                python3 -m chiefwiggum.outcome_cli \
+                    --ralph-id "$RALPH_ID" \
+                    --status success \
+                    --task-id "$completed_task_id" \
+                    --commit "$completed_commit_sha" \
+                    --loops-run "$loop_count" \
+                    --log-path "$LOG_DIR/ralph.log" >/dev/null || true
 
-                # Call wig complete to record in database.
-                #
-                # CRITICAL: capture both stdout and exit code WITHOUT tripping
-                # `set -e`. The naive `output=$(...); status=$?` pattern dies
-                # at the assignment line when the subshell exits non-zero —
-                # the exact bug that killed workers tian-7498d6 and tian-600616
-                # on 2026-04-18. See the sister fix for claim_next_task_for_ralph
-                # in commit 9912e3a.
-                log_status "INFO" "📤 Reporting task completion to ChiefWiggum..."
-                local complete_output=""
-                local complete_status=0
-                complete_output=$(eval "$complete_cmd" 2>&1) || complete_status=$?
+                log_status "SUCCESS" "✅ Task $completed_task_id outcome recorded; worker exiting."
+                reset_session "task_complete"
+                update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "task_complete" "completed" "task_done" '{"category":"none","count":0,"details":[]}' "null" "false" "null"
 
-                if [[ $complete_status -eq 0 ]]; then
-                    log_status "SUCCESS" "✅ Task $completed_task_id marked complete in database"
-                    log_status "DEBUG" "Complete command output: $complete_output"
+                # Single-task worker: exit cleanly so the daemon spawns a
+                # fresh worker for the next pending task.
+                return 6
 
-                    # TASK CONTINUATION: Attempt to claim next task from queue (unless single-task mode)
-                    if [[ "$SINGLE_TASK_MODE" == "true" ]]; then
-                        log_status "INFO" "🎯 Single-task mode: Exiting after task completion (no auto-claim)"
-                        reset_session "single_task_complete"
-                        update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "single_task_complete" "completed" "task_done" '{"category":"none","count":0,"details":[]}' "null" "false" "null"
-                        return 6
-                    fi
-
-                    log_status "INFO" "📋 Checking for next task in queue..."
-
-                    local claim_result
-                    claim_result=$(claim_next_task_for_ralph "$RALPH_ID")
-                    local claim_success=$(echo "$claim_result" | jq -r '.success')
-                    local queue_empty=$(echo "$claim_result" | jq -r '.queue_empty')
-
-                    if [[ "$claim_success" == "true" ]]; then
-                        # Successfully claimed next task
-                        local new_task_id=$(echo "$claim_result" | jq -r '.task_id')
-
-                        # CHECKPOINT 1: Validate task ID from JSON response
-                        log_status "INFO" "🔍 CHECKPOINT 1: Validating claimed task ID: $new_task_id"
-                        if ! validate_task_id "$new_task_id"; then
-                            log_status "ERROR" "❌ CHECKPOINT 1 FAILED: Invalid task ID after claim"
-                            log_status "ERROR" "Releasing claim and exiting..."
-                            release_current_task "$RALPH_ID" || true
-                            reset_session "invalid_task_after_claim"
-                            return 5
-                        fi
-                        log_status "SUCCESS" "✅ CHECKPOINT 1 PASSED: Task ID is valid"
-
-                        # CHECKPOINT 2: Get task info with retry to handle DB sync delays
-                        log_status "INFO" "🔍 CHECKPOINT 2: Retrieving task info with retry logic"
-                        local task_info
-                        task_info=$(get_task_info_with_retry "$RALPH_ID")
-                        local task_info_success=$(echo "$task_info" | jq -r '.success')
-
-                        if [[ "$task_info_success" != "true" ]]; then
-                            log_status "ERROR" "❌ CHECKPOINT 2 FAILED: Could not retrieve task info after retries"
-                            log_status "ERROR" "Releasing claim and exiting..."
-                            release_current_task "$RALPH_ID" || true
-                            reset_session "task_info_retrieval_failed"
-                            return 5
-                        fi
-
-                        local new_task_title=$(echo "$task_info" | jq -r '.title')
-                        log_status "SUCCESS" "✅ CHECKPOINT 2 PASSED: Retrieved task info"
-                        log_status "SUCCESS" "📋 Claimed next task from queue: $new_task_id - $new_task_title"
-
-                        # CHECKPOINT 3: Generate prompt with validation
-                        log_status "INFO" "🔍 CHECKPOINT 3: Generating task prompt"
-                        log_status "INFO" "📝 Generating prompt for new task..."
-                        if generate_task_prompt_for_file "$RALPH_ID" "$new_task_id" "$PROMPT_FILE"; then
-                            log_status "SUCCESS" "✅ CHECKPOINT 3 PASSED: Prompt generated successfully"
-                            log_status "SUCCESS" "✅ Prompt generated for task $new_task_id"
-
-                            # Reset session state for new task (clear context from previous task)
-                            reset_session "new_task_claimed"
-
-                            # Reset exit signals for the new task
-                            echo '{"test_only_loops": [], "done_signals": [], "completion_indicators": []}' > "$EXIT_SIGNALS_FILE"
-
-                            log_status "INFO" "🔄 Continuing loop with next task..."
-                            # Return special code to signal main loop to continue with new task
-                            return 4
-                        else
-                            log_status "ERROR" "❌ CHECKPOINT 3 FAILED: Prompt generation failed"
-                            log_status "ERROR" "Releasing claim and exiting..."
-                            release_current_task "$RALPH_ID" || true
-                            reset_session "prompt_generation_failed"
-                            # Return special code to signal main loop to exit
-                            return 5
-                        fi
-                    elif [[ "$queue_empty" == "true" ]]; then
-                        # No more tasks in queue
-                        log_status "SUCCESS" "🎉 Queue empty - all tasks complete!"
-                        reset_session "queue_complete"
-                        update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "queue_complete" "completed" "all_tasks_done" '{"category":"none","count":0,"details":[]}' "null" "false" "null"
-                        # Return special code to signal main loop to exit gracefully
-                        return 6
-                    else
-                        # Claim failed for other reasons
-                        local claim_reason=$(echo "$claim_result" | jq -r '.reason')
-                        log_status "ERROR" "❌ Failed to claim next task: $claim_reason"
-                        reset_session "claim_failed"
-                        return 5
-                    fi
-                else
-                    log_status "WARN" "⚠️ Failed to mark task complete (may already be completed or claimed by another)"
-                fi
             fi
         fi
 
-        # AUTO-RECOVERY: Detect task completion from git commit if RALPH_STATUS was missed
-        # This handles cases where Claude completes work and commits, but forgets to output RALPH_STATUS block
-        if [[ -f ".response_analysis" && -n "$RALPH_ID" ]]; then
-            local completed_task_id=$(jq -r '.analysis.completed_task_id // ""' .response_analysis 2>/dev/null)
-
-            # Only attempt auto-recovery if no explicit completion was detected
-            if [[ -z "$completed_task_id" || "$completed_task_id" == "null" ]]; then
-                # Check if we have a recent commit (within last 5 minutes)
-                if command -v git &>/dev/null && git rev-parse --git-dir >/dev/null 2>&1; then
-                    local last_commit_sha=$(git log -1 --pretty=%H 2>/dev/null)
-                    local last_commit_msg=$(git log -1 --pretty=%B 2>/dev/null)
-                    local commit_age_seconds=$(git log -1 --pretty=%ct 2>/dev/null)
-                    local current_time=$(date +%s 2>/dev/null || echo "0")
-
-                    if [[ -n "$commit_age_seconds" && "$commit_age_seconds" =~ ^[0-9]+$ && "$current_time" =~ ^[0-9]+$ ]]; then
-                        local age_minutes=$(( (current_time - commit_age_seconds) / 60 ))
-
-                        # Only auto-recover for very recent commits (within 5 minutes)
-                        if [[ $age_minutes -le 5 ]]; then
-                            local auto_task_id=""
-                            local pattern_matched=""
-
-                            # Try to extract task ID from commit message using multiple patterns
-                            # Pattern 1: Task-N, Task #N, task-N (with optional - or # and space)
-                            if [[ "$last_commit_msg" =~ [Tt]ask-([0-9]+) ]] || [[ "$last_commit_msg" =~ [Tt]ask\ \#([0-9]+) ]] || [[ "$last_commit_msg" =~ [Tt]ask\ ([0-9]+) ]]; then
-                                auto_task_id="task-${BASH_REMATCH[1]}"
-                                pattern_matched="Task-N pattern"
-                            # Pattern 2: Issue N, Issue-N
-                            elif [[ "$last_commit_msg" =~ [Ii]ssue-([0-9]+) ]] || [[ "$last_commit_msg" =~ [Ii]ssue\ ([0-9]+) ]]; then
-                                auto_task_id="issue-${BASH_REMATCH[1]}"
-                                pattern_matched="Issue-N pattern"
-                            # Pattern 3: (T0.1), (T1.2) - Tier notation
-                            elif [[ "$last_commit_msg" =~ \(T([0-9]+)\.([0-9]+)\) ]]; then
-                                auto_task_id="T${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"
-                                pattern_matched="Tier notation"
-                            fi
-
-                            # If we extracted a task ID, verify it matches the current task and auto-complete
-                            if [[ -n "$auto_task_id" ]]; then
-                                # Get the current task ID this Ralph is working on
-                                local current_task_id=$(get_current_task_id "$RALPH_ID" 2>/dev/null)
-
-                                # Only auto-complete if the extracted task matches what Ralph is working on
-                                # This prevents accidentally completing the wrong task
-                                if [[ -n "$current_task_id" && "$auto_task_id" == "$current_task_id" ]]; then
-                                    log_status "INFO" "🔧 AUTO-RECOVERY: Detected completion from commit without RALPH_STATUS block"
-                                    log_status "INFO" "   Task ID: $auto_task_id (matched via $pattern_matched)"
-                                    log_status "INFO" "   Commit: ${last_commit_sha:0:7} - \"${last_commit_msg:0:60}...\""
-                                    log_status "INFO" "   Age: ${age_minutes}m ago"
-
-                                    # Build completion command
-                                    local auto_complete_cmd="wig complete \"$auto_task_id\" --ralph-id \"$RALPH_ID\" --commit \"$last_commit_sha\" --message \"Auto-recovered from commit (no RALPH_STATUS block)\""
-
-                                    # Attempt to mark task complete
-                                    log_status "INFO" "📤 Auto-reporting task completion to ChiefWiggum..."
-                                    if eval "$auto_complete_cmd" 2>&1; then
-                                        log_status "SUCCESS" "✅ AUTO-RECOVERY: Task $auto_task_id marked complete"
-                                        log_status "INFO" "   Note: Claude forgot to output RALPH_STATUS block but work was done"
-
-                                        # TASK CONTINUATION: Attempt to claim next task (unless single-task mode)
-                                        if [[ "$SINGLE_TASK_MODE" == "true" ]]; then
-                                            log_status "INFO" "🎯 Single-task mode: Exiting after task completion (no auto-claim)"
-                                            reset_session "single_task_complete"
-                                            update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "single_task_complete" "completed" "task_done" '{"category":"none","count":0,"details":[]}' "null" "false" "null"
-                                            return 6
-                                        fi
-
-                                        log_status "INFO" "📋 Checking for next task in queue..."
-                                        # claim_next_task_for_ralph echoes a JSON envelope; parse
-                                        # .success with jq. The old `== "true"` check compared
-                                        # against the raw JSON string and never matched, so this
-                                        # auto-recovery path always fell through to "queue empty".
-                                        local next_claimed=$(claim_next_task_for_ralph "$RALPH_ID" || true)
-                                        local next_success=$(echo "$next_claimed" | jq -r '.success' 2>/dev/null)
-                                        local next_task_from_json=$(echo "$next_claimed" | jq -r '.task_id' 2>/dev/null)
-
-                                        if [[ "$next_success" == "true" ]]; then
-                                            local new_task_id="$next_task_from_json"
-                                            if [[ -z "$new_task_id" || "$new_task_id" == "null" ]]; then
-                                                new_task_id=$(get_current_task_id "$RALPH_ID")
-                                            fi
-                                            local new_task_title=$(get_task_title "$new_task_id")
-
-                                            if [[ -n "$new_task_id" ]]; then
-                                                log_status "SUCCESS" "📋 Claimed next task: $new_task_id - $new_task_title"
-
-                                                # Generate new prompt for the next task
-                                                if generate_task_prompt_for_file "$RALPH_ID" "$new_task_id" "$PROMPT_FILE"; then
-                                                    log_status "INFO" "📝 Generated prompt for new task"
-
-                                                    # Reset exit signals for new task
-                                                    echo '{"test_only_loops": [], "done_signals": [], "completion_indicators": []}' > "$EXIT_SIGNALS_FILE"
-
-                                                    log_status "INFO" "🔄 Continuing loop with next task..."
-                                                    # Signal main loop to continue with new task
-                                                    return 4
-                                                else
-                                                    log_status "ERROR" "❌ Failed to generate prompt for new task, exiting..."
-                                                    reset_session "prompt_generation_failed"
-                                                    return 5
-                                                fi
-                                            fi
-                                        else
-                                            # No more tasks
-                                            log_status "SUCCESS" "🎉 Queue empty - all tasks complete!"
-                                            reset_session "queue_complete"
-                                            update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "queue_complete" "completed" "all_tasks_done" '{"category":"none","count":0,"details":[]}' "null" "false" "null"
-                                            return 6
-                                        fi
-                                    else
-                                        log_status "WARN" "⚠️ AUTO-RECOVERY: Failed to mark task complete (may be wrong task or already completed)"
-                                    fi
-                                else
-                                    [[ "${VERBOSE_PROGRESS:-}" == "true" ]] && log_status "DEBUG" "Auto-recovery skipped: extracted task '$auto_task_id' != current task '$current_task_id'"
-                                fi
-                            else
-                                [[ "${VERBOSE_PROGRESS:-}" == "true" ]] && log_status "DEBUG" "Auto-recovery: No task ID pattern found in commit message"
-                            fi
-                        else
-                            [[ "${VERBOSE_PROGRESS:-}" == "true" ]] && log_status "DEBUG" "Auto-recovery: Last commit too old (${age_minutes}m > 5m)"
-                        fi
-                    fi
-                fi
-            fi
-        fi
+        # AUTO-RECOVERY removed 2026-04-19. It used to scrape `task-N` out
+        # of the last git commit message when the RALPH_STATUS block was
+        # missing — but the `task-N` short form never matches the full
+        # stable id in the DB (`task-N-verification-steps` etc.), so every
+        # auto-recovery completion failed, then under set -e crashed the
+        # worker. The correct path is now: Claude emits a RALPH_STATUS
+        # block → shell analyzer extracts the FULL task_id → we write
+        # outcome.json with it. No commit-message guessing.
 
         # Get file change count for circuit breaker
         start_phase "git_operations"
@@ -1664,9 +1465,18 @@ EOF
 cleanup() {
     log_status "INFO" "Ralph loop interrupted (signal). Cleaning up..."
 
-    # Release task claim before exiting
-    if [[ -n "$RALPH_ID" ]]; then
-        release_current_task "$RALPH_ID" || true
+    # Emit an ABORTED outcome so the daemon releases our claim.
+    if [[ "$OUTCOME_WRITTEN" != "true" && -n "$RALPH_ID" ]]; then
+        local current_task_from_db=""
+        current_task_from_db=$(get_current_task_id "$RALPH_ID" 2>/dev/null || true)
+        python3 -m chiefwiggum.outcome_cli \
+            --ralph-id "$RALPH_ID" \
+            --status aborted \
+            --task-id "$current_task_from_db" \
+            --error-message "interrupted by signal" \
+            --loops-run "$loop_count" \
+            --log-path "$LOG_DIR/ralph.log" >/dev/null 2>&1 || true
+        OUTCOME_WRITTEN=true
     fi
 
     reset_session "manual_interrupt"
@@ -1720,6 +1530,35 @@ on_exit() {
             "null" "false" "$crash_message"
 
         log_status "INFO" "Status file updated with exit code $exit_code"
+
+        # Emit a CRASHED outcome so the daemon knows the worker died
+        # unexpectedly and can release its claim. Suppress errors —
+        # we're already in a failure path, don't compound it.
+        if [[ "$OUTCOME_WRITTEN" != "true" && -n "${RALPH_ID:-}" ]]; then
+            local current_task_from_db=""
+            current_task_from_db=$(get_current_task_id "$RALPH_ID" 2>/dev/null || true)
+            python3 -m chiefwiggum.outcome_cli \
+                --ralph-id "$RALPH_ID" \
+                --status crashed \
+                --task-id "$current_task_from_db" \
+                --error-category "script_error" \
+                --error-message "$crash_message (exit $exit_code; cmd: ${BASH_COMMAND:-unknown})" \
+                --loops-run "$loop_val" \
+                --log-path "$LOG_DIR/ralph.log" >/dev/null 2>&1 || true
+            OUTCOME_WRITTEN=true
+        fi
+    else
+        # Clean exit with no outcome written yet — emit a TIMEOUT/no-task
+        # sentinel so the daemon doesn't think the worker crashed.
+        if [[ "$OUTCOME_WRITTEN" != "true" && -n "${RALPH_ID:-}" ]]; then
+            python3 -m chiefwiggum.outcome_cli \
+                --ralph-id "$RALPH_ID" \
+                --status no_task \
+                --error-message "worker exited cleanly without writing an outcome" \
+                --loops-run "${loop_count:-0}" \
+                --log-path "$LOG_DIR/ralph.log" >/dev/null 2>&1 || true
+            OUTCOME_WRITTEN=true
+        fi
     fi
 }
 
@@ -1921,49 +1760,17 @@ main() {
         if [[ "$exit_reason" != "" ]]; then
             log_status "SUCCESS" "🏁 Graceful exit triggered: $exit_reason"
 
-            # Release the completed task's claim before deciding whether to
-            # chain: claim_next_task_for_ralph will re-release internally as
-            # well, but doing it here makes the status accurate during the
-            # brief window while we generate the next prompt.
-            if [[ -n "$RALPH_ID" ]]; then
-                release_current_task "$RALPH_ID" || true
-            fi
-
-            # Worker persistence: the Ralph WORKER (this process) is long-
-            # lived; the Claude session ("ralph loop") is throwaway. When the
-            # current task's session accumulates completion signals, we reset
-            # the session and claim the next task. The worker process stays
-            # alive across task boundaries. Use --single-task to opt out.
-            if [[ "$SINGLE_TASK_MODE" != "true" && -n "$RALPH_ID" ]]; then
-                log_status "INFO" "📋 Task done. Worker checking queue for next task..."
-                local chain_claim_result
-                # Defensive `|| true` in case the helper ever regresses to a
-                # non-zero return — we still want its JSON stdout.
-                chain_claim_result=$(claim_next_task_for_ralph "$RALPH_ID" || true)
-                local chain_claim_success
-                chain_claim_success=$(echo "$chain_claim_result" | jq -r '.success' 2>/dev/null)
-                local chain_new_task_id
-                chain_new_task_id=$(echo "$chain_claim_result" | jq -r '.task_id' 2>/dev/null)
-
-                if [[ "$chain_claim_success" == "true" && -n "$chain_new_task_id" && "$chain_new_task_id" != "null" ]]; then
-                    if generate_task_prompt_for_file "$RALPH_ID" "$chain_new_task_id" "$PROMPT_FILE"; then
-                        log_status "SUCCESS" "🔄 Worker picked up next task: $chain_new_task_id"
-                        # Kill the old Claude session; next iteration starts a
-                        # fresh one for the new task.
-                        reset_session "next_task_claimed"
-                        # Zero the exit signals so the new task starts with a
-                        # clean slate and doesn't immediately re-exit.
-                        echo '{"test_only_loops": [], "done_signals": [], "completion_indicators": []}' > "$EXIT_SIGNALS_FILE"
-                        continue
-                    else
-                        log_status "WARN" "⚠️ Failed to generate prompt for $chain_new_task_id; releasing and exiting"
-                        release_current_task "$RALPH_ID" || true
-                    fi
-                else
-                    log_status "INFO" "🏁 Queue empty; worker exiting."
-                fi
-            fi
-
+            # New architecture (2026-04-19): one worker = one task = one
+            # process. Workers DO NOT self-chain in-process. We exit the
+            # loop and let the chiefwiggum daemon spawn a fresh worker for
+            # the next pending task on this project.
+            #
+            # We also DO NOT call `release_current_task` or `wig complete`
+            # from here anymore — the shell→Python IPC was the source of
+            # repeated set-e-kills-worker crashes. Instead the worker
+            # writes an outcome.json (happens above on explicit
+            # RALPH_STATUS COMPLETE detection, or below as a fallback)
+            # and the daemon makes the idempotent DB transition.
             reset_session "project_complete"
             update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "graceful_exit" "completed" "$exit_reason" '{"category":"none","count":0,"details":[]}' "null" "false" "null"
 
@@ -1971,6 +1778,20 @@ main() {
             log_status "INFO" "  - Total loops: $loop_count"
             log_status "INFO" "  - API calls used: $(cat "$CALL_COUNT_FILE")"
             log_status "INFO" "  - Exit reason: $exit_reason"
+
+            # If we reached graceful exit WITHOUT an explicit RALPH_STATUS
+            # COMPLETE (the success path writes its own outcome earlier),
+            # emit a synthetic outcome so the daemon knows to release the
+            # claim rather than treat this worker as silently-crashed.
+            if [[ "$OUTCOME_WRITTEN" != "true" && -n "$RALPH_ID" ]]; then
+                python3 -m chiefwiggum.outcome_cli \
+                    --ralph-id "$RALPH_ID" \
+                    --status timeout \
+                    --error-message "graceful exit: $exit_reason" \
+                    --loops-run "$loop_count" \
+                    --log-path "$LOG_DIR/ralph.log" >/dev/null || true
+                OUTCOME_WRITTEN=true
+            fi
 
             break
         fi
