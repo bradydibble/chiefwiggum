@@ -165,6 +165,25 @@ def parse_fix_plan(path: str | Path) -> list[FixPlanTask]:
                     title_part = title_candidate
                     task_match = True
 
+        # Reject section-header-as-task: if the matched "title" ends in a
+        # colon with no content after it, it's a navigational marker the
+        # parser accidentally captured (e.g. "After T0 (Stop the Bleeding):"
+        # or "Tier 3 (Confidence):" or "What Works Well:"). Real task titles
+        # have work described after any colon ("T0.1: Disable Jira Polling").
+        #
+        # History: a fleet of 35 such mis-parsed "tasks" caused workers to
+        # spin on the queue (2026-04-20) — Claude correctly read them as
+        # section headers, emitted RALPH_STATUS COMPLETE with nothing to
+        # do, got re-spawned on the next mis-parsed header, and repeated.
+        if task_match and title_part and title_part.rstrip().endswith(":"):
+            logger.debug(
+                "fix_plan_parser: rejecting section-header-as-task %r on line %d",
+                title_part, line_num,
+            )
+            task_match = False
+            task_number = None
+            title_part = None
+
         if task_match and task_number and title_part and current_priority:
             if current_task:
                 # Finalize previous task: flush description and code blocks
